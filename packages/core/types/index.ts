@@ -170,6 +170,7 @@ export type {
   WecomInstallation,
   ListWecomInstallationsResponse,
   RegisterWecomBYORequest,
+  RedeemWecomBindingTokenResponse,
 } from "./wecom";
 export type {
   Autopilot,
