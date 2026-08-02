@@ -15,6 +15,7 @@ package wecom
 // without threading the Channel through the engine.
 
 import (
+	"log/slog"
 	"sync"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -22,15 +23,26 @@ import (
 	"github.com/multica-ai/multica/server/internal/util"
 )
 
-// sendersRegistry is a goroutine-safe installation_id → wsSender map.
+// sendersRegistry is a goroutine-safe installation_id → wsSender map, plus
+// the holding queue for messages that arrived while the map had no entry (see
+// outbound_queue.go — the aibot socket is the only transport, so an
+// undeliverable message either waits or is lost).
 type sendersRegistry struct {
 	mu    sync.RWMutex
 	byKey map[string]*wsSender
+
+	pending *outboundQueue
+	log     *slog.Logger
 }
 
 // newSendersRegistry constructs an empty registry.
 func newSendersRegistry() *sendersRegistry {
-	return &sendersRegistry{byKey: make(map[string]*wsSender)}
+	log := slog.Default()
+	return &sendersRegistry{
+		byKey:   make(map[string]*wsSender),
+		pending: newOutboundQueue(log),
+		log:     log,
+	}
 }
 
 // NewSendersRegistry is the public constructor boot uses to inject the
@@ -58,4 +70,58 @@ func (r *sendersRegistry) get(id pgtype.UUID) *wsSender {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.byKey[util.UUIDToString(id)]
+}
+
+// send is the one outbound entry point for messages the engine produces
+// (agent replies, inbox cards). It writes to the live connection when there
+// is one and holds the message for the next one when there is not, so a
+// reconnect window costs latency rather than the message.
+//
+// It returns an error only for a message the wire will never accept — an
+// empty chat id, a bad chat type — so a malformed body cannot sit in the
+// queue being retried forever. A transport failure is not an error here: the
+// message is re-queued and the caller has nothing useful to do about it.
+func (r *sendersRegistry) send(id pgtype.UUID, msg pendingSend) error {
+	if _, err := sendMsgTextBody(msg.ChatID, msg.ChatType, msg.Content); err != nil {
+		return err
+	}
+	sender := r.get(id)
+	if sender == nil {
+		r.pending.enqueue(id, msg)
+		r.log.Debug("wecom outbound: no live connection, message held for reconnect",
+			"installation_id", util.UUIDToString(id), "depth", r.pending.depth(id))
+		return nil
+	}
+	if err := sender.sendText(msg.ChatID, msg.ChatType, msg.Content); err != nil {
+		r.pending.enqueue(id, msg)
+		r.log.Warn("wecom outbound: send failed, message held for reconnect",
+			"installation_id", util.UUIDToString(id), "error", err)
+		return nil
+	}
+	return nil
+}
+
+// flushPending drains an installation's holding queue over the live
+// connection, oldest first. Connect calls it once the subscribe ack lands.
+// A write that fails puts its message back at the head and stops the drain —
+// the socket is going down again, and the next Connect will pick up where
+// this one left off.
+func (r *sendersRegistry) flushPending(id pgtype.UUID) {
+	for {
+		sender := r.get(id)
+		if sender == nil {
+			return
+		}
+		msg, ok := r.pending.pop(id)
+		if !ok {
+			return
+		}
+		if err := sender.sendText(msg.ChatID, msg.ChatType, msg.Content); err != nil {
+			r.pending.pushFront(id, msg)
+			r.log.Warn("wecom outbound: resend failed, keeping the rest queued",
+				"installation_id", util.UUIDToString(id), "error", err,
+				"depth", r.pending.depth(id))
+			return
+		}
+	}
 }

@@ -178,6 +178,12 @@ func (c *wecomChannel) Connect(ctx context.Context) error {
 	if c.senders != nil && c.installationID.Valid {
 		c.senders.set(c.installationID, sender)
 		defer c.senders.clear(c.installationID)
+
+		// Anything the engine produced while this installation had no socket
+		// is waiting; deliver it now, oldest first. On its own goroutine so a
+		// long backlog does not delay the read loop, and self-terminating —
+		// it stops at an empty queue or the first write failure.
+		go c.senders.flushPending(c.installationID)
 	}
 
 	// Heartbeat — WeChat kills silent sockets past ~90s. We ping every 30s
