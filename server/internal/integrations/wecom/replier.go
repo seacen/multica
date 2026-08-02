@@ -14,6 +14,8 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
 	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
 	"github.com/multica-ai/multica/server/internal/util"
@@ -26,11 +28,24 @@ const (
 	// read loop (wecom_channel.go), not by the Replier — the message never
 	// reaches the engine — but it lives here with the other user-visible copy.
 	unsupportedMsgTypeText = "我目前只能处理文字消息，请用文字再发一次。"
+
+	bindingPromptPrefix = "👋 请先绑定你的 Multica 账号，才能与我对话：\n"
+	bindingPromptSuffix = "\n（链接 15 分钟内有效）"
+	// bindingPendingText replaces the link when the mint was throttled — the
+	// raw token behind the earlier link was never stored, so it cannot be
+	// reprinted.
+	bindingPendingText = "👋 绑定链接刚才已经发给你了，请点上一条消息里的链接完成绑定。"
 )
+
+// bindingMinter is the binding-token surface the replier needs.
+// *BindingTokenService satisfies it.
+type bindingMinter interface {
+	Mint(ctx context.Context, workspaceID, installationID pgtype.UUID, wecomUserID string) (BindingToken, error)
+}
 
 // OutboundReplier implements engine.OutboundReplier for WeCom.
 type OutboundReplier struct {
-	binding     *BindingTokenService
+	binding     bindingMinter
 	senders     *sendersRegistry
 	appURL      string
 	bindingPath string
@@ -41,7 +56,7 @@ type OutboundReplier struct {
 // required for the needs_binding prompt to work; without them the prompt
 // is skipped (the offline/archived/issue notices still fire).
 type OutboundReplierConfig struct {
-	Binding *BindingTokenService
+	Binding bindingMinter
 
 	// Senders is the same sendersRegistry the wecom ChannelDeps was built
 	// with. The replier looks up the live wsSender by installation id.
@@ -133,8 +148,14 @@ func (r *OutboundReplier) sendBindingPrompt(ctx context.Context, inst engine.Res
 	if err != nil {
 		return fmt.Errorf("wecom: mint binding token: %w", err)
 	}
+	// The throttle suppressed the mint: a live link is already in this chat.
+	// Only its hash was ever stored, so there is no URL to rebuild — point
+	// the user at the message they already have.
+	if token.Reused {
+		return r.post(ctx, inst, msg, bindingPendingText)
+	}
 	bindURL := r.appURL + r.bindingPath + "?token=" + url.QueryEscape(token.Raw)
-	text := "👋 请先绑定你的 Multica 账号，才能与我对话：\n" + bindURL + "\n（链接 15 分钟内有效）"
+	text := bindingPromptPrefix + bindURL + bindingPromptSuffix
 	return r.post(ctx, inst, msg, text)
 }
 

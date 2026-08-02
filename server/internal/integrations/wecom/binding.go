@@ -35,6 +35,17 @@ import (
 // longer.
 const BindingTokenTTL = 15 * time.Minute
 
+// BindingTokenMintInterval is how often one platform user can be issued a new
+// binding link. Every message from an unbound user reaches the needs_binding
+// outcome, so without a floor here a user who types six lines writes six
+// token rows and receives six links, only the last of which they will click.
+//
+// It has to stay comfortably inside BindingTokenTTL: at 10 minutes against a
+// 15-minute token, the link a throttled user is pointed back at still has at
+// least five minutes on it, and once the window passes they get a fresh one.
+// A throttle at or past the TTL would strand them with no valid link.
+const BindingTokenMintInterval = 10 * time.Minute
+
 var (
 	// ErrBindingTokenInvalid: token unknown / already consumed / expired.
 	// One opaque error for all three avoids a replay timing oracle.
@@ -53,6 +64,14 @@ var (
 type BindingToken struct {
 	Raw       string
 	ExpiresAt time.Time
+
+	// Reused says the throttle suppressed the mint because a live link is
+	// already sitting in the user's chat. Raw is empty in that case and there
+	// is no way to recover it — the table only ever held the hash — so the
+	// caller must point the user back at the earlier message rather than
+	// building a URL. ExpiresAt is the live token's, so the caller can say how
+	// long it has left.
+	Reused bool
 }
 
 // RedeemedBindingToken is returned after a successful redemption.
@@ -62,32 +81,67 @@ type RedeemedBindingToken struct {
 	WecomUserID    string
 }
 
+// bindingMintQueries is the slice of generated queries the mint path uses.
+// Narrow on purpose: it is the only part of the service that runs outside a
+// transaction, so it is the only part a unit test can drive with a fake.
+// *db.Queries satisfies it.
+type bindingMintQueries interface {
+	CreateChannelBindingToken(ctx context.Context, arg db.CreateChannelBindingTokenParams) (db.ChannelBindingToken, error)
+	FindLiveChannelBindingToken(ctx context.Context, arg db.FindLiveChannelBindingTokenParams) (db.ChannelBindingToken, error)
+}
+
 // BindingTokenService mints and redeems WeCom binding tokens. Redemption is
 // transactional: consuming the token and inserting the channel_user_binding
 // row commit together, so a failed bind never burns a token.
 type BindingTokenService struct {
-	q   *db.Queries
-	tx  engine.TxStarter
-	now func() time.Time
+	q    *db.Queries
+	mint bindingMintQueries
+	tx   engine.TxStarter
+	now  func() time.Time
 }
 
 // NewBindingTokenService constructs the service. tx (a *pgxpool.Pool) is
 // needed for the transactional redeem path.
 func NewBindingTokenService(q *db.Queries, tx engine.TxStarter) *BindingTokenService {
-	return &BindingTokenService{q: q, tx: tx, now: time.Now}
+	return &BindingTokenService{q: q, mint: q, tx: tx, now: time.Now}
 }
 
 // Mint creates a single-use binding token for (installation, wecomUserID)
 // and returns the raw secret + expiry. The raw value must be delivered over
 // the aibot WebSocket (encrypted in transit by the platform) and never
 // logged.
+//
+// Throttled: if this user already has a live, unconsumed token minted inside
+// BindingTokenMintInterval, no row is written and the result comes back with
+// Reused set and Raw empty — the raw secret was never stored, so there is
+// nothing to hand back. Callers point the user at the link already in their
+// chat instead. This is what keeps an unbound user's message stream from
+// writing a token row per message.
 func (s *BindingTokenService) Mint(ctx context.Context, workspaceID, installationID pgtype.UUID, wecomUserID string) (BindingToken, error) {
+	if s.mint == nil {
+		return BindingToken{}, errors.New("wecom: BindingTokenService missing queries")
+	}
+	live, err := s.mint.FindLiveChannelBindingToken(ctx, db.FindLiveChannelBindingTokenParams{
+		InstallationID: installationID,
+		ChannelType:    channelTypeWecom,
+		ChannelUserID:  wecomUserID,
+		CreatedAfter:   pgtype.Timestamptz{Time: s.now().Add(-BindingTokenMintInterval), Valid: true},
+	})
+	switch {
+	case err == nil:
+		return BindingToken{ExpiresAt: live.ExpiresAt.Time, Reused: true}, nil
+	case errors.Is(err, pgx.ErrNoRows):
+		// Nothing live for this user — mint below.
+	default:
+		return BindingToken{}, fmt.Errorf("wecom: look up live token: %w", err)
+	}
+
 	raw, err := randomBindingToken(32)
 	if err != nil {
 		return BindingToken{}, fmt.Errorf("wecom: generate token: %w", err)
 	}
 	expiresAt := s.now().Add(BindingTokenTTL)
-	if _, err := s.q.CreateChannelBindingToken(ctx, db.CreateChannelBindingTokenParams{
+	if _, err := s.mint.CreateChannelBindingToken(ctx, db.CreateChannelBindingTokenParams{
 		TokenHash:      hashBindingToken(raw),
 		WorkspaceID:    workspaceID,
 		InstallationID: installationID,

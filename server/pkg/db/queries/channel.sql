@@ -651,6 +651,26 @@ WHERE token_hash = $1
   AND expires_at > now()
 RETURNING *;
 
+-- name: FindLiveChannelBindingToken :one
+-- Mint guard: the newest token for this platform user that is still
+-- unconsumed, unexpired, and recent enough that the link already sitting in
+-- their chat is the one to point back at. Without it every message from an
+-- unbound user mints another row, so a user who keeps typing at a bot they
+-- have not linked yet writes one row per message, forever. `created_after` is
+-- the caller's throttle window (see wecom.BindingTokenMintInterval); the
+-- expires_at / consumed_at predicates keep a stale or already-redeemed token
+-- from suppressing a mint the user actually needs. Served by
+-- idx_channel_binding_token_installation.
+SELECT * FROM channel_binding_token
+WHERE installation_id = $1
+  AND channel_type = $2
+  AND channel_user_id = $3
+  AND consumed_at IS NULL
+  AND expires_at > now()
+  AND created_at >= sqlc.arg('created_after')::timestamptz
+ORDER BY created_at DESC
+LIMIT 1;
+
 -- name: PurgeExpiredChannelBindingTokens :exec
 DELETE FROM channel_binding_token
 WHERE expires_at < $1;
