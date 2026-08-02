@@ -4494,7 +4494,7 @@ func (s *TaskService) broadcastChatDone(ctx context.Context, task db.AgentTaskQu
 // issue's status before the write so the client can gate that reconcile on
 // status_changed.
 //
-// The `issue` payload is a map (issueToMap), which the workspace WS fanout
+// The `issue` payload is a map (IssueToMap), which the workspace WS fanout
 // (listeners.go SubscribeAll) marshals and broadcasts as-is — that is what
 // drives the UI reconcile. Note this does NOT cover the full HTTP UpdateIssue
 // side effects: the activity-log and inbox listeners type-assert `issue` to a
@@ -4510,7 +4510,7 @@ func (s *TaskService) broadcastIssueUpdated(issue db.Issue, prevStatus string) {
 		ActorType:   "system",
 		ActorID:     "",
 		Payload: map[string]any{
-			"issue":          issueToMap(issue, prefix),
+			"issue":          IssueToMap(issue, prefix),
 			"status_changed": prevStatus != issue.Status,
 			"prev_status":    prevStatus,
 		},
@@ -4623,7 +4623,13 @@ func (s *TaskService) AutoUnresolveThreadOnReply(ctx context.Context, parent *db
 	})
 }
 
-func issueToMap(issue db.Issue, issuePrefix string) map[string]any {
+// IssueToMap flattens a db.Issue into the map[string]any payload shape every
+// bus listener downstream expects under the "issue" key of EventIssueCreated /
+// EventIssueUpdated — the subscriber listener, the notification listener and
+// the realtime broadcaster all read from this shape. Exported so non-service
+// publishers of those events (the channel engine's /issue path) emit exactly
+// the same field set instead of maintaining a parallel copy that drifts.
+func IssueToMap(issue db.Issue, issuePrefix string) map[string]any {
 	return map[string]any{
 		"id":              util.UUIDToString(issue.ID),
 		"workspace_id":    util.UUIDToString(issue.WorkspaceID),

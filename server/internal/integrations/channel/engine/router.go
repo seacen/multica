@@ -697,50 +697,13 @@ func (r *Router) createIssue(ctx context.Context, inst ResolvedInstallation, ori
 			if ws, err := r.reader.GetWorkspace(ctx, issue.WorkspaceID); err == nil {
 				prefix = ws.IssuePrefix
 			}
-			return map[string]any{"issue": issueBroadcastMap(issue, prefix)}
+			// Reuse the canonical flattener rather than a local copy, so the
+			// engine's /issue path can never drift from the payload every
+			// downstream listener is written against.
+			return map[string]any{"issue": service.IssueToMap(issue, prefix)}
 		},
 	}
 	return r.issues.Create(ctx, params, opts)
-}
-
-// issueBroadcastMap flattens a db.Issue into the map[string]any shape the
-// bus listeners downstream expect on EventIssueCreated. Mirrors
-// service.issueToMap (kept private to that package) so engine-created
-// issues broadcast the same field set autopilot-created ones do — the
-// subscriber listener, notification listener, and realtime broadcaster
-// all read from this shape.
-func issueBroadcastMap(issue db.Issue, issuePrefix string) map[string]any {
-	m := map[string]any{
-		"id":            uuidString(issue.ID),
-		"workspace_id":  uuidString(issue.WorkspaceID),
-		"number":        issue.Number,
-		"title":         issue.Title,
-		"status":        issue.Status,
-		"priority":      issue.Priority,
-		"creator_type":  issue.CreatorType,
-		"creator_id":    uuidString(issue.CreatorID),
-		"position":      issue.Position,
-	}
-	if issuePrefix != "" {
-		m["identifier"] = fmt.Sprintf("%s-%d", issuePrefix, issue.Number)
-	}
-	if issue.Description.Valid {
-		s := issue.Description.String
-		m["description"] = &s
-	}
-	if issue.AssigneeType.Valid {
-		s := issue.AssigneeType.String
-		m["assignee_type"] = &s
-	}
-	if issue.AssigneeID.Valid {
-		s := uuidString(issue.AssigneeID)
-		m["assignee_id"] = &s
-	}
-	if issue.ParentIssueID.Valid {
-		s := uuidString(issue.ParentIssueID)
-		m["parent_issue_id"] = &s
-	}
-	return m
 }
 
 // ErrEmptyIssueTitle is returned by createIssue when /issue has no title and
