@@ -8,17 +8,27 @@ package handler
 // WebSocket long connection, so a public callback URL is not required.
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/integrations/wecom"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
+
+// WecomBindingRedeemer is the slice of wecom.BindingTokenService the redeem
+// endpoint drives. *wecom.BindingTokenService is the production value; the
+// interface exists so each failure mode's HTTP status can be pinned in a test
+// without a live channel_binding_token table.
+type WecomBindingRedeemer interface {
+	RedeemAndBind(ctx context.Context, raw string, multicaUserID pgtype.UUID) (wecom.RedeemedBindingToken, error)
+}
 
 // WecomInstallationResponse is the wire shape for a wecom installation
 // row. The secret is NEVER included — it remains sealed on the row. BotID

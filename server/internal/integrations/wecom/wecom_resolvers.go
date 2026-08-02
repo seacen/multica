@@ -42,6 +42,34 @@ func wecomMsgFromRaw(msg channel.InboundMessage) (InboundMessage, error) {
 	return wm, nil
 }
 
+// The four query surfaces below are the slices of *Store each resolver
+// actually uses. They are interfaces, not the concrete *Store, for one
+// reason: *Store embeds *db.Queries, so anything holding it can only be
+// driven by a live database. Narrowing to the handful of methods each
+// resolver calls lets the routing, membership and dedup decisions be
+// exercised with fakes — the same seam slack uses for installQueries.
+// *Store satisfies all four.
+type (
+	installationLookup interface {
+		GetInstallationByBotID(ctx context.Context, botID string) (Installation, error)
+	}
+
+	identityLookup interface {
+		GetChannelUserBindingByUserID(ctx context.Context, arg db.GetChannelUserBindingByUserIDParams) (db.ChannelUserBinding, error)
+		IsWorkspaceMember(ctx context.Context, workspaceID, userID pgtype.UUID) (bool, error)
+	}
+
+	dedupQueries interface {
+		ClaimChannelInboundDedup(ctx context.Context, arg db.ClaimChannelInboundDedupParams) (db.ChannelInboundMessageDedup, error)
+		MarkChannelInboundDedupProcessed(ctx context.Context, arg db.MarkChannelInboundDedupProcessedParams) (int64, error)
+		ReleaseChannelInboundDedup(ctx context.Context, arg db.ReleaseChannelInboundDedupParams) (int64, error)
+	}
+
+	auditQueries interface {
+		RecordChannelInboundDrop(ctx context.Context, arg db.RecordChannelInboundDropParams) error
+	}
+)
+
 // NewResolverSet assembles the wecom ResolverSet from the store, the shared
 // chat-session service, and an outbound replier. wecom has no typing-
 // indicator affordance, so Typing is left nil — the Router treats a nil
@@ -56,9 +84,9 @@ func NewResolverSet(
 	set := engine.ResolverSet{
 		Installation: &installationResolver{store: store},
 		Identity:     &identityResolver{store: store},
-		Dedup:        &deduper{store: store},
+		Dedup:        &deduper{q: store},
 		Session:      &sessionBinder{session: session},
-		Audit:        &auditor{store: store},
+		Audit:        &auditor{q: store},
 		OriginType:   originWecomChat,
 	}
 	if replier != nil {
@@ -78,7 +106,7 @@ type engineSessionBinder interface {
 
 // ---- installation routing ----
 
-type installationResolver struct{ store *Store }
+type installationResolver struct{ store installationLookup }
 
 // ResolveInstallation looks up the wecom installation by the BotID carried
 // on the inbound event. Every aibot_msg_callback frame identifies the bot
@@ -112,7 +140,7 @@ func (r *installationResolver) ResolveInstallation(ctx context.Context, msg chan
 
 // ---- identity ----
 
-type identityResolver struct{ store *Store }
+type identityResolver struct{ store identityLookup }
 
 // ResolveSender maps the WeCom smart-bot userid (the anonymized "T"-prefixed
 // id the aibot API assigns per bot, from Source.SenderID) to a Multica user
@@ -136,7 +164,7 @@ func (r *identityResolver) ResolveSender(ctx context.Context, inst engine.Resolv
 	if senderID == "" {
 		return engine.ResolvedIdentity{}, engine.ErrSenderUnbound
 	}
-	binding, err := r.store.Queries.GetChannelUserBindingByUserID(ctx, db.GetChannelUserBindingByUserIDParams{
+	binding, err := r.store.GetChannelUserBindingByUserID(ctx, db.GetChannelUserBindingByUserIDParams{
 		InstallationID: inst.ID,
 		ChannelUserID:  senderID,
 	})
@@ -161,17 +189,17 @@ func (r *identityResolver) ResolveSender(ctx context.Context, inst engine.Resolv
 // deduper is the wecom Deduper. It uses the shared channel_inbound_message_dedup
 // sqlc queries — the same table Feishu / Slack use — so the two-phase
 // idempotency invariant is enforced uniformly across channels.
-type deduper struct{ store *Store }
+type deduper struct{ q dedupQueries }
 
 // NewInboundDeduper hands boot the same two-phase deduper the ResolverSet
 // runs on. The Channel needs it directly, not only through the Router: the
 // "text only, please" receipt for a voice note is written from the read loop
 // and never enters the Router, so its at-most-once guarantee has to come from
 // the same table.
-func NewInboundDeduper(store *Store) engine.Deduper { return &deduper{store: store} }
+func NewInboundDeduper(store *Store) engine.Deduper { return &deduper{q: store} }
 
 func (d *deduper) Claim(ctx context.Context, installationID pgtype.UUID, messageID string) (pgtype.UUID, error) {
-	row, err := d.store.Queries.ClaimChannelInboundDedup(ctx, db.ClaimChannelInboundDedupParams{
+	row, err := d.q.ClaimChannelInboundDedup(ctx, db.ClaimChannelInboundDedupParams{
 		InstallationID: installationID,
 		MessageID:      messageID,
 	})
@@ -185,7 +213,7 @@ func (d *deduper) Claim(ctx context.Context, installationID pgtype.UUID, message
 }
 
 func (d *deduper) Mark(ctx context.Context, installationID pgtype.UUID, messageID string, claimToken pgtype.UUID) error {
-	_, err := d.store.Queries.MarkChannelInboundDedupProcessed(ctx, db.MarkChannelInboundDedupProcessedParams{
+	_, err := d.q.MarkChannelInboundDedupProcessed(ctx, db.MarkChannelInboundDedupProcessedParams{
 		InstallationID: installationID,
 		MessageID:      messageID,
 		ClaimToken:     claimToken,
@@ -194,7 +222,7 @@ func (d *deduper) Mark(ctx context.Context, installationID pgtype.UUID, messageI
 }
 
 func (d *deduper) Release(ctx context.Context, installationID pgtype.UUID, messageID string, claimToken pgtype.UUID) error {
-	_, err := d.store.Queries.ReleaseChannelInboundDedup(ctx, db.ReleaseChannelInboundDedupParams{
+	_, err := d.q.ReleaseChannelInboundDedup(ctx, db.ReleaseChannelInboundDedupParams{
 		InstallationID: installationID,
 		MessageID:      messageID,
 		ClaimToken:     claimToken,
@@ -245,7 +273,7 @@ func (r *sessionBinder) BindMedia(ctx context.Context, p engine.BindMediaParams)
 
 // ---- audit ----
 
-type auditor struct{ store *Store }
+type auditor struct{ q auditQueries }
 
 func (a *auditor) RecordDrop(ctx context.Context, instID pgtype.UUID, msg channel.InboundMessage, reason engine.DropReason) error {
 	var eventType string
@@ -256,7 +284,7 @@ func (a *auditor) RecordDrop(ctx context.Context, instID pgtype.UUID, msg channe
 	if instID.Valid {
 		instIDArg = instID
 	}
-	return a.store.Queries.RecordChannelInboundDrop(ctx, db.RecordChannelInboundDropParams{
+	return a.q.RecordChannelInboundDrop(ctx, db.RecordChannelInboundDropParams{
 		InstallationID:   instIDArg,
 		ChannelType:      channelTypeWecom,
 		ChannelChatID:    textOrNull(msg.Source.ChatID),

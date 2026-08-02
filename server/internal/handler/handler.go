@@ -279,7 +279,12 @@ type Handler struct {
 	// to their real userid or email, so an explicit binding is required —
 	// see wecom/binding.go). Nil disables the redeem endpoint (returns 503)
 	// and the OutboundReplier's binding-prompt path.
-	WecomBindingTokens *wecom.BindingTokenService
+	//
+	// Typed as the narrow redeem interface rather than
+	// *wecom.BindingTokenService so the endpoint's failure-mode-to-status
+	// mapping (410 / 409 / 403) can be exercised without a database;
+	// *wecom.BindingTokenService is the production value.
+	WecomBindingTokens WecomBindingRedeemer
 	// LLM is the basic LLM API layer (MUL-4238): a thin wrapper over the
 	// OpenAI Go SDK backing server-internal one-shot LLM helpers such as chat
 	// title generation. The generic passthrough endpoints were removed in
