@@ -81,8 +81,49 @@ type aibotMsgCallback struct {
 	Text    struct {
 		Content string `json:"content"`
 	} `json:"text"`
-	// Image / voice / file / video / mixed have their own fields; we do
-	// not surface them yet — MsgType=="text" is the only case we route.
+	// Mixed carries 图文混排 — a message the user composed with text runs
+	// and attachments interleaved. Each item is itself typed, so a mixed
+	// message that contains any text run has something we can ingest.
+	Mixed struct {
+		MsgItem []struct {
+			MsgType string `json:"msgtype"`
+			Text    struct {
+				Content string `json:"content"`
+			} `json:"text"`
+		} `json:"msg_item"`
+	} `json:"mixed"`
+	// Image / voice / file / video carry their own media fields; we do not
+	// surface them — the adapter declares CapText only.
+}
+
+// routableText returns the text this callback can be ingested as, and
+// whether there is any. Plain text messages answer with their body; 图文混排
+// answers with its text runs joined (the attachments are dropped — the
+// adapter declares CapText, so there is nothing to do with them, and losing
+// the picture is better than losing the sentence written next to it).
+// Everything else — a bare voice note, photo or file — answers false and
+// takes the receipt path.
+func (mc aibotMsgCallback) routableText() (string, bool) {
+	switch strings.ToLower(mc.MsgType) {
+	case "text":
+		return mc.Text.Content, true
+	case "mixed":
+		var runs []string
+		for _, item := range mc.Mixed.MsgItem {
+			if !strings.EqualFold(item.MsgType, "text") {
+				continue
+			}
+			if s := strings.TrimSpace(item.Text.Content); s != "" {
+				runs = append(runs, s)
+			}
+		}
+		if len(runs) == 0 {
+			return "", false
+		}
+		return strings.Join(runs, "\n"), true
+	default:
+		return "", false
+	}
 }
 
 // aibotEventCallback is the body of an aibot_event_callback frame. We only
@@ -148,7 +189,10 @@ type InboundMessage struct {
 // A user @-mentioning the bot in a group is not distinguishable from a raw
 // group message on the wire — WeChat only forwards to the bot when it was
 // addressed, so any received group message counts as addressed.
-func channelMessageFromCallback(botID string, mc aibotMsgCallback, reqID string) channel.InboundMessage {
+//
+// text is the ingestible body the caller resolved via routableText — the
+// message's own content for a text message, the joined text runs for 图文混排.
+func channelMessageFromCallback(botID string, mc aibotMsgCallback, text, reqID string) channel.InboundMessage {
 	chatType := channel.ChatTypeP2P
 	if strings.EqualFold(mc.ChatType, "group") {
 		chatType = channel.ChatTypeGroup
@@ -167,7 +211,7 @@ func channelMessageFromCallback(botID string, mc aibotMsgCallback, reqID string)
 		ChatType:     mc.ChatType,
 		ChatID:       chatID,
 		SenderUserID: senderID,
-		Content:      mc.Text.Content,
+		Content:      text,
 		ReqID:        reqID,
 	}
 	raw, _ := json.Marshal(wm)
@@ -176,7 +220,7 @@ func channelMessageFromCallback(botID string, mc aibotMsgCallback, reqID string)
 		EventID:        mc.MsgID,
 		MessageID:      mc.MsgID,
 		Type:           channelMsgType(mc.MsgType),
-		Text:           mc.Text.Content,
+		Text:           text,
 		AddressedToBot: true,
 		// A pure /issue command in WeChat Work should NOT trigger the
 		// agent — the engine already creates the issue and the
@@ -185,7 +229,7 @@ func channelMessageFromCallback(botID string, mc aibotMsgCallback, reqID string)
 		// command" reply that just clutters the conversation. wecom is
 		// alone on this — Slack/Lark keep the historical "let the agent
 		// see /issue and respond too" behaviour.
-		SkipAgentRun: isIssueCommand(mc.Text.Content),
+		SkipAgentRun: isIssueCommand(text),
 		Source: channel.Source{
 			ChannelType: TypeWecom,
 			ChatID:      chatID,

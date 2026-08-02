@@ -163,6 +163,13 @@ func (r *identityResolver) ResolveSender(ctx context.Context, inst engine.Resolv
 // idempotency invariant is enforced uniformly across channels.
 type deduper struct{ store *Store }
 
+// NewInboundDeduper hands boot the same two-phase deduper the ResolverSet
+// runs on. The Channel needs it directly, not only through the Router: the
+// "text only, please" receipt for a voice note is written from the read loop
+// and never enters the Router, so its at-most-once guarantee has to come from
+// the same table.
+func NewInboundDeduper(store *Store) engine.Deduper { return &deduper{store: store} }
+
 func (d *deduper) Claim(ctx context.Context, installationID pgtype.UUID, messageID string) (pgtype.UUID, error) {
 	row, err := d.store.Queries.ClaimChannelInboundDedup(ctx, db.ClaimChannelInboundDedupParams{
 		InstallationID: installationID,

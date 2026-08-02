@@ -22,6 +22,10 @@ import (
 const (
 	agentOfflineText  = "⚠️ 智能体当前不在线，你的消息已收到，等它上线后会处理。"
 	agentArchivedText = "⚠️ 该智能体已归档，无法回复。请联系工作区管理员。"
+	// unsupportedMsgTypeText answers a voice note / photo / file. Sent by the
+	// read loop (wecom_channel.go), not by the Replier — the message never
+	// reaches the engine — but it lives here with the other user-visible copy.
+	unsupportedMsgTypeText = "我目前只能处理文字消息，请用文字再发一次。"
 )
 
 // OutboundReplier implements engine.OutboundReplier for WeCom.

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"strings"
 	"time"
 
 	cryptorand "crypto/rand"
@@ -29,6 +30,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
+	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
 	"github.com/multica-ai/multica/server/internal/util"
 )
 
@@ -77,6 +79,14 @@ type wecomChannel struct {
 	// itself on entry and clear on exit. nil in tests that don't exercise
 	// the OutboundReplier path.
 	senders *sendersRegistry
+
+	// dedup is the shared two-phase claim/mark surface over
+	// channel_inbound_message_dedup. The read loop needs it directly (not
+	// only through the ResolverSet) because the "I can only read text"
+	// receipt is sent without ever entering the engine Router, and WeChat
+	// redelivers frames — the claim is what stops a redelivered voice note
+	// from drawing a second receipt. nil disables the receipt.
+	dedup engine.Deduper
 }
 
 var _ channel.Channel = (*wecomChannel)(nil)
@@ -277,13 +287,15 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 			log.Warn("wecom: bad aibot_msg_callback body", "error", err)
 			return nil
 		}
-		if mc.MsgType != "text" {
-			// Media types arrive but iteration 1 only routes text; drop
-			// the rest silently so the handler pipeline is not spammed.
-			log.Debug("wecom: dropped non-text message", "msg_type", mc.MsgType, "msg_id", mc.MsgID)
+		text, ok := mc.routableText()
+		if !ok {
+			// A voice note, photo or file. The adapter declares CapText, so
+			// there is nothing to ingest — but silence reads as a broken bot,
+			// so answer instead of dropping.
+			c.replyUnsupportedMsgType(ctx, mc, sender, log)
 			return nil
 		}
-		msg := channelMessageFromCallback(c.botID, mc, env.Headers.ReqID)
+		msg := channelMessageFromCallback(c.botID, mc, text, env.Headers.ReqID)
 		if err := c.handler(ctx, msg); err != nil {
 			return err
 		}
@@ -332,6 +344,59 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 		}
 		return nil
 	}
+}
+
+// replyUnsupportedMsgType answers a callback the adapter cannot ingest with
+// a short "text only, please" notice. Three things it deliberately does NOT
+// do: escalate to the read loop (a bot that cannot answer is not a reason to
+// drop the socket), reach the engine Router (no chat_session, no stored
+// message, no agent run — the notice is a pure courtesy reply), and speak
+// twice for one msgid.
+//
+// The claim on channel_inbound_message_dedup is what enforces that last one.
+// WeChat redelivers frames on its own schedule and a reconnect replays the
+// window, so an in-memory guard would not survive the case it exists for.
+// A failed write releases the claim, leaving the redelivery free to retry.
+func (c *wecomChannel) replyUnsupportedMsgType(ctx context.Context, mc aibotMsgCallback, sender *wsSender, log *slog.Logger) {
+	chatID := mc.ChatID
+	if chatID == "" {
+		chatID = mc.From.UserID
+	}
+	if chatID == "" {
+		log.Warn("wecom: unsupported message type with no addressable chat", "msg_type", mc.MsgType)
+		return
+	}
+	chatType := chatTypeSingleInt
+	if strings.EqualFold(mc.ChatType, "group") {
+		chatType = chatTypeGroupInt
+	}
+
+	// No msgid means no dedup key. Answering anyway would risk a reply storm
+	// on redelivery, so stay with the old drop behaviour.
+	if mc.MsgID == "" || c.dedup == nil || !c.installationID.Valid {
+		log.Debug("wecom: dropped non-text message (no dedup key)", "msg_type", mc.MsgType, "msg_id", mc.MsgID)
+		return
+	}
+
+	claim, err := c.dedup.Claim(ctx, c.installationID, mc.MsgID)
+	if err != nil {
+		if !errors.Is(err, engine.ErrDuplicate) {
+			log.Warn("wecom: dedup claim for unsupported message failed",
+				"error", err, "msg_type", mc.MsgType, "msg_id", mc.MsgID)
+		}
+		return
+	}
+	if err := sender.sendText(chatID, chatType, unsupportedMsgTypeText); err != nil {
+		if relErr := c.dedup.Release(ctx, c.installationID, mc.MsgID, claim); relErr != nil {
+			log.Warn("wecom: release dedup claim failed", "error", relErr, "msg_id", mc.MsgID)
+		}
+		log.Warn("wecom: unsupported-type notice failed", "error", err, "msg_id", mc.MsgID)
+		return
+	}
+	if err := c.dedup.Mark(ctx, c.installationID, mc.MsgID, claim); err != nil {
+		log.Warn("wecom: mark dedup processed failed", "error", err, "msg_id", mc.MsgID)
+	}
+	log.Debug("wecom: answered unsupported message type", "msg_type", mc.MsgType, "msg_id", mc.MsgID)
 }
 
 // pingLoop sends heartbeat frames every pingInterval until ctx is
@@ -415,6 +480,12 @@ type ChannelDeps struct {
 	// outbound.
 	Senders *sendersRegistry
 
+	// Dedup is the same two-phase claim/mark surface the ResolverSet uses.
+	// The read loop needs it directly so the "text only, please" receipt is
+	// sent at most once per msgid. Nil disables the receipt (the old silent
+	// drop).
+	Dedup engine.Deduper
+
 	// Dialer overrides the default gorilla dialer. Tests point it at an
 	// httptest server; production leaves this nil.
 	Dialer Dialer
@@ -464,6 +535,7 @@ func newWecomFactory(deps ChannelDeps) channel.Factory {
 			wsURL:          deps.WSURL,
 			logger:         logger,
 			senders:        deps.Senders,
+			dedup:          deps.Dedup,
 		}, nil
 	}
 }

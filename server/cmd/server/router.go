@@ -695,7 +695,12 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				wecom.RegisterWecom(channelRegistry, wecom.ChannelDeps{
 					Credentials: credsResolver,
 					Senders:     wecomSenders,
-					Logger:      slog.Default(),
+					// The read loop answers voice/photo/file messages itself
+					// instead of dropping them, and needs the shared dedup
+					// table so a redelivered frame does not draw a second
+					// reply. Same surface the ResolverSet below uses.
+					Dedup:  wecom.NewInboundDeduper(wecomStore),
+					Logger: slog.Default(),
 				})
 				channelRouter.Register(wecom.TypeWecom, wecom.NewResolverSet(
 					wecomStore, wecomSession, wecomReplier,
