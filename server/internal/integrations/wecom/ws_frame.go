@@ -20,10 +20,10 @@ import (
 
 // Frame commands the client sends.
 const (
-	cmdSubscribe   = "aibot_subscribe"
-	cmdPing        = "ping"
-	cmdSendMsg     = "aibot_send_msg"
-	cmdRespondMsg  = "aibot_respond_msg"
+	cmdSubscribe  = "aibot_subscribe"
+	cmdPing       = "ping"
+	cmdSendMsg    = "aibot_send_msg"
+	cmdRespondMsg = "aibot_respond_msg"
 )
 
 // Frame commands the server sends. These are what the read loop switches on.
