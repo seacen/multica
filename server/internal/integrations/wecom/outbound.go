@@ -196,13 +196,28 @@ func (o *Outbound) tryDeliverInbox(ctx context.Context, item map[string]any, rec
 		return false
 	}
 
+	// The card's type label and link text follow the installation's locale.
+	// A lookup failure is not fatal — the default copy still says something
+	// useful, and dropping a notification over a language choice would be
+	// worse than sending it in the wrong one.
+	cp := copyFor(DefaultLocale)
+	if inst, err := o.q.GetChannelInstallation(ctx, db.GetChannelInstallationParams{
+		ID:          binding.InstallationID,
+		ChannelType: channelTypeWecom,
+	}); err == nil {
+		cp = copyFor(localeOfRow(inst))
+	} else {
+		o.logger.WarnContext(ctx, "wecom outbound: installation lookup for inbox locale failed",
+			"error", err, "installation_id", uuidStringPub(binding.InstallationID))
+	}
+
 	// Resolve slug for the link. Best-effort — a missing slug just falls
 	// back to the workspace UUID in the URL.
 	slug := ""
 	if ws, err := o.q.GetWorkspace(ctx, workspaceID); err == nil {
 		slug = ws.Slug
 	}
-	content := buildInboxMarkdown(item, workspaceIDStr, slug)
+	content := buildInboxMarkdown(item, workspaceIDStr, slug, cp)
 	if content == "" {
 		return false
 	}

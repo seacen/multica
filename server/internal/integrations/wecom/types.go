@@ -68,6 +68,11 @@ type Installation struct {
 	// distinct from the token/EncodingAESKey used by callback-mode bots
 	// (which we do not use). Rotated via re-install.
 	SecretEncrypted []byte
+
+	// Locale selects the language this installation's users are answered in
+	// (see strings.go). Empty means DefaultLocale — every installation that
+	// predates the field keeps the Chinese copy it already had.
+	Locale string
 }
 
 // InstallationCredentials is the plaintext-bearing view the WebSocket
@@ -86,6 +91,11 @@ type installConfig struct {
 	AppID           string `json:"app_id"`
 	BotID           string `json:"bot_id"`
 	SecretEncrypted []byte `json:"secret_encrypted"`
+
+	// Locale is optional: absent on every existing row, and absent means the
+	// default (Chinese). Stored per installation rather than per user because
+	// the bot speaks one language to a whole workspace's chats.
+	Locale string `json:"locale,omitempty"`
 }
 
 // encodeInstallConfig marshals an Installation's config-bearing fields into
@@ -98,6 +108,7 @@ func encodeInstallConfig(inst Installation) ([]byte, error) {
 		AppID:           inst.BotID,
 		BotID:           inst.BotID,
 		SecretEncrypted: inst.SecretEncrypted,
+		Locale:          inst.Locale,
 	})
 }
 
@@ -119,5 +130,18 @@ func installationFromRow(row db.ChannelInstallation) (Installation, error) {
 		Status:          InstallationStatus(row.Status),
 		BotID:           cfg.BotID,
 		SecretEncrypted: cfg.SecretEncrypted,
+		Locale:          cfg.Locale,
 	}, nil
+}
+
+// localeOfRow reads an installation row's copy language without hydrating the
+// whole Installation. Used on the outbound paths, which hold a raw row.
+func localeOfRow(row db.ChannelInstallation) Locale {
+	var cfg installConfig
+	if len(row.Config) > 0 {
+		if err := json.Unmarshal(row.Config, &cfg); err != nil {
+			return DefaultLocale
+		}
+	}
+	return resolveLocale(cfg.Locale)
 }

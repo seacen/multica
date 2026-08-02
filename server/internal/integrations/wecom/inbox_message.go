@@ -17,31 +17,6 @@ import (
 // use 4000 to leave headroom for the prefix + link suffix.
 const inboxMarkdownMaxLen = 4000
 
-// inboxTypeLabels are the Chinese display names used in the notification
-// preamble. Kept locally so wecom does not reach into cmd/server for it;
-// the two lists agree by convention.
-var inboxTypeLabels = map[string]string{
-	"issue_assigned":     "任务指派",
-	"mentioned":          "提及你",
-	"status_changed":     "状态变更",
-	"comment_added":      "新评论",
-	"new_comment":        "新评论",
-	"reaction_added":     "表情反应",
-	"task_failed":        "任务失败",
-	"unassigned":         "取消指派",
-	"assignee_changed":   "指派人变更",
-	"priority_changed":   "优先级变更",
-	"due_date_changed":   "截止日期变更",
-	"start_date_changed": "开始日期变更",
-}
-
-func inboxTypeLabel(t string) string {
-	if label, ok := inboxTypeLabels[t]; ok {
-		return label
-	}
-	return "新消息"
-}
-
 // inboxAppURL resolves the frontend URL for building the "view detail" link.
 // Priority: WECOM_APP_URL → MULTICA_APP_URL → FRONTEND_ORIGIN. Only HTTPS
 // values are accepted; a non-HTTPS override is silently dropped so a
@@ -65,11 +40,12 @@ func inboxAppURL() string {
 //
 //	**[{type}] {title}**
 //	{body}
-//	[查看详情]({appURL}/{slug|workspaceID}/inbox?issue={issueID})
+//	[{detail link}]({appURL}/{slug|workspaceID}/inbox?issue={issueID})
 //
-// The link segment is omitted entirely when no appURL is configured — we
-// would rather send a title-only card than a broken link.
-func buildInboxMarkdown(item map[string]any, workspaceID, slug string) string {
+// The type label and the link's anchor text come from the installation's
+// copyPack (strings.go). The link segment is omitted entirely when no appURL
+// is configured — we would rather send a title-only card than a broken link.
+func buildInboxMarkdown(item map[string]any, workspaceID, slug string, c copyPack) string {
 	title, _ := item["title"].(string)
 	typeStr, _ := item["type"].(string)
 	if title == "" && typeStr == "" {
@@ -80,7 +56,7 @@ func buildInboxMarkdown(item map[string]any, workspaceID, slug string) string {
 
 	var b strings.Builder
 	b.WriteString("**[")
-	b.WriteString(inboxTypeLabel(typeStr))
+	b.WriteString(c.label(typeStr))
 	b.WriteString("] ")
 	b.WriteString(title)
 	b.WriteString("**")
@@ -89,7 +65,7 @@ func buildInboxMarkdown(item map[string]any, workspaceID, slug string) string {
 		b.WriteString(body)
 	}
 	if link != "" {
-		b.WriteString("\n[查看详情](")
+		b.WriteString("\n[" + c.InboxDetailLink + "](")
 		b.WriteString(link)
 		b.WriteString(")")
 	}
@@ -99,10 +75,10 @@ func buildInboxMarkdown(item map[string]any, workspaceID, slug string) string {
 	}
 	// Truncate the body only. Prefix + link must survive intact so the
 	// user still gets the "view detail" affordance.
-	prefix := "**[" + inboxTypeLabel(typeStr) + "] " + title + "**"
+	prefix := "**[" + c.label(typeStr) + "] " + title + "**"
 	suffix := ""
 	if link != "" {
-		suffix = "\n[查看详情](" + link + ")"
+		suffix = "\n[" + c.InboxDetailLink + "](" + link + ")"
 	}
 	room := inboxMarkdownMaxLen - utf8.RuneCountInString(prefix) - utf8.RuneCountInString(suffix) - 4 // "\n...\n"
 	if room <= 0 {

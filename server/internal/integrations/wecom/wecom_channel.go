@@ -87,6 +87,10 @@ type wecomChannel struct {
 	// redelivers frames — the claim is what stops a redelivered voice note
 	// from drawing a second receipt. nil disables the receipt.
 	dedup engine.Deduper
+
+	// locale selects the copy this installation's users see (strings.go).
+	// The zero value resolves to DefaultLocale.
+	locale Locale
 }
 
 var _ channel.Channel = (*wecomChannel)(nil)
@@ -392,7 +396,7 @@ func (c *wecomChannel) replyUnsupportedMsgType(ctx context.Context, mc aibotMsgC
 		}
 		return
 	}
-	if err := sender.sendText(chatID, chatType, unsupportedMsgTypeText); err != nil {
+	if err := sender.sendText(chatID, chatType, copyFor(c.locale).UnsupportedMsgType); err != nil {
 		if relErr := c.dedup.Release(ctx, c.installationID, mc.MsgID, claim); relErr != nil {
 			log.Warn("wecom: release dedup claim failed", "error", relErr, "msg_id", mc.MsgID)
 		}
@@ -542,6 +546,7 @@ func newWecomFactory(deps ChannelDeps) channel.Factory {
 			logger:         logger,
 			senders:        deps.Senders,
 			dedup:          deps.Dedup,
+			locale:         resolveLocale(ic.Locale),
 		}, nil
 	}
 }

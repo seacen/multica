@@ -21,21 +21,15 @@ import (
 	"github.com/multica-ai/multica/server/internal/util"
 )
 
-const (
-	agentOfflineText  = "⚠️ 智能体当前不在线，你的消息已收到，等它上线后会处理。"
-	agentArchivedText = "⚠️ 该智能体已归档，无法回复。请联系工作区管理员。"
-	// unsupportedMsgTypeText answers a voice note / photo / file. Sent by the
-	// read loop (wecom_channel.go), not by the Replier — the message never
-	// reaches the engine — but it lives here with the other user-visible copy.
-	unsupportedMsgTypeText = "我目前只能处理文字消息，请用文字再发一次。"
-
-	bindingPromptPrefix = "👋 请先绑定你的 Multica 账号，才能与我对话：\n"
-	bindingPromptSuffix = "\n（链接 15 分钟内有效）"
-	// bindingPendingText replaces the link when the mint was throttled — the
-	// raw token behind the earlier link was never stored, so it cannot be
-	// reprinted.
-	bindingPendingText = "👋 绑定链接刚才已经发给你了，请点上一条消息里的链接完成绑定。"
-)
+// localeOf reads the copy language off the installation the Router resolved.
+// installationResolver stashes the hydrated wecom Installation in Platform;
+// anything else (a fake in a test, a future resolver) gets the default.
+func localeOf(inst engine.ResolvedInstallation) Locale {
+	if p, ok := inst.Platform.(Installation); ok {
+		return resolveLocale(p.Locale)
+	}
+	return DefaultLocale
+}
 
 // bindingMinter is the binding-token surface the replier needs.
 // *BindingTokenService satisfies it.
@@ -101,19 +95,20 @@ func NewOutboundReplier(cfg OutboundReplierConfig) *OutboundReplier {
 // logged, not propagated: the replier runs detached from the inbound ACK
 // path (the engine.Router owns that goroutine).
 func (r *OutboundReplier) Reply(ctx context.Context, inst engine.ResolvedInstallation, msg channel.InboundMessage, res engine.Result) {
+	c := copyFor(localeOf(inst))
 	switch res.Outcome {
 	case engine.OutcomeNeedsBinding:
-		if err := r.sendBindingPrompt(ctx, inst, msg, res); err != nil {
+		if err := r.sendBindingPrompt(ctx, inst, msg, res, c); err != nil {
 			r.logger.WarnContext(ctx, "wecom replier: binding prompt failed",
 				"installation_id", util.UUIDToString(inst.ID), "error", err)
 		}
 	case engine.OutcomeAgentOffline:
-		if err := r.post(ctx, inst, msg, agentOfflineText); err != nil {
+		if err := r.post(ctx, inst, msg, c.AgentOffline); err != nil {
 			r.logger.WarnContext(ctx, "wecom replier: offline notice failed",
 				"installation_id", util.UUIDToString(inst.ID), "error", err)
 		}
 	case engine.OutcomeAgentArchived:
-		if err := r.post(ctx, inst, msg, agentArchivedText); err != nil {
+		if err := r.post(ctx, inst, msg, c.AgentArchived); err != nil {
 			r.logger.WarnContext(ctx, "wecom replier: archived notice failed",
 				"installation_id", util.UUIDToString(inst.ID), "error", err)
 		}
@@ -122,7 +117,7 @@ func (r *OutboundReplier) Reply(ctx context.Context, inst engine.ResolvedInstall
 		// chat message stays silent (the agent's own reply lands via
 		// EventChatDone / Channel.Send).
 		if res.IssueID.Valid {
-			if err := r.post(ctx, inst, msg, issueCreatedText(res)); err != nil {
+			if err := r.post(ctx, inst, msg, issueCreatedText(res, c)); err != nil {
 				r.logger.WarnContext(ctx, "wecom replier: issue-created confirmation failed",
 					"installation_id", util.UUIDToString(inst.ID), "error", err)
 			}
@@ -130,7 +125,7 @@ func (r *OutboundReplier) Reply(ctx context.Context, inst engine.ResolvedInstall
 	}
 }
 
-func (r *OutboundReplier) sendBindingPrompt(ctx context.Context, inst engine.ResolvedInstallation, msg channel.InboundMessage, res engine.Result) error {
+func (r *OutboundReplier) sendBindingPrompt(ctx context.Context, inst engine.ResolvedInstallation, msg channel.InboundMessage, res engine.Result, c copyPack) error {
 	sender := res.Sender
 	if sender == "" {
 		sender = msg.Source.SenderID
@@ -152,11 +147,10 @@ func (r *OutboundReplier) sendBindingPrompt(ctx context.Context, inst engine.Res
 	// Only its hash was ever stored, so there is no URL to rebuild — point
 	// the user at the message they already have.
 	if token.Reused {
-		return r.post(ctx, inst, msg, bindingPendingText)
+		return r.post(ctx, inst, msg, c.BindingPending)
 	}
 	bindURL := r.appURL + r.bindingPath + "?token=" + url.QueryEscape(token.Raw)
-	text := bindingPromptPrefix + bindURL + bindingPromptSuffix
-	return r.post(ctx, inst, msg, text)
+	return r.post(ctx, inst, msg, c.BindingPromptPrefix+bindURL+c.BindingPromptSuffix)
 }
 
 // post looks up the installation's live wsSender in the registry and
@@ -183,14 +177,10 @@ func (r *OutboundReplier) post(ctx context.Context, inst engine.ResolvedInstalla
 	return sender.sendText(chatID, chatType, text)
 }
 
-func issueCreatedText(res engine.Result) string {
+func issueCreatedText(res engine.Result, c copyPack) string {
 	id := res.IssueIdentifier
 	if id == "" {
 		id = fmt.Sprintf("#%d", res.IssueNumber)
 	}
-	title := strings.TrimSpace(res.IssueTitle)
-	if title == "" {
-		return "✅ 已创建 " + id
-	}
-	return "✅ 已创建 " + id + " — " + title
+	return c.issueCreated(id, res.IssueTitle)
 }
