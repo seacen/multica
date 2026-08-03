@@ -533,6 +533,48 @@ func TestATaskThatIsGoneIsAskedAboutOnce(t *testing.T) {
 	}
 }
 
+// TestALookupThatFailedIsNotRetriedPerMessage — the read that failed is the
+// one worth caching most. A slow or flapping database is exactly when a batch
+// of transcript messages costs one round trip each, on the daemon's own
+// request, and that is how a spinner takes the transcript down with it.
+func TestALookupThatFailedIsNotRetriedPerMessage(t *testing.T) {
+	rig, bus, tasks, clock := busRig(t)
+	rig.typing.taskSessions.now = clock.now
+	tasks.err = errors.New("connection reset by peer")
+	rig.ingest(t, "REQ-42")
+
+	for i := 0; i < 8; i++ {
+		bus.Publish(taskMessageEvent(chatTaskID(), toolUse("Read", map[string]any{"file_path": "x.go"})))
+	}
+
+	if tasks.count() != 1 {
+		t.Fatalf("read the task row %d times for one batch of messages", tasks.count())
+	}
+}
+
+// TestAFailedLookupIsForgottenQuickly — the other side of it. Unlike a task
+// with no session, a failure is not an answer, so it may only be remembered
+// long enough to cover the batch that provoked it.
+func TestAFailedLookupIsForgottenQuickly(t *testing.T) {
+	rig, bus, tasks, clock := busRig(t)
+	rig.typing.taskSessions.now = clock.now
+	tasks.err = errors.New("connection reset by peer")
+	rig.ingest(t, "REQ-42")
+
+	bus.Publish(taskMessageEvent(chatTaskID(), toolUse("Read", map[string]any{"file_path": "x.go"})))
+	clock.advance(taskSessionFailTTL + time.Second)
+	tasks.err = nil
+	bus.Publish(taskMessageEvent(chatTaskID(), toolUse("Read", map[string]any{"file_path": "y.go"})))
+
+	if tasks.count() != 2 {
+		t.Fatalf("asked %d times; a database that came back has to be asked again", tasks.count())
+	}
+	frames := streamViews(t, &rig.conn.recordingConn)
+	if len(frames) != 2 || !strings.Contains(frames[1].Content, "y.go") {
+		t.Fatalf("the bubble never got the step the recovered lookup found: %+v", frames)
+	}
+}
+
 // TestProgressSubscribersAreRaceFree — task:message is published from the
 // daemon's HTTP handler, chat:done from another, and the guard timer from a
 // third. Run under -race.

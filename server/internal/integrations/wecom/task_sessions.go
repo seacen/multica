@@ -27,15 +27,26 @@ const (
 	// live bubble ever re-reads the row it already read.
 	taskSessionTTL = 10 * time.Minute
 
+	// taskSessionFailTTL is how long a read that FAILED is remembered. A
+	// failure is not an answer — the row may be perfectly readable a moment
+	// later — so it is held only long enough to cover the batch that provoked
+	// it. That is the whole point: a database slow enough to fail is a database
+	// slow enough that asking it once per transcript message spends the
+	// daemon's entire request.
+	taskSessionFailTTL = 2 * time.Second
+
 	// taskSessionMax bounds the map on a busy workspace. Well above the number
 	// of tasks that can be in flight inside one TTL; hitting it means
 	// something unusual, and dropping the oldest entries costs one query each.
 	taskSessionMax = 512
 )
 
+// taskSessionEntry is one remembered answer. until is stamped per entry rather
+// than derived from one TTL because the two kinds of answer are worth keeping
+// for very different lengths of time.
 type taskSessionEntry struct {
 	session pgtype.UUID // invalid means "this task has no chat session"
-	at      time.Time
+	until   time.Time
 }
 
 type taskSessionCache struct {
@@ -68,7 +79,7 @@ func (c *taskSessionCache) get(taskID string) (pgtype.UUID, bool) {
 	if !ok {
 		return pgtype.UUID{}, false
 	}
-	if c.now().Sub(entry.at) > c.ttl {
+	if !c.now().Before(entry.until) {
 		delete(c.byTask, taskID)
 		return pgtype.UUID{}, false
 	}
@@ -77,6 +88,17 @@ func (c *taskSessionCache) get(taskID string) (pgtype.UUID, bool) {
 
 // put records an answer, including the answer "none".
 func (c *taskSessionCache) put(taskID string, session pgtype.UUID) {
+	c.record(taskID, session, c.ttl)
+}
+
+// putFailure records that the read did not work, so the rest of the batch stops
+// re-asking. The caller reads it back as "no session", which is the right
+// behaviour either way: with no session there is no bubble to write into.
+func (c *taskSessionCache) putFailure(taskID string) {
+	c.record(taskID, pgtype.UUID{}, taskSessionFailTTL)
+}
+
+func (c *taskSessionCache) record(taskID string, session pgtype.UUID, ttl time.Duration) {
 	if taskID == "" {
 		return
 	}
@@ -86,7 +108,7 @@ func (c *taskSessionCache) put(taskID string, session pgtype.UUID) {
 	if len(c.byTask) >= c.max {
 		c.evictLocked(now)
 	}
-	c.byTask[taskID] = taskSessionEntry{session: session, at: now}
+	c.byTask[taskID] = taskSessionEntry{session: session, until: now.Add(ttl)}
 }
 
 func (c *taskSessionCache) size() int {
@@ -101,7 +123,7 @@ func (c *taskSessionCache) size() int {
 // Caller holds c.mu.
 func (c *taskSessionCache) evictLocked(now time.Time) {
 	for k, e := range c.byTask {
-		if now.Sub(e.at) > c.ttl {
+		if !now.Before(e.until) {
 			delete(c.byTask, k)
 		}
 	}

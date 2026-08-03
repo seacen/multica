@@ -367,7 +367,13 @@ func (m *TypingIndicatorManager) refreshFromTask(e events.Event, step progressSt
 				m.taskSessions.put(taskID, pgtype.UUID{})
 				return
 			case err != nil:
-				return // a read that failed; not cached, the next one may work
+				// A failure is not an answer, but re-asking is worse than
+				// waiting: the rest of this batch would each put another round
+				// trip on the daemon's request, on a database that has just
+				// shown it is in no state to serve them. Remembered for
+				// seconds, not minutes.
+				m.taskSessions.putFailure(taskID)
+				return
 			}
 			sessionID = task.ChatSessionID
 			m.taskSessions.put(taskID, sessionID)
