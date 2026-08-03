@@ -67,8 +67,14 @@ type gorillaWSConn struct {
 // Connect() call and dropped when the connection ends.
 type wsSender struct {
 	conn wsConn
-	mu   sync.Mutex
 	log  *slog.Logger
+
+	// wmu serializes writes — gorilla forbids concurrent ones. A one-slot
+	// channel rather than a Mutex because a caller with a deadline has to be
+	// able to stop waiting for its turn: a mid-run refresh runs on the daemon's
+	// own transcript request, and queueing behind a 20KB answer would spend
+	// that request's whole budget on a spinner in one chat.
+	wmu chan struct{}
 
 	// waiters holds the frames whose verdict somebody is standing by for,
 	// keyed by req_id. Most writes are fire-and-forget — a ping, a push — but
@@ -139,11 +145,31 @@ func newWSSender(conn wsConn, log *slog.Logger) *wsSender {
 	return &wsSender{
 		conn:       conn,
 		log:        log,
+		wmu:        make(chan struct{}, 1),
 		waiters:    make(map[string]*ackWaiter),
 		streams:    make(map[string]*streamAcks),
 		ackTimeout: ackTimeout,
 	}
 }
+
+// lockWriter takes the writer, or gives up when ctx does. A caller with no
+// deadline of its own — the ping, the subscribe handshake, a proactive push —
+// passes context.Background() and waits as long as it takes.
+func (s *wsSender) lockWriter(ctx context.Context) error {
+	select {
+	case s.wmu <- struct{}{}:
+		return nil
+	default:
+	}
+	select {
+	case s.wmu <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *wsSender) unlockWriter() { <-s.wmu }
 
 // ackTimeout caps the wait for a verdict. WeCom answers in a few hundred
 // milliseconds; past this we assume the ack was lost rather than the frame
@@ -262,8 +288,8 @@ func (s *wsSender) cancelAck(reqID string, w *ackWaiter) {
 
 // beginStreamFrameLocked reserves the next place in a req_id's write order for
 // the frame that is about to go out, and refuses a non-final frame once the
-// closing frame has been written. Caller holds s.mu, which is what makes the
-// refusal airtight: the seal and the write it fences are decided inside the
+// closing frame has been written. Caller holds the writer, which is what makes
+// the refusal airtight: the seal and the write it fences are decided inside the
 // same critical section, so a refresh can never slip between the two and land
 // on top of the answer.
 func (s *wsSender) beginStreamFrameLocked(reqID string, w *ackWaiter, finish bool) bool {
@@ -292,7 +318,7 @@ func (s *wsSender) beginStreamFrameLocked(reqID string, w *ackWaiter, finish boo
 // reached the socket, so one failed write does not put every later verdict on
 // this req_id out of step. The seal is not given back: a turn whose closing
 // frame failed is over either way, and the caller has already fallen back to a
-// plain message. Caller holds s.mu.
+// plain message. Caller holds the writer.
 func (s *wsSender) abortStreamFrameLocked(reqID string) {
 	s.ackMu.Lock()
 	defer s.ackMu.Unlock()
@@ -321,7 +347,10 @@ func (s *wsSender) pruneStreamsLocked() {
 }
 
 // respondStream writes one frame of a streaming reply and waits for the
-// server's verdict.
+// server's verdict. ctx bounds the whole thing — the wait for the writer, the
+// write itself and the wait for the ack — because the caller on the progress
+// path is the daemon's transcript request and none of those three is otherwise
+// bounded by anything the caller chose.
 //
 // reqID is not ours to choose: every frame of one stream must echo the req_id
 // of the aibot_msg_callback that opened the turn, or the server refuses it
@@ -330,6 +359,9 @@ func (s *wsSender) pruneStreamsLocked() {
 func (s *wsSender) respondStream(ctx context.Context, reqID, streamID, content string, finish bool) error {
 	if reqID == "" {
 		return errors.New("wecom: stream frame requires the callback req_id")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	body, err := respondStreamBody(streamID, content, finish)
 	if err != nil {
@@ -340,7 +372,7 @@ func (s *wsSender) respondStream(ctx context.Context, reqID, streamID, content s
 	if !ok {
 		return errStreamBusy
 	}
-	if err := s.writeStreamFrame(reqID, w, finish, map[string]any{
+	if err := s.writeStreamFrame(ctx, reqID, w, finish, map[string]any{
 		"cmd":     cmdRespondMsg,
 		"headers": frameHeaders{ReqID: reqID},
 		"body":    body,
@@ -369,17 +401,21 @@ func (s *wsSender) respondStream(ctx context.Context, reqID, streamID, content s
 	}
 }
 
-// write marshals frame to JSON and pushes it under the writer mutex. The
-// caller must not hold sendMu on wecomChannel — nothing here reaches back
-// into the Channel.
+// write marshals frame to JSON and pushes it under the writer mutex. Used by
+// the callers with nobody waiting on them — the ping, the subscribe handshake,
+// a proactive push — which wait for their turn however long it takes. The
+// caller must not hold sendMu on wecomChannel; nothing here reaches back into
+// the Channel.
 func (s *wsSender) write(frame map[string]any) error {
 	payload, err := json.Marshal(frame)
 	if err != nil {
 		return fmt.Errorf("wecom: marshal frame: %w", err)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.writeLocked(payload)
+	if err := s.lockWriter(context.Background()); err != nil {
+		return err
+	}
+	defer s.unlockWriter()
+	return s.writeLocked(context.Background(), payload)
 }
 
 // writeStreamFrame is write() for a stream frame: the same serialized push,
@@ -388,26 +424,41 @@ func (s *wsSender) write(frame map[string]any) error {
 // closing frame is dropped here rather than sent — the bubble is sealed, and a
 // frame the server might still accept would paint "reading config.go" over the
 // answer.
-func (s *wsSender) writeStreamFrame(reqID string, w *ackWaiter, finish bool, frame map[string]any) error {
+//
+// Unlike write() this one honours a deadline, at both places a write can stall:
+// waiting for the writer and waiting for the socket.
+func (s *wsSender) writeStreamFrame(ctx context.Context, reqID string, w *ackWaiter, finish bool, frame map[string]any) error {
 	payload, err := json.Marshal(frame)
 	if err != nil {
 		return fmt.Errorf("wecom: marshal frame: %w", err)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if err := s.lockWriter(ctx); err != nil {
+		return err
+	}
+	defer s.unlockWriter()
 	if !s.beginStreamFrameLocked(reqID, w, finish) {
 		return errStreamSuperseded
 	}
-	if err := s.writeLocked(payload); err != nil {
+	if err := s.writeLocked(ctx, payload); err != nil {
 		s.abortStreamFrameLocked(reqID)
 		return err
 	}
 	return nil
 }
 
-// writeLocked pushes one already-marshalled frame. Caller holds s.mu.
-func (s *wsSender) writeLocked(payload []byte) error {
-	if err := s.conn.SetWriteDeadline(time.Now().Add(writeDeadline)); err != nil {
+// writeLocked pushes one already-marshalled frame. Caller holds the writer.
+//
+// The socket deadline is the sooner of the connection's own writeDeadline and
+// whatever the caller gave itself. A frame is a few kilobytes, so a socket that
+// cannot take one inside a caller's budget is congested rather than busy, and
+// the Supervisor's reconnect is the designed answer to that — a better one than
+// holding the daemon's transcript request for ten seconds.
+func (s *wsSender) writeLocked(ctx context.Context, payload []byte) error {
+	deadline := time.Now().Add(writeDeadline)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	if err := s.conn.SetWriteDeadline(deadline); err != nil {
 		return err
 	}
 	return s.conn.WriteMessage(websocket.TextMessage, payload)

@@ -53,6 +53,11 @@ const streamCloseTimeout = 10 * time.Second
 // numbers together are 1.8s, which leaves the request its own work with room
 // to spare, and a refresh that has not been acked inside a second is one the
 // user would not have seen anyway — the next tool call is 500ms behind it.
+//
+// progressWriteTimeout is a ceiling and not a hope: respondStream bounds the
+// wait for the writer and the socket write by it as well as the wait for the
+// ack, so the whole refresh returns inside the second whatever the socket is
+// doing (ws_sender.go).
 const (
 	progressWriteTimeout = 1 * time.Second
 	taskLookupTimeout    = 800 * time.Millisecond
