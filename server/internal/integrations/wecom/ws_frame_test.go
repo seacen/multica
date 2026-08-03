@@ -138,30 +138,42 @@ func TestDecodeMixedCallback(t *testing.T) {
 	if mc.Mixed.MsgItem[1].MsgType != "image" {
 		t.Errorf("item 1 msgtype = %q", mc.Mixed.MsgItem[1].MsgType)
 	}
-	text, ok := mc.routableText()
+	text, ok := mc.routableText(copyFor(DefaultLocale))
 	if !ok {
 		t.Fatal("a mixed message with two text runs has something to ingest")
 	}
-	if text != "看这张\n行不行" {
-		t.Errorf("routableText = %q, want both runs joined in order", text)
+	// The picture between them has no aeskey on this fixture but it does have
+	// a url, so it renders as a placeholder in the position it was composed.
+	want := "看这张\n" + copyFor(DefaultLocale).MediaImage + "\n行不行"
+	if text != want {
+		t.Errorf("routableText = %q, want %q", text, want)
 	}
 }
 
-// TestRoutableText is the whole "what can this adapter ingest" decision in one
-// table. CapText is all we declare, so anything without words takes the
-// receipt path instead of the engine.
+// TestRoutableText is the whole "what can this adapter read" decision in one
+// table. Words are ingested as themselves and attachments as a placeholder
+// standing in for bytes that arrive later; only a message with neither takes
+// the receipt path.
 func TestRoutableText(t *testing.T) {
+	c := copyFor(DefaultLocale)
+	// items are (msgtype, payload): for a text or voice run the payload is
+	// the content, for an attachment it is the url.
 	mixed := func(items ...[2]string) aibotMsgCallback {
 		mc := aibotMsgCallback{MsgType: "mixed"}
 		for _, it := range items {
-			var item struct {
-				MsgType string `json:"msgtype"`
-				Text    struct {
-					Content string `json:"content"`
-				} `json:"text"`
+			item := mixedItem{MsgType: it[0]}
+			switch it[0] {
+			case "text":
+				item.Text.Content = it[1]
+			case "voice":
+				item.Voice.Content = it[1]
+			case "image":
+				item.Image = mediaBody{URL: it[1]}
+			case "file":
+				item.File = mediaBody{URL: it[1]}
+			case "video":
+				item.Video = mediaBody{URL: it[1]}
 			}
-			item.MsgType = it[0]
-			item.Text.Content = it[1]
 			mc.Mixed.MsgItem = append(mc.Mixed.MsgItem, item)
 		}
 		return mc
@@ -169,6 +181,23 @@ func TestRoutableText(t *testing.T) {
 	text := func(s string) aibotMsgCallback {
 		mc := aibotMsgCallback{MsgType: "text"}
 		mc.Text.Content = s
+		return mc
+	}
+	media := func(msgType, url string) aibotMsgCallback {
+		mc := aibotMsgCallback{MsgType: msgType}
+		switch msgType {
+		case "image":
+			mc.Image = mediaBody{URL: url}
+		case "file":
+			mc.File = mediaBody{URL: url}
+		case "video":
+			mc.Video = mediaBody{URL: url}
+		}
+		return mc
+	}
+	voice := func(s string) aibotMsgCallback {
+		mc := aibotMsgCallback{MsgType: "voice"}
+		mc.Voice.Content = s
 		return mc
 	}
 
@@ -184,25 +213,70 @@ func TestRoutableText(t *testing.T) {
 			mc.MsgType = "TEXT"
 			return mc
 		}(), "你好", true},
-		{"voice note", aibotMsgCallback{MsgType: "voice"}, "", false},
-		{"photo", aibotMsgCallback{MsgType: "image"}, "", false},
-		{"file drop", aibotMsgCallback{MsgType: "file"}, "", false},
-		{"video", aibotMsgCallback{MsgType: "video"}, "", false},
+		{"voice note", voice("明天见"), "明天见", true},
+		{"voice note nobody said anything in", voice("  "), "", false},
+		{"photo", media("image", "https://cos.invalid/a"), c.MediaImage, true},
+		{"file drop", media("file", "https://cos.invalid/b"), c.MediaFile, true},
+		{"video", media("video", "https://cos.invalid/c"), c.MediaVideo, true},
+		{"photo with nothing to fetch", media("image", ""), "", false},
 		{"unknown future type", aibotMsgCallback{MsgType: "sphere_of_influence"}, "", false},
-		{"mixed with one run", mixed([2]string{"text", "看这张"}, [2]string{"image", ""}), "看这张", true},
-		{"mixed with only pictures", mixed([2]string{"image", ""}), "", false},
-		{"mixed whose run is blank", mixed([2]string{"text", "   "}, [2]string{"image", ""}), "", false},
+		{"mixed, words then picture", mixed([2]string{"text", "看这张"}, [2]string{"image", "https://cos.invalid/a"}),
+			"看这张\n" + c.MediaImage, true},
+		{"mixed, picture then words", mixed([2]string{"image", "https://cos.invalid/a"}, [2]string{"text", "看这张"}),
+			c.MediaImage + "\n看这张", true},
+		{"mixed with only pictures", mixed([2]string{"image", "https://cos.invalid/a"}), c.MediaImage, true},
+		{"mixed whose run is blank", mixed([2]string{"text", "   "}, [2]string{"image", "https://cos.invalid/a"}), c.MediaImage, true},
+		{"mixed with nothing usable in it", mixed([2]string{"text", "  "}, [2]string{"image", ""}), "", false},
 	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			got, ok := c.mc.routableText()
-			if ok != c.wantOK {
-				t.Fatalf("ok = %v, want %v", ok, c.wantOK)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := tc.mc.routableText(c)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
 			}
-			if got != c.wantText {
-				t.Errorf("text = %q, want %q", got, c.wantText)
+			if got != tc.wantText {
+				t.Errorf("text = %q, want %q", got, tc.wantText)
 			}
 		})
+	}
+}
+
+// TestAttachmentsListsWhatToFetch — the descriptors the MediaResolver runs
+// on. A url that is not there is not an attachment: carrying it forward would
+// buy the message a media deadline and an intent-ledger row for an object
+// that can never exist.
+func TestAttachmentsListsWhatToFetch(t *testing.T) {
+	mc := aibotMsgCallback{MsgType: "mixed"}
+	mc.Mixed.MsgItem = []mixedItem{
+		{MsgType: "text"},
+		{MsgType: "image", Image: mediaBody{URL: "https://cos.invalid/a", AESKey: "k1"}},
+		{MsgType: "image"},
+		{MsgType: "file", File: mediaBody{URL: "https://cos.invalid/b", AESKey: "k2"}},
+		{MsgType: "video", Video: mediaBody{URL: "https://cos.invalid/c", AESKey: "k3"}},
+		{MsgType: "sticker"},
+	}
+	got := mc.attachments()
+	want := []InboundMedia{
+		{Kind: channel.MsgTypeImage, URL: "https://cos.invalid/a", AESKey: "k1"},
+		{Kind: channel.MsgTypeFile, URL: "https://cos.invalid/b", AESKey: "k2"},
+		{Kind: channel.MsgTypeVideo, URL: "https://cos.invalid/c", AESKey: "k3"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("attachments = %d, want %d: %+v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("attachment %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+
+	standalone := aibotMsgCallback{MsgType: "image"}
+	standalone.Image = mediaBody{URL: "https://cos.invalid/solo", AESKey: "k"}
+	if got := standalone.attachments(); len(got) != 1 || got[0].Kind != channel.MsgTypeImage {
+		t.Fatalf("a standalone photo listed %+v", got)
+	}
+	if got := (aibotMsgCallback{MsgType: "text"}).attachments(); len(got) != 0 {
+		t.Fatalf("a text message listed %d attachments", len(got))
 	}
 }
 
@@ -259,7 +333,7 @@ func TestChannelMessageFromCallbackRoutingIdentity(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			env, mc := decodeCallback(t, c.raw)
-			text, ok := mc.routableText()
+			text, ok := mc.routableText(copyFor(DefaultLocale))
 			if !ok {
 				t.Fatal("fixture is a text message")
 			}
@@ -297,7 +371,7 @@ func TestChannelMessageFromCallbackRoutingIdentity(t *testing.T) {
 // the sender off Raw, so a rename there breaks routing silently.
 func TestChannelMessageRawCarriesThePlatformFields(t *testing.T) {
 	env, mc := decodeCallback(t, groupTextFrame)
-	text, _ := mc.routableText()
+	text, _ := mc.routableText(copyFor(DefaultLocale))
 	msg := channelMessageFromCallback("wb1234567890abcdef", mc, text, env.Headers.ReqID)
 
 	wm, err := wecomMsgFromRaw(msg)

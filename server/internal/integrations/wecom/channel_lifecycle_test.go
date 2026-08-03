@@ -513,19 +513,22 @@ func TestUnsupportedTypeWithoutADedupKeyStaysSilent(t *testing.T) {
 }
 
 // TestCapabilitiesAndTypeStayHonest — the mask is a promise about what the
-// adapter can actually do. CapVoice is honest because WeCom transcribes voice
-// notes itself; CapAttachment is not, because nothing downloads the media yet.
+// adapter can actually do. CapVoice because WeCom transcribes voice notes
+// itself, CapAttachment because photos and files are downloaded, decrypted
+// and bound to the message. CapRichCard is the one still missing: nothing
+// here builds a template_card.
 func TestCapabilitiesAndTypeStayHonest(t *testing.T) {
 	c := &wecomChannel{}
 	if c.Type() != TypeWecom {
 		t.Errorf("Type = %q", c.Type())
 	}
-	want := channel.CapText | channel.CapVoice | channel.CapTypingIndicator | channel.CapMessageEdit
+	want := channel.CapText | channel.CapVoice | channel.CapAttachment |
+		channel.CapTypingIndicator | channel.CapMessageEdit
 	if c.Capabilities() != want {
 		t.Errorf("Capabilities = %v, want %v", c.Capabilities(), want)
 	}
-	if c.Capabilities().Has(channel.CapAttachment) {
-		t.Error("attachments are still not deliverable; declaring them would produce messages we cannot send")
+	if c.Capabilities().Has(channel.CapRichCard) {
+		t.Error("no card is ever built; declaring rich cards would make callers degrade the wrong way")
 	}
 	if err := c.Disconnect(context.Background()); err != nil {
 		t.Errorf("Disconnect: %v", err)

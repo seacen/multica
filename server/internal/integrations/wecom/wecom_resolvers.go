@@ -71,17 +71,20 @@ type (
 )
 
 // NewResolverSet assembles the wecom ResolverSet from the store, the shared
-// chat-session service, an outbound replier and the typing indicator.
+// chat-session service, an outbound replier, the typing indicator and the
+// media resolver.
 //
-// Replier and typing are both optional: pass nil to disable outbound binding
-// prompts or the streaming bubble. They are taken as concrete types rather
-// than interfaces so a nil argument leaves the field nil instead of a
-// typed-nil interface the Router would happily call.
+// The last three are optional: pass nil to disable outbound binding prompts,
+// the streaming bubble, or inbound media. Replier and typing are taken as
+// concrete types rather than interfaces so a nil argument leaves the field nil
+// instead of a typed-nil interface the Router would happily call; media is
+// already an interface value the caller either built or did not.
 func NewResolverSet(
 	store *Store,
 	session engineSessionBinder,
 	replier engine.OutboundReplier,
 	typing *TypingIndicatorManager,
+	media engine.MediaResolver,
 ) engine.ResolverSet {
 	set := engine.ResolverSet{
 		Installation: &installationResolver{store: store},
@@ -97,6 +100,9 @@ func NewResolverSet(
 	if typing != nil {
 		set.Typing = typing
 	}
+	if media != nil {
+		set.Media = media
+	}
 	return set
 }
 
@@ -107,6 +113,7 @@ func NewResolverSet(
 type engineSessionBinder interface {
 	EnsureSession(ctx context.Context, in engine.EnsureSessionInput) (pgtype.UUID, error)
 	AppendUserMessage(ctx context.Context, in engine.AppendInput) (engine.AppendResult, error)
+	BindMediaRefs(ctx context.Context, in engine.BindMediaInput) error
 }
 
 // ---- installation routing ----
@@ -263,17 +270,29 @@ func (r *sessionBinder) AppendMessage(ctx context.Context, p engine.AppendParams
 		CommandText:    p.Message.Text, // wecom has no enrichment; command == body
 		MessageID:      p.Message.MessageID,
 		ClaimToken:     p.ClaimToken,
+		// The budget the agent run waits out before giving up on the
+		// attachments. Passing it is what makes the run see the photo rather
+		// than only the "[图片]" standing in for it: the task row is deferred
+		// to this deadline and promoted early the moment binding finishes.
+		// It is zero for a message with no media, so a plain sentence is
+		// never held back.
+		MediaPendingSeconds: p.MediaPendingSeconds,
 	})
 }
 
-// BindMedia is a no-op for wecom. The wecom ResolverSet registers no
-// MediaResolver, so the Router never resolves media for a wecom message
-// (resolveMedia stays false) and this method is never called at runtime; it
-// exists only to satisfy engine.SessionBinder. If wecom gains inbound media
-// support, wire this to a BindMediaRefs on the session store, mirroring the
-// lark binder.
+// BindMedia attaches the objects the MediaResolver stored to this message.
+// The Router calls it off the connector ACK path, after the download and
+// upload have finished, with whatever survived — an empty ref list still
+// arrives, and still has to clear the message's pending marker so the
+// deferred run stops waiting.
 func (r *sessionBinder) BindMedia(ctx context.Context, p engine.BindMediaParams) error {
-	return nil
+	return r.session.BindMediaRefs(ctx, engine.BindMediaInput{
+		MessageID:   p.MessageID,
+		SessionID:   p.SessionID,
+		WorkspaceID: p.WorkspaceID,
+		Sender:      p.Sender,
+		MediaRefs:   p.MediaRefs,
+	})
 }
 
 // ---- audit ----

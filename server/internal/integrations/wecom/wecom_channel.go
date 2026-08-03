@@ -99,9 +99,10 @@ func (c *wecomChannel) Type() channel.Type { return TypeWecom }
 
 // Capabilities declares what the aibot adapter supports today. CapVoice is
 // declared because WeCom transcribes voice notes on its own side and delivers
-// the text, so the adapter handles them end to end without touching audio.
-// Photos and files still arrive as bodies we do not download, so CapAttachment
-// stays undeclared.
+// the text; CapAttachment because photos, files and video are downloaded,
+// decrypted and bound to the message as attachments (media_ingest.go). The
+// bit is about receiving — sending an attachment back would need the
+// aibot_upload_media_* dance, which nothing here does yet.
 //
 // The typing-indicator and message-edit bits are one mechanism, not two: a
 // streaming reply's opening frame IS the indicator and its closing frame IS
@@ -109,7 +110,8 @@ func (c *wecomChannel) Type() channel.Type { return TypeWecom }
 // the mask to decide "can this channel show progress" and one asking "can this
 // channel replace what it already said" both get a true answer.
 func (c *wecomChannel) Capabilities() channel.Capability {
-	return channel.CapText | channel.CapVoice | channel.CapTypingIndicator | channel.CapMessageEdit
+	return channel.CapText | channel.CapVoice | channel.CapAttachment |
+		channel.CapTypingIndicator | channel.CapMessageEdit
 }
 
 // Disconnect is a no-op: the WS connection's whole lifetime is scoped to
@@ -304,11 +306,12 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 			log.Warn("wecom: bad aibot_msg_callback body", "error", err)
 			return nil
 		}
-		text, ok := mc.routableText()
+		text, ok := mc.routableText(copyFor(c.locale))
 		if !ok {
-			// A voice note, photo or file. The adapter declares CapText, so
-			// there is nothing to ingest — but silence reads as a broken bot,
-			// so answer instead of dropping.
+			// Nothing in this message can be read: a kind the adapter does
+			// not know, or a known kind that arrived without the one field
+			// that makes it usable. Silence reads as a broken bot, so answer
+			// instead of dropping.
 			c.replyUnsupportedMsgType(ctx, mc, sender, log)
 			return nil
 		}

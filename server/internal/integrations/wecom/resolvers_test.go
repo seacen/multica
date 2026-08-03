@@ -56,7 +56,7 @@ func wecomInbound(botID, chatID, senderID string, chatType channel.ChatType) cha
 // ---- the set itself ----
 
 func TestNewResolverSetIsComplete(t *testing.T) {
-	set := NewResolverSet(nil, nil, nil, nil)
+	set := NewResolverSet(nil, nil, nil, nil, nil)
 	if set.Installation == nil || set.Identity == nil || set.Dedup == nil || set.Session == nil || set.Audit == nil {
 		t.Fatal("all five required resolvers must be populated")
 	}
@@ -70,15 +70,19 @@ func TestNewResolverSetIsComplete(t *testing.T) {
 		t.Error("a nil typing manager must leave Typing nil, not a typed-nil interface the Router would call")
 	}
 	if set.Media != nil {
-		t.Error("wecom does not resolve inbound media; Media must stay nil")
+		t.Error("a nil media resolver must leave Media nil, not a typed-nil interface the Router would call")
 	}
 
-	set = NewResolverSet(nil, nil, NewOutboundReplier(OutboundReplierConfig{}), NewTypingIndicator(TypingIndicatorConfig{}))
+	set = NewResolverSet(nil, nil, NewOutboundReplier(OutboundReplierConfig{}), NewTypingIndicator(TypingIndicatorConfig{}),
+		NewMediaResolver(nil, nil, nil, testLogger()))
 	if set.Replier == nil {
 		t.Error("a real replier must reach ResolverSet.Replier")
 	}
 	if set.Typing == nil {
 		t.Error("a real typing manager must reach ResolverSet.Typing")
+	}
+	if set.Media == nil {
+		t.Error("a real media resolver must reach ResolverSet.Media, or inbound photos are never fetched")
 	}
 }
 
@@ -409,11 +413,13 @@ func TestNewInboundDeduperIsTheSameTwoPhaseSurface(t *testing.T) {
 // ---- session binding ----
 
 type fakeSessionBinder struct {
-	ensured   engine.EnsureSessionInput
-	appended  engine.AppendInput
-	sessionID pgtype.UUID
-	ensureErr error
-	appendErr error
+	ensured    engine.EnsureSessionInput
+	appended   engine.AppendInput
+	mediaBound engine.BindMediaInput
+	sessionID  pgtype.UUID
+	ensureErr  error
+	appendErr  error
+	bindErr    error
 }
 
 func (f *fakeSessionBinder) EnsureSession(_ context.Context, in engine.EnsureSessionInput) (pgtype.UUID, error) {
@@ -424,6 +430,11 @@ func (f *fakeSessionBinder) EnsureSession(_ context.Context, in engine.EnsureSes
 func (f *fakeSessionBinder) AppendUserMessage(_ context.Context, in engine.AppendInput) (engine.AppendResult, error) {
 	f.appended = in
 	return engine.AppendResult{MessageID: uuidOf(5)}, f.appendErr
+}
+
+func (f *fakeSessionBinder) BindMediaRefs(_ context.Context, in engine.BindMediaInput) error {
+	f.mediaBound = in
+	return f.bindErr
 }
 
 // TestSessionIsolationKey — one session per person in a DM, one per room in a
@@ -515,15 +526,74 @@ func TestAppendCarriesTheDedupFence(t *testing.T) {
 	if in.MessageID != "MSGID-001" {
 		t.Errorf("platform MessageID = %q", in.MessageID)
 	}
+	if in.MediaPendingSeconds != 0 {
+		t.Errorf("MediaPendingSeconds = %v for a text message, want 0", in.MediaPendingSeconds)
+	}
 }
 
-// TestBindMediaIsANoOp — wecom registers no MediaResolver, so this exists
-// only to satisfy the interface. If it ever starts doing work, the CapText
-// declaration is a lie.
-func TestBindMediaIsANoOp(t *testing.T) {
-	b := &sessionBinder{session: &fakeSessionBinder{}}
-	if err := b.BindMedia(context.Background(), engine.BindMediaParams{}); err != nil {
+// TestAppendCarriesTheMediaBudget — the Router computes how long the agent
+// run should wait for attachments; dropping it on the floor here is what
+// makes the run start against a bare placeholder.
+func TestAppendCarriesTheMediaBudget(t *testing.T) {
+	fake := &fakeSessionBinder{}
+	b := &sessionBinder{session: fake}
+
+	if _, err := b.AppendMessage(context.Background(), engine.AppendParams{
+		SessionID:           uuidOf(6),
+		Message:             wecomInbound("wb-1", "T-alex", "T-alex", channel.ChatTypeP2P),
+		MediaPendingSeconds: 45,
+	}); err != nil {
+		t.Fatalf("AppendMessage: %v", err)
+	}
+	if fake.appended.MediaPendingSeconds != 45 {
+		t.Fatalf("MediaPendingSeconds = %v, want 45", fake.appended.MediaPendingSeconds)
+	}
+}
+
+// TestBindMediaReachesTheSessionStore — the Router hands over what the
+// resolver stored and this is where it becomes an attachment row. A mapping
+// slip here loses the photo silently: the message keeps its "[图片]" and
+// nothing says why.
+func TestBindMediaReachesTheSessionStore(t *testing.T) {
+	fake := &fakeSessionBinder{}
+	b := &sessionBinder{session: fake}
+	refs := []channel.MediaRef{{
+		Type:       channel.MsgTypeImage,
+		StorageKey: "workspaces/w/wecom/i/abc",
+		StorageURL: "https://objects.invalid/workspaces/w/wecom/i/abc",
+		Filename:   "whiteboard.png",
+		MimeType:   "image/png",
+		SizeBytes:  4096,
+	}}
+	if err := b.BindMedia(context.Background(), engine.BindMediaParams{
+		MessageID:   uuidOf(5),
+		SessionID:   uuidOf(6),
+		WorkspaceID: uuidOf(2),
+		Sender:      uuidOf(7),
+		MediaRefs:   refs,
+	}); err != nil {
 		t.Fatalf("BindMedia: %v", err)
+	}
+	in := fake.mediaBound
+	if in.MessageID != uuidOf(5) || in.SessionID != uuidOf(6) || in.WorkspaceID != uuidOf(2) || in.Sender != uuidOf(7) {
+		t.Errorf("bind input = %+v", in)
+	}
+	if len(in.MediaRefs) != 1 || in.MediaRefs[0] != refs[0] {
+		t.Errorf("refs did not survive the mapping: %+v", in.MediaRefs)
+	}
+}
+
+// TestBindMediaStillRunsWithNothingToBind — an empty ref list is not a no-op:
+// it is what clears the message's pending marker so the deferred agent run
+// stops waiting on media that never arrived.
+func TestBindMediaStillRunsWithNothingToBind(t *testing.T) {
+	fake := &fakeSessionBinder{}
+	b := &sessionBinder{session: fake}
+	if err := b.BindMedia(context.Background(), engine.BindMediaParams{MessageID: uuidOf(5), SessionID: uuidOf(6)}); err != nil {
+		t.Fatalf("BindMedia: %v", err)
+	}
+	if fake.mediaBound.MessageID != uuidOf(5) {
+		t.Fatal("BindMedia swallowed the call instead of clearing the marker")
 	}
 }
 

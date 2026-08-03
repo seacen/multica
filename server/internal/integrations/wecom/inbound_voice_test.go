@@ -76,7 +76,7 @@ func TestVoiceMessageWithBlankTranscriptGetsAReceipt(t *testing.T) {
 func TestVoiceRoutableTextIsTheTranscriptVerbatim(t *testing.T) {
 	mc := aibotMsgCallback{MsgType: "voice"}
 	mc.Voice.Content = "  明天 10 点，和 Alex 对一下 Q3 的数  "
-	got, ok := mc.routableText()
+	got, ok := mc.routableText(copyFor(DefaultLocale))
 	if !ok {
 		t.Fatal("a voice callback with a transcript must be routable")
 	}

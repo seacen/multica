@@ -735,8 +735,25 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				// the open bubble as the run moves along.
 				wecomTyping.Register(bus)
 
+				// Inbound media: a photo, file or video arrives as a
+				// pre-signed COS url plus the key its bytes are encrypted
+				// with, so the resolver downloads, decrypts and stores it and
+				// the engine binds it to the message as an attachment — the
+				// agent then reads it like any other. Built only when a
+				// storage backend exists; without one there is nowhere to put
+				// the object, and the message keeps the "[图片]" placeholder
+				// it was stored with. The senders registry is how a failed
+				// attachment gets said out loud instead of only logged.
+				var wecomMedia engine.MediaResolver
+				if store != nil {
+					wecomMedia = wecom.NewMediaResolver(
+						store, engine.NewDBMediaIntentLedger(queries), wecomSenders, slog.Default())
+				} else {
+					slog.Warn("wecom: no storage backend; inbound photos and files stay placeholders")
+				}
+
 				channelRouter.Register(wecom.TypeWecom, wecom.NewResolverSet(
-					wecomStore, wecomSession, wecomReplier, wecomTyping,
+					wecomStore, wecomSession, wecomReplier, wecomTyping, wecomMedia,
 				))
 
 				// EventChatDone subscriber: delivers the agent's chat reply

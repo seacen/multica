@@ -91,29 +91,100 @@ type aibotMsgCallback struct {
 	Voice struct {
 		Content string `json:"content"`
 	} `json:"voice"`
+	// Image / File / Video are the downloadable kinds. Each carries only a
+	// pre-signed COS url and the key its bytes are encrypted with — no name,
+	// no size, no MIME type (see media_download.go for where those come from
+	// instead).
+	Image mediaBody `json:"image"`
+	File  mediaBody `json:"file"`
+	Video mediaBody `json:"video"`
 	// Mixed carries 图文混排 — a message the user composed with text runs
-	// and attachments interleaved. Each item is itself typed, so a mixed
-	// message that contains any text run has something we can ingest.
+	// and attachments interleaved. Each item is itself typed and carries the
+	// same bodies a standalone message of that type would.
 	Mixed struct {
-		MsgItem []struct {
-			MsgType string `json:"msgtype"`
-			Text    struct {
-				Content string `json:"content"`
-			} `json:"text"`
-		} `json:"msg_item"`
+		MsgItem []mixedItem `json:"msg_item"`
 	} `json:"mixed"`
-	// Image / file / video carry their own media fields; we do not surface
-	// them yet.
 }
 
-// routableText returns the text this callback can be ingested as, and
-// whether there is any. Plain text messages answer with their body; a voice
-// note answers with the transcript WeCom already made of it; 图文混排 answers
-// with its text runs joined (the attachments are dropped — the adapter
-// declares CapText, so there is nothing to do with them, and losing the
-// picture is better than losing the sentence written next to it). Everything
-// else — a photo or a file — answers false and takes the receipt path.
-func (mc aibotMsgCallback) routableText() (string, bool) {
+// mediaBody is the {url, aeskey} pair every downloadable kind carries. In
+// long-connection mode the key is minted per url, so it lives on the message
+// rather than in configuration.
+type mediaBody struct {
+	URL    string `json:"url"`
+	AESKey string `json:"aeskey"`
+}
+
+// mixedItem is one run of a 图文混排 message: a sentence, a spoken sentence,
+// or an attachment, in the order the user composed them.
+type mixedItem struct {
+	MsgType string `json:"msgtype"`
+	Text    struct {
+		Content string `json:"content"`
+	} `json:"text"`
+	Voice struct {
+		Content string `json:"content"`
+	} `json:"voice"`
+	Image mediaBody `json:"image"`
+	File  mediaBody `json:"file"`
+	Video mediaBody `json:"video"`
+}
+
+// mediaFor returns the body and normalized kind for a raw wecom msgtype, and
+// whether that type is one we download at all.
+func mediaFor(msgType string, image, file, video mediaBody) (mediaBody, channel.MsgType, bool) {
+	switch strings.ToLower(msgType) {
+	case "image":
+		return image, channel.MsgTypeImage, true
+	case "file":
+		return file, channel.MsgTypeFile, true
+	case "video":
+		return video, channel.MsgTypeVideo, true
+	default:
+		return mediaBody{}, channel.MsgTypeUnknown, false
+	}
+}
+
+// attachments lists the downloadable media on this callback, in the order the
+// user sent it. A body with no url is skipped: there is nothing to fetch, and
+// carrying it forward would only produce an intent-ledger row for an object
+// that can never exist.
+func (mc aibotMsgCallback) attachments() []InboundMedia {
+	var out []InboundMedia
+	add := func(body mediaBody, kind channel.MsgType) {
+		if strings.TrimSpace(body.URL) == "" {
+			return
+		}
+		out = append(out, InboundMedia{Kind: kind, URL: body.URL, AESKey: body.AESKey})
+	}
+	if body, kind, ok := mediaFor(mc.MsgType, mc.Image, mc.File, mc.Video); ok {
+		add(body, kind)
+		return out
+	}
+	if !strings.EqualFold(mc.MsgType, "mixed") {
+		return nil
+	}
+	for _, item := range mc.Mixed.MsgItem {
+		if body, kind, ok := mediaFor(item.MsgType, item.Image, item.File, item.Video); ok {
+			add(body, kind)
+		}
+	}
+	return out
+}
+
+// routableText returns the text this callback is stored and read as, and
+// whether there is any.
+//
+// Plain text answers with its body; a voice note answers with the transcript
+// WeCom already made of it; a photo, file or video answers with a bracketed
+// placeholder, because the bytes arrive later on a detached path and the
+// message has to say something in the meantime (the placeholder is also what
+// survives if the download never succeeds); 图文混排 answers with its runs
+// rendered in the order they were composed, so "look at this" still reads
+// above the picture it was written about.
+//
+// Everything else — a location card, a kind WeCom adds next year — answers
+// false and takes the receipt path.
+func (mc aibotMsgCallback) routableText(c copyPack) (string, bool) {
 	switch strings.ToLower(mc.MsgType) {
 	case "text":
 		return mc.Text.Content, true
@@ -127,13 +198,16 @@ func (mc aibotMsgCallback) routableText() (string, bool) {
 			return "", false
 		}
 		return transcript, true
+	case "image", "file", "video":
+		body, kind, _ := mediaFor(mc.MsgType, mc.Image, mc.File, mc.Video)
+		if strings.TrimSpace(body.URL) == "" {
+			return "", false
+		}
+		return c.mediaPlaceholder(kind), true
 	case "mixed":
 		var runs []string
 		for _, item := range mc.Mixed.MsgItem {
-			if !strings.EqualFold(item.MsgType, "text") {
-				continue
-			}
-			if s := strings.TrimSpace(item.Text.Content); s != "" {
+			if s := item.render(c); s != "" {
 				runs = append(runs, s)
 			}
 		}
@@ -143,6 +217,24 @@ func (mc aibotMsgCallback) routableText() (string, bool) {
 		return strings.Join(runs, "\n"), true
 	default:
 		return "", false
+	}
+}
+
+// render turns one 图文混排 run into the line it contributes to the message
+// body. An item of a kind this adapter does not know contributes nothing
+// rather than a stray placeholder.
+func (item mixedItem) render(c copyPack) string {
+	switch strings.ToLower(item.MsgType) {
+	case "text":
+		return strings.TrimSpace(item.Text.Content)
+	case "voice":
+		return strings.TrimSpace(item.Voice.Content)
+	default:
+		body, kind, ok := mediaFor(item.MsgType, item.Image, item.File, item.Video)
+		if !ok || strings.TrimSpace(body.URL) == "" {
+			return ""
+		}
+		return c.mediaPlaceholder(kind)
 	}
 }
 
@@ -195,6 +287,25 @@ type InboundMessage struct {
 	// keep it so a future aibot_respond_msg (5s window) can echo it back;
 	// iteration 1 uses aibot_send_msg unconditionally and does not need it.
 	ReqID string `json:"req_id,omitempty"`
+
+	// Media lists the attachments to fetch, in the order the user sent them.
+	// It is the MediaResolver's input and travels only in
+	// channel.InboundMessage.Raw, which the engine passes along in memory and
+	// never persists — the urls lapse after five minutes and the keys are
+	// single-use, so neither belongs in a table or a log line.
+	Media []InboundMedia `json:"media,omitempty"`
+}
+
+// InboundMedia is one downloadable attachment on a callback.
+type InboundMedia struct {
+	// Kind is the normalized media type the attachment row is labelled with.
+	Kind channel.MsgType `json:"kind"`
+	// URL is the pre-signed COS address, good for five minutes, needing no
+	// access token.
+	URL string `json:"url"`
+	// AESKey unlocks what comes back from URL. Long-connection mode mints one
+	// per url; see media_crypt.go.
+	AESKey string `json:"aeskey"`
 }
 
 // channelMessageFromCallback converts a wecom-side aibot_msg_callback into
@@ -233,6 +344,7 @@ func channelMessageFromCallback(botID string, mc aibotMsgCallback, text, reqID s
 		SenderUserID: senderID,
 		Content:      text,
 		ReqID:        reqID,
+		Media:        mc.attachments(),
 	}
 	raw, _ := json.Marshal(wm)
 

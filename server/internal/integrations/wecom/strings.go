@@ -17,7 +17,11 @@ package wecom
 // needs a third language with real formatting rules, that is the moment to
 // reach for a framework — not now.
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/multica-ai/multica/server/internal/integrations/channel"
+)
 
 // Locale names the language an installation's users are answered in.
 type Locale string
@@ -55,9 +59,25 @@ type copyPack struct {
 	AgentOffline  string
 	AgentArchived string
 
-	// UnsupportedMsgType answers a voice note, photo or file — sent from the
-	// read loop, which never reaches the Replier.
+	// UnsupportedMsgType answers a message kind the adapter cannot read at
+	// all — sent from the read loop, which never reaches the Replier.
 	UnsupportedMsgType string
+
+	// MediaImage / MediaFile / MediaVideo stand in for an attachment inside
+	// the message body. They are written when the message is stored, before
+	// anything has been downloaded, and they are what stays if the download
+	// never lands — so they have to read as "there was a picture here", not
+	// as a failure.
+	MediaImage string
+	MediaFile  string
+	MediaVideo string
+
+	// MediaTooLarge / MediaUnreadable tell the sender that an attachment did
+	// not make it. Two reasons rather than one because the fix differs: a
+	// file over the limit needs splitting or a link, whereas an expired or
+	// undecryptable download just needs sending again.
+	MediaTooLarge   string
+	MediaUnreadable string
 
 	// BindingPromptPrefix / BindingPromptSuffix wrap the bind URL.
 	// BindingPending replaces the whole thing when the mint was throttled and
@@ -175,6 +195,20 @@ type progressCopy struct {
 	Elapsed string
 }
 
+// mediaPlaceholder returns the stand-in text for one attachment kind. An
+// unknown kind falls back to the file wording, which is true of anything with
+// bytes in it.
+func (c copyPack) mediaPlaceholder(kind channel.MsgType) string {
+	switch kind {
+	case channel.MsgTypeImage:
+		return c.MediaImage
+	case channel.MsgTypeVideo:
+		return c.MediaVideo
+	default:
+		return c.MediaFile
+	}
+}
+
 // label returns the display name for an inbox notification type.
 func (c copyPack) label(t string) string {
 	if l, ok := c.InboxTypeLabels[t]; ok {
@@ -204,7 +238,12 @@ var copyPacks = map[Locale]copyPack{
 	LocaleZhHans: {
 		AgentOffline:        "⚠️ 智能体当前不在线，你的消息已收到，等它上线后会处理。",
 		AgentArchived:       "⚠️ 该智能体已归档，无法回复。请联系工作区管理员。",
-		UnsupportedMsgType:  "我目前只能处理文字消息，请用文字再发一次。",
+		UnsupportedMsgType:  "我暂时读不了这种消息，麻烦用文字、图片或文件再发一次。",
+		MediaImage:          "[图片]",
+		MediaFile:           "[文件]",
+		MediaVideo:          "[视频]",
+		MediaTooLarge:       "⚠️ 有附件超过 100MB，我读不了，麻烦压缩一下或换个方式发给我。",
+		MediaUnreadable:     "⚠️ 有附件我没能读取（链接可能已过期），麻烦重新发一次。",
 		BindingPromptPrefix: "👋 请先绑定你的 Multica 账号，才能与我对话：\n",
 		BindingPromptSuffix: "\n（链接 15 分钟内有效）",
 		BindingPending:      "👋 绑定链接刚才已经发给你了，请点上一条消息里的链接完成绑定。",
@@ -263,7 +302,12 @@ var copyPacks = map[Locale]copyPack{
 	LocaleEn: {
 		AgentOffline:        "⚠️ The agent is offline right now. Your message was received and will be handled once it's back.",
 		AgentArchived:       "⚠️ This agent has been archived and can't reply. Please contact your workspace admin.",
-		UnsupportedMsgType:  "I can only read text messages for now — please send it as text.",
+		UnsupportedMsgType:  "I can't read that kind of message yet — please send text, an image or a file.",
+		MediaImage:          "[Image]",
+		MediaFile:           "[File]",
+		MediaVideo:          "[Video]",
+		MediaTooLarge:       "⚠️ One of those attachments is over 100MB, which I can't read. Please compress it or send it another way.",
+		MediaUnreadable:     "⚠️ I couldn't read one of those attachments — the link may have expired. Please send it again.",
 		BindingPromptPrefix: "👋 Link your Multica account before we can talk:\n",
 		BindingPromptSuffix: "\n(the link is good for 15 minutes)",
 		BindingPending:      "👋 I already sent you a link — tap the one in the message above to finish linking.",

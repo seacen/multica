@@ -1,9 +1,13 @@
 package wecom
 
 // inbound_msgtype_test.go — coverage for what the read loop does with a
-// callback that is not a plain text message. Voice notes, photos and file
-// drops are ordinary WeChat Work traffic; the user must not be left talking
-// into a void, and a redelivered frame must not produce a second receipt.
+// callback it cannot read: a kind WeCom has that this adapter does not, or a
+// known kind that arrived without the field that makes it usable. The user
+// must not be left talking into a void, and a redelivered frame must not
+// produce a second receipt.
+//
+// Voice notes, photos and files are NOT in here any more — they are ingested
+// (inbound_voice_test.go, inbound_media_test.go).
 
 import (
 	"context"
@@ -156,7 +160,7 @@ func TestUnsupportedMsgTypeReceiptIsDedupedByMsgID(t *testing.T) {
 	sender := newWSSender(conn, nil)
 
 	for i := 0; i < 3; i++ {
-		if err := c.dispatchFrame(context.Background(), mediaFrame("image", "msg-dup"), sender, testLogger()); err != nil {
+		if err := c.dispatchFrame(context.Background(), mediaFrame("location", "msg-dup"), sender, testLogger()); err != nil {
 			t.Fatalf("dispatchFrame #%d: %v", i, err)
 		}
 	}
@@ -171,7 +175,7 @@ func TestUnsupportedMsgTypeReceiptReleasesClaimOnSendFailure(t *testing.T) {
 	c, _, dedup := testChannel(t, func(context.Context, channel.InboundMessage) error { return nil })
 	failing := newWSSender(&failingConn{}, nil)
 
-	if err := c.dispatchFrame(context.Background(), mediaFrame("file", "msg-fail"), failing, testLogger()); err != nil {
+	if err := c.dispatchFrame(context.Background(), mediaFrame("location", "msg-fail"), failing, testLogger()); err != nil {
 		t.Fatalf("a failed receipt must not escalate to the read loop: %v", err)
 	}
 	dedup.mu.Lock()
@@ -183,7 +187,8 @@ func TestUnsupportedMsgTypeReceiptReleasesClaimOnSendFailure(t *testing.T) {
 }
 
 // TestMixedMessageRoutesItsTextPart: 图文混排 carrying a text run is a real
-// message, not an unsupported type — the text goes to the engine as usual.
+// message, not an unsupported type — it goes to the engine with the text and
+// a placeholder holding the picture's place until the download lands.
 func TestMixedMessageRoutesItsTextPart(t *testing.T) {
 	var got channel.InboundMessage
 	c, conn, _ := testChannel(t, func(_ context.Context, m channel.InboundMessage) error {
@@ -211,8 +216,9 @@ func TestMixedMessageRoutesItsTextPart(t *testing.T) {
 	if err := c.dispatchFrame(context.Background(), env, sender, testLogger()); err != nil {
 		t.Fatalf("dispatchFrame: %v", err)
 	}
-	if got.Text != "看下这张图" {
-		t.Fatalf("engine received Text=%q, want the mixed message's text run", got.Text)
+	want := "看下这张图\n" + copyFor(DefaultLocale).MediaImage
+	if got.Text != want {
+		t.Fatalf("engine received Text=%q, want %q", got.Text, want)
 	}
 	if got.MessageID != "msg-mixed" {
 		t.Fatalf("MessageID = %q", got.MessageID)
@@ -222,24 +228,27 @@ func TestMixedMessageRoutesItsTextPart(t *testing.T) {
 	}
 }
 
-// TestMixedMessageWithoutTextGetsAReceipt: an image-only 混排 has nothing to
-// ingest, so it falls back to the receipt path.
-func TestMixedMessageWithoutTextGetsAReceipt(t *testing.T) {
+// TestMixedMessageWithNothingUsableGetsAReceipt: an empty text run beside an
+// attachment with no url leaves nothing to store and nothing to fetch, so it
+// falls back to the receipt path rather than starting a run over a blank
+// message.
+func TestMixedMessageWithNothingUsableGetsAReceipt(t *testing.T) {
 	c, conn, _ := testChannel(t, func(context.Context, channel.InboundMessage) error {
-		t.Fatal("a text-less mixed message must not reach the engine handler")
+		t.Fatal("an empty mixed message must not reach the engine handler")
 		return nil
 	})
 	sender := newWSSender(conn, nil)
 
 	body, _ := json.Marshal(map[string]any{
-		"msgid":    "msg-mixed-notext",
+		"msgid":    "msg-mixed-empty",
 		"aibotid":  "bot",
 		"chattype": "single",
 		"from":     map[string]any{"userid": "T-alex"},
 		"msgtype":  "mixed",
 		"mixed": map[string]any{
 			"msg_item": []any{
-				map[string]any{"msgtype": "image", "image": map[string]any{"url": "https://example.invalid/a.png"}},
+				map[string]any{"msgtype": "text", "text": map[string]any{"content": "   "}},
+				map[string]any{"msgtype": "image", "image": map[string]any{"aeskey": "k"}},
 			},
 		},
 	})
@@ -247,7 +256,7 @@ func TestMixedMessageWithoutTextGetsAReceipt(t *testing.T) {
 		t.Fatalf("dispatchFrame: %v", err)
 	}
 	if n := len(conn.sends()); n != 1 {
-		t.Fatalf("want one receipt for a text-less mixed message, got %d", n)
+		t.Fatalf("want one receipt for an empty mixed message, got %d", n)
 	}
 }
 
