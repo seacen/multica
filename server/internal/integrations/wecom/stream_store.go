@@ -53,6 +53,40 @@ const streamMaxAge = 6 * time.Minute
 // replace.
 const streamGuardAfter = 5 * time.Minute
 
+// roundMemory is how long a session keeps the note the handle left behind. It
+// has to outlast the bubble by a lot: the guard closes at five minutes and the
+// run it made a promise about carries on for as long as the agent needs, so the
+// window between the promise and the failure it accounts for is the length of a
+// long run, not the length of a stream. An hour covers those and still bounds
+// the map to the sessions answered in the last hour.
+const roundMemory = time.Hour
+
+// roundEnding says whether the words a closer is writing are the last this
+// round will need. Only the guard's are not: "still working, I'll reply
+// separately" is a promise, and whatever the run does next is still owed.
+type roundEnding bool
+
+const (
+	roundOver      roundEnding = true
+	roundContinues roundEnding = false
+)
+
+// roundVerdict is the store's answer to "may I speak for this round, and where".
+type roundVerdict int
+
+const (
+	// roundForgotten — nothing on file. A turn from before a restart, or one
+	// that never opened a bubble at all. The caller has to find the chat some
+	// other way.
+	roundForgotten roundVerdict = iota
+	// roundOwesAnEnding — the bubble was closed early and the run went on, so
+	// its real ending has never been said. Addressing follows.
+	roundOwesAnEnding
+	// roundToldAlready — the answer landed, or another publisher's failure got
+	// here first. Nothing to add.
+	roundToldAlready
+)
+
 // streamHandle is everything needed to keep writing to one open bubble. The
 // addressing is captured at ingest rather than looked up later: by the time
 // the answer arrives the binding row may have been re-pointed, and the frame
@@ -95,6 +129,40 @@ type streamHandle struct {
 	CreatedAt time.Time
 }
 
+// roundAddress is where a round's words go once its bubble is gone: the
+// installation whose socket carries them, the chat that asked, and the language
+// to say it in. The stream ids are deliberately not here — they name a bubble
+// nobody can write to any more, and carrying them would invite another attempt.
+type roundAddress struct {
+	InstallationID pgtype.UUID
+	ChatID         string
+	ChatType       int
+	Locale         Locale
+}
+
+func (h streamHandle) address() roundAddress {
+	return roundAddress{
+		InstallationID: h.InstallationID,
+		ChatID:         h.ChatID,
+		ChatType:       h.ChatType,
+		Locale:         h.Locale,
+	}
+}
+
+// endedRound is what a session keeps once its handle is gone: where the round
+// was speaking, and whether anything is still owed to it.
+//
+// The second field is the whole of it. A handle is taken by whichever ending
+// gets there first, and the five-minute guard is allowed to be that one — it
+// writes "still working, I'll reply separately" while the run carries on. The
+// failure that arrives afterwards finds no handle, and without this note it
+// used to return without a word: a promise, and then nothing.
+type endedRound struct {
+	addr roundAddress
+	owed bool
+	at   time.Time
+}
+
 // streamEntry pairs a handle with the timer that closes it if nothing else
 // does. The timer is stored next to the handle so whoever consumes the handle
 // also disarms the guard, in one lock.
@@ -123,10 +191,13 @@ type streamEntry struct {
 	unusable bool
 }
 
-// streamStore maps chat_session_id to the open bubble for that session.
+// streamStore maps chat_session_id to the open bubble for that session, and —
+// for a while after the bubble is gone — to what the round it belonged to still
+// owes.
 type streamStore struct {
 	mu     sync.Mutex
 	byKey  map[string]streamEntry
+	ended  map[string]endedRound
 	maxAge time.Duration
 	now    func() time.Time
 }
@@ -134,6 +205,7 @@ type streamStore struct {
 func newStreamStore() *streamStore {
 	return &streamStore{
 		byKey:  make(map[string]streamEntry),
+		ended:  make(map[string]endedRound),
 		maxAge: streamMaxAge,
 		now:    time.Now,
 	}
@@ -188,7 +260,13 @@ func (s *streamStore) arm(sessionID pgtype.UUID, streamID string, t *time.Timer)
 // A disowned handle IS handed over, with Unusable set. Its bubble cannot be
 // sealed, but the round still has to end in words, and the addressing captured
 // at ingest is what puts them in the right chat.
-func (s *streamStore) take(sessionID pgtype.UUID) (streamHandle, bool) {
+//
+// ending is the caller's account of what it is about to write. Everything but
+// the guard ends the round; the guard's copy promises a separate reply, and the
+// note left behind is what makes that promise keepable — the failure that
+// arrives ten minutes later has no handle and needs both the address and the
+// knowledge that nobody has spoken yet.
+func (s *streamStore) take(sessionID pgtype.UUID, ending roundEnding) (streamHandle, bool) {
 	key := util.UUIDToString(sessionID)
 
 	s.mu.Lock()
@@ -204,8 +282,63 @@ func (s *streamStore) take(sessionID pgtype.UUID) (streamHandle, bool) {
 	if s.expiredLocked(entry.handle) {
 		return streamHandle{}, false
 	}
+	s.rememberLocked(key, entry.handle.address(), ending)
 	entry.handle.Unusable = entry.unusable
 	return entry.handle, true
+}
+
+// remember files where a round was speaking without taking a handle for it —
+// the answer that went out as a plain message because the bubble was already
+// gone, and the failure notice that had to find its chat in the binding row.
+// Both are endings, and both have to be on file or the next publisher of the
+// same news repeats it.
+func (s *streamStore) remember(sessionID pgtype.UUID, addr roundAddress, ending roundEnding) {
+	key := util.UUIDToString(sessionID)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rememberLocked(key, addr, ending)
+}
+
+func (s *streamStore) rememberLocked(key string, addr roundAddress, ending roundEnding) {
+	s.ended[key] = endedRound{addr: addr, owed: ending == roundContinues, at: s.now()}
+}
+
+// claimEnding asks whether a round with no bubble left is still owed an ending,
+// and claims the right to say it. The claim is the point: task:failed has two
+// publishers and a sweeper tick can repeat one, so whoever gets here first
+// speaks and everyone after reads roundToldAlready.
+//
+// roundForgotten is not a refusal. It means this process never saw the round —
+// a restart mid-run, a turn whose opening frame the server refused — so there
+// is no address on file and the caller has to find the chat itself.
+func (s *streamStore) claimEnding(sessionID pgtype.UUID) (roundAddress, roundVerdict) {
+	key := util.UUIDToString(sessionID)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	round, ok := s.ended[key]
+	if !ok {
+		return roundAddress{}, roundForgotten
+	}
+	if s.now().Sub(round.at) > roundMemory {
+		delete(s.ended, key)
+		return roundAddress{}, roundForgotten
+	}
+	if !round.owed {
+		return round.addr, roundToldAlready
+	}
+	round.owed = false
+	s.ended[key] = round
+	return round.addr, roundOwesAnEnding
+}
+
+// remembered reports how many rounds are on file past their bubble. Diagnostics
+// and the cheap rejection at the head of the failure subscriber.
+func (s *streamStore) remembered() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.ended)
 }
 
 // peek reads a session's handle without consuming it — the progress-refresh
@@ -334,10 +467,12 @@ func (s *streamStore) expiredLocked(h streamHandle) bool {
 	return s.now().Sub(h.CreatedAt) > s.maxAge
 }
 
-// sweepLocked evicts handles the server would no longer accept. The guard
-// timer normally retires an entry long before this fires; the sweep is what
-// keeps a process whose timers were beaten by a clock jump from accumulating
-// keys forever. Caller holds s.mu.
+// sweepLocked evicts handles the server would no longer accept, and the notes
+// left by rounds too old to still be running. The guard timer normally retires
+// an entry long before this fires; the sweep is what keeps a process whose
+// timers were beaten by a clock jump from accumulating keys forever, and it is
+// the only thing that bounds the notes, which no timer touches. Caller holds
+// s.mu.
 func (s *streamStore) sweepLocked() {
 	for key, entry := range s.byKey {
 		if s.expiredLocked(entry.handle) {
@@ -345,6 +480,12 @@ func (s *streamStore) sweepLocked() {
 				entry.guard.Stop()
 			}
 			delete(s.byKey, key)
+		}
+	}
+	now := s.now()
+	for key, round := range s.ended {
+		if now.Sub(round.at) > roundMemory {
+			delete(s.ended, key)
 		}
 	}
 }

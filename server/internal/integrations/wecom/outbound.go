@@ -156,11 +156,28 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 	// see outbound_queue.go. The user asked a question; an answer a minute
 	// late still answers it.
 	chatType := aibotChatTypeFromChannel(channel.ChatType(binding.ChatType))
-	return o.senders.send(inst.ID, pendingSend{
+	if err := o.senders.send(inst.ID, pendingSend{
 		ChatID:   binding.ChannelChatID,
 		ChatType: chatType,
 		Content:  content,
-	})
+	}); err != nil {
+		return err
+	}
+	// An answer is the round's ending whether it went into the bubble or
+	// underneath it, and this is the branch where no handle was consumed to
+	// record that. Without the note, a task:failed arriving behind a delivered
+	// answer — an auto-retry's first attempt, a sweeper that ran late — reaches
+	// the typing indicator with nothing to tell it the round is over, and
+	// contradicts the answer the user is already reading.
+	if o.streams != nil {
+		o.streams.remember(sessionID, roundAddress{
+			InstallationID: inst.ID,
+			ChatID:         binding.ChannelChatID,
+			ChatType:       chatType,
+			Locale:         localeOfRow(inst),
+		}, roundOver)
+	}
+	return nil
 }
 
 // takeStream hands over the bubble open for this session, if the typing
@@ -169,7 +186,7 @@ func (o *Outbound) takeStream(sessionID pgtype.UUID) (streamHandle, bool) {
 	if o.streams == nil || o.senders == nil {
 		return streamHandle{}, false
 	}
-	return o.streams.take(sessionID)
+	return o.streams.take(sessionID, roundOver)
 }
 
 // finishStream writes the answer into the bubble and seals it. A failure here

@@ -225,7 +225,7 @@ func TestTheMarkIsWhatEachCallerReads(t *testing.T) {
 		t.Error("the handle was forgotten; the round's ending has no address left")
 	}
 
-	h, ok := store.take(session)
+	h, ok := store.take(session, roundOver)
 	if !ok || !h.Unusable {
 		t.Fatalf("take returned (%+v, %v), want the addressing carrying the server's verdict", h, ok)
 	}
@@ -248,7 +248,7 @@ func TestADisownedHandleStillAgesOut(t *testing.T) {
 	store.now = func() time.Time { return base.Add(streamMaxAge + time.Second) }
 	store.claim(uuidOf(4), streamHandle{ReqID: "R2", StreamID: "S2"})
 
-	if _, ok := store.take(session); ok {
+	if _, ok := store.take(session, roundOver); ok {
 		t.Error("take returned a handle from a round the store should have swept")
 	}
 	if depth := store.depth(); depth != 1 {

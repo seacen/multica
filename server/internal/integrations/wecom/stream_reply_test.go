@@ -635,7 +635,7 @@ func TestStaleHandleIsTreatedAsGone(t *testing.T) {
 	if _, ok := store.peek(uuidOf(3)); ok {
 		t.Error("peek returned a handle the server would refuse")
 	}
-	if _, ok := store.take(uuidOf(3)); ok {
+	if _, ok := store.take(uuidOf(3), roundOver); ok {
 		t.Error("take returned a handle the server would refuse")
 	}
 	if !store.claim(uuidOf(3), streamHandle{ReqID: "R2", StreamID: "S2"}) {
