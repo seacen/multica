@@ -355,13 +355,19 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 		// aibot_upload_media_* can reject with a non-zero errcode
 		// (e.g. wrong msgtype, rate limit, chat not writable).
 		//
-		// Hand every ack to the sender first: a streaming reply blocks on the
-		// verdict for its frame, because 846608 ("this stream is past its
+		// Hand every response to the sender first: a streaming reply blocks on
+		// the verdict for its frame, because 846608 ("this stream is past its
 		// window") is the difference between putting the answer in the bubble
-		// and putting it in a new message. Frames nobody is waiting on fall
-		// through and are only logged, so a failed outbound stays visible
-		// without a packet capture.
-		sender.deliverAck(env.Headers.ReqID, env.ErrCode, env.ErrMsg)
+		// and putting it in a new message, and a media upload blocks on the
+		// BODY, which is where the upload_id and the media_id come back
+		// (media_upload.go). Frames nobody is waiting on fall through and are
+		// only logged, so a failed outbound stays visible without a packet
+		// capture.
+		//
+		// An upload response may name its own cmd rather than arrive
+		// anonymous; either way it lands here, since the switch above claims
+		// only the frames the server initiates.
+		sender.routeResponse(env)
 		if env.ErrCode != 0 {
 			log.Warn("wecom: server ack error",
 				"errcode", env.ErrCode,

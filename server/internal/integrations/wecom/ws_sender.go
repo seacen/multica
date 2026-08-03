@@ -90,6 +90,18 @@ type wsSender struct {
 	// touch it.
 	streams map[string]*streamAcks
 
+	// replies holds the frames whose caller needs the response BODY and not
+	// just the verdict — the media upload, whose init hands back an upload_id
+	// and whose finish hands back a media_id (media_upload.go). Keyed by
+	// req_id like waiters, and separate from it because the two answer
+	// different questions: a stream frame asks "did that land", an upload
+	// frame asks "what did you call it". Guarded by ackMu.
+	//
+	// The two key spaces cannot collide: every req_id in here is one we minted
+	// with newReqID, while a stream's is the server's own from the callback
+	// that opened the turn.
+	replies map[string]*replyWaiter
+
 	// ackTimeout is how long a frame waits for its verdict. A field rather
 	// than the constant so a test can exercise the give-up path without
 	// standing still for five seconds.
@@ -148,6 +160,7 @@ func newWSSender(conn wsConn, log *slog.Logger) *wsSender {
 		wmu:        make(chan struct{}, 1),
 		waiters:    make(map[string]*ackWaiter),
 		streams:    make(map[string]*streamAcks),
+		replies:    make(map[string]*replyWaiter),
 		ackTimeout: ackTimeout,
 	}
 }
@@ -204,6 +217,83 @@ var (
 type ackResult struct {
 	code int
 	msg  string
+}
+
+// replyWaiter is one request's standing claim on the server's whole answer.
+// Unlike ackWaiter there is no sequencing to do: a req_id here belongs to
+// exactly one frame, because we minted it for that frame.
+type replyWaiter struct {
+	ch chan replyResult
+}
+
+// replyResult is a server answer with its body kept. body is nil for the acks
+// that carry nothing but a verdict.
+type replyResult struct {
+	code int
+	msg  string
+	body json.RawMessage
+}
+
+// routeResponse hands a server response to whoever is waiting for it, and
+// reports whether anybody was. The read loop calls it for every frame that is
+// an answer to one of our writes.
+//
+// Order matters: a request waiting on the body is asked first, because those
+// req_ids are ours and a stream's are the server's — one lookup settles which
+// kind of answer this is without the frame having to say.
+func (s *wsSender) routeResponse(env frameEnvelope) bool {
+	if s.deliverReply(env) {
+		return true
+	}
+	s.deliverAck(env.Headers.ReqID, env.ErrCode, env.ErrMsg)
+	return false
+}
+
+// awaitReply registers interest in the full response for the frame about to be
+// written. false means the req_id is already spoken for, which with minted ids
+// means a collision we would rather fail on than silently cross wires.
+func (s *wsSender) awaitReply(reqID string) (*replyWaiter, bool) {
+	s.ackMu.Lock()
+	defer s.ackMu.Unlock()
+	if _, taken := s.replies[reqID]; taken {
+		return nil, false
+	}
+	w := &replyWaiter{ch: make(chan replyResult, 1)}
+	s.replies[reqID] = w
+	return w, true
+}
+
+// cancelReply retires a waiter. Called on every exit path, including the happy
+// one — a request is one frame and one answer, so the entry is never useful
+// twice.
+func (s *wsSender) cancelReply(reqID string, w *replyWaiter) {
+	s.ackMu.Lock()
+	defer s.ackMu.Unlock()
+	if cur, ok := s.replies[reqID]; ok && cur == w {
+		delete(s.replies, reqID)
+	}
+}
+
+// deliverReply hands a response to the request that asked for it, if there is
+// one, and reports whether it was taken.
+func (s *wsSender) deliverReply(env frameEnvelope) bool {
+	if env.Headers.ReqID == "" {
+		return false
+	}
+	s.ackMu.Lock()
+	w, ok := s.replies[env.Headers.ReqID]
+	if ok {
+		delete(s.replies, env.Headers.ReqID)
+	}
+	s.ackMu.Unlock()
+	if !ok {
+		return false
+	}
+	select {
+	case w.ch <- replyResult{code: env.ErrCode, msg: env.ErrMsg, body: env.Body}:
+	default:
+	}
+	return true
 }
 
 // deliverAck hands a server ack to the frame it belongs to. The read loop calls
@@ -407,15 +497,23 @@ func (s *wsSender) respondStream(ctx context.Context, reqID, streamID, content s
 // caller must not hold sendMu on wecomChannel; nothing here reaches back into
 // the Channel.
 func (s *wsSender) write(frame map[string]any) error {
+	return s.writeWithContext(context.Background(), frame)
+}
+
+// writeWithContext is write() for a caller that has a deadline of its own, at
+// both places a write can stall: waiting for the writer and waiting for the
+// socket. The media upload is the caller — a hundred chunk frames must not
+// outlive the delivery they belong to.
+func (s *wsSender) writeWithContext(ctx context.Context, frame map[string]any) error {
 	payload, err := json.Marshal(frame)
 	if err != nil {
 		return fmt.Errorf("wecom: marshal frame: %w", err)
 	}
-	if err := s.lockWriter(context.Background()); err != nil {
+	if err := s.lockWriter(ctx); err != nil {
 		return err
 	}
 	defer s.unlockWriter()
-	return s.writeLocked(context.Background(), payload)
+	return s.writeLocked(ctx, payload)
 }
 
 // writeStreamFrame is write() for a stream frame: the same serialized push,
