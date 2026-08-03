@@ -6,7 +6,9 @@ package wecom
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -16,19 +18,30 @@ import (
 )
 
 // fakeTasks answers the one lookup the progress subscriber makes: which chat
-// session does this task belong to.
+// session does this task belong to. Counted under a mutex because the same
+// subscriber is driven from several goroutines in the race test.
 type fakeTasks struct {
+	mu      sync.Mutex
 	session pgtype.UUID
 	err     error
 	calls   int
 }
 
 func (f *fakeTasks) GetAgentTask(context.Context, pgtype.UUID) (db.AgentTaskQueue, error) {
+	f.mu.Lock()
 	f.calls++
-	if f.err != nil {
-		return db.AgentTaskQueue{}, f.err
+	err, session := f.err, f.session
+	f.mu.Unlock()
+	if err != nil {
+		return db.AgentTaskQueue{}, err
 	}
-	return db.AgentTaskQueue{ChatSessionID: f.session}, nil
+	return db.AgentTaskQueue{ChatSessionID: session}, nil
+}
+
+func (f *fakeTasks) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
 }
 
 // TestProgressRewritesTheSameBubble — the point of the refresh: the user
@@ -172,7 +185,197 @@ func TestProgressSkipsTheLookupWithNoBubblesOpen(t *testing.T) {
 		Payload: protocol.TaskProgressPayload{Summary: "Launching claude"},
 	})
 
-	if tasks.calls != 0 {
-		t.Errorf("looked the task up %d times with no bubble anywhere", tasks.calls)
+	if tasks.count() != 0 {
+		t.Errorf("looked the task up %d times with no bubble anywhere", tasks.count())
 	}
+}
+
+// ---- the run's own work, played into the bubble ----
+
+// chatTaskID / issueTaskID stand in for the run behind an event. Real task
+// ids are uuids and the subscriber parses them before it will read a row.
+func chatTaskID() string  { return uuidText(uuidOf(33)) }
+func issueTaskID() string { return uuidText(uuidOf(34)) }
+
+// taskMessageEvent is what POST /api/daemon/tasks/{id}/messages publishes,
+// once per message in the batch.
+func taskMessageEvent(taskID string, msg protocol.TaskMessagePayload) events.Event {
+	msg.TaskID = taskID
+	return events.Event{Type: protocol.EventTaskMessage, TaskID: taskID, Payload: msg}
+}
+
+// busRig is a rig whose typing manager is subscribed and whose clock the test
+// drives, so the throttle can be exercised without sleeping.
+func busRig(t *testing.T) (*streamRig, *events.Bus, *fakeTasks, *testClock) {
+	t.Helper()
+	rig := newStreamRig(t)
+	clock := newTestClock()
+	rig.streams.now = clock.now
+	tasks := &fakeTasks{session: rig.session}
+	rig.typing.tasks = tasks
+	bus := events.New()
+	rig.typing.Register(bus)
+	return rig, bus, tasks, clock
+}
+
+// TestToolCallsShowUpInTheBubble is the change in one test: what the agent is
+// actually doing reaches the user while it is doing it.
+func TestToolCallsShowUpInTheBubble(t *testing.T) {
+	rig, bus, _, clock := busRig(t)
+	rig.ingest(t, "REQ-42")
+	opening := streamViews(t, &rig.conn.recordingConn)[0]
+
+	bus.Publish(taskMessageEvent(chatTaskID(), toolUse("Read", map[string]any{"file_path": "/srv/app/config.go"})))
+	clock.advance(progressMinInterval)
+	bus.Publish(taskMessageEvent(chatTaskID(), toolUse("Bash", map[string]any{"command": "go test ./..."})))
+
+	frames := streamViews(t, &rig.conn.recordingConn)
+	if len(frames) != 3 {
+		t.Fatalf("want opening + two refreshes, got %d: %+v", len(frames), frames)
+	}
+	last := frames[2]
+	if last.Finish {
+		t.Error("a progress refresh must leave the bubble open")
+	}
+	if last.ID != opening.ID || last.ReqID != opening.ReqID {
+		t.Errorf("refresh %+v addresses a different bubble than the question opened", last)
+	}
+	if !strings.Contains(last.Content, "正在读取 config.go") || !strings.Contains(last.Content, "正在执行 go 命令") {
+		t.Errorf("content = %q, want both steps", last.Content)
+	}
+	if strings.Contains(last.Content, "go test ./...") {
+		t.Errorf("content = %q leaked the command", last.Content)
+	}
+}
+
+// TestNothingIsLookedUpWithNoBubbleOpen — this subscriber sees every task
+// message on a shared bus. On a deployment with no WeCom turn in flight it
+// must not put a database read behind each one.
+func TestNothingIsLookedUpWithNoBubbleOpen(t *testing.T) {
+	_, bus, tasks, _ := busRig(t)
+
+	bus.Publish(taskMessageEvent(chatTaskID(), toolUse("Read", map[string]any{"file_path": "x.go"})))
+
+	if tasks.count() != 0 {
+		t.Errorf("looked the task up %d times with no bubble anywhere", tasks.count())
+	}
+}
+
+// TestTheSessionIsLookedUpOnce — task:message carries a task id and no chat
+// session, and a single run posts dozens of them.
+func TestTheSessionIsLookedUpOnce(t *testing.T) {
+	rig, bus, tasks, clock := busRig(t)
+	rig.ingest(t, "REQ-42")
+
+	for i := 0; i < 6; i++ {
+		bus.Publish(taskMessageEvent(chatTaskID(), toolUse("Grep", map[string]any{"pattern": "x"})))
+		clock.advance(progressMinInterval)
+	}
+	if tasks.count() != 1 {
+		t.Errorf("read the task row %d times for one run", tasks.count())
+	}
+}
+
+// TestNonChatRunsNeverTouchTheBubble — issue and autopilot runs publish the
+// same events and have no chat session. The absence has to be remembered too,
+// or every one of their messages re-asks the database.
+func TestNonChatRunsNeverTouchTheBubble(t *testing.T) {
+	rig, bus, tasks, clock := busRig(t)
+	tasks.session = pgtype.UUID{} // an issue run
+	rig.ingest(t, "REQ-42")
+
+	for i := 0; i < 5; i++ {
+		bus.Publish(taskMessageEvent(issueTaskID(), toolUse("Read", map[string]any{"file_path": "x.go"})))
+		clock.advance(progressMinInterval)
+	}
+	if got := len(streamViews(t, &rig.conn.recordingConn)); got != 1 {
+		t.Errorf("wrote %d frames; an issue run must not touch somebody else's bubble", got)
+	}
+	if tasks.count() != 1 {
+		t.Errorf("read the task row %d times for a run already known to have no session", tasks.count())
+	}
+}
+
+// TestABurstOfToolCallsSendsOneFrame — tool calls land several a second and
+// every frame is a write on the bot's single socket.
+func TestABurstOfToolCallsSendsOneFrame(t *testing.T) {
+	rig, bus, _, clock := busRig(t)
+	rig.ingest(t, "REQ-42")
+
+	for i := 0; i < 8; i++ {
+		bus.Publish(taskMessageEvent(chatTaskID(), toolUse("Read", map[string]any{"file_path": string(rune('a'+i)) + ".go"})))
+		clock.advance(100 * time.Millisecond)
+	}
+
+	frames := streamViews(t, &rig.conn.recordingConn)
+	if len(frames) != 2 {
+		t.Fatalf("wrote %d frames for one burst, want the opening frame plus a single refresh", len(frames))
+	}
+	clock.advance(progressMinInterval)
+	bus.Publish(taskMessageEvent(chatTaskID(), toolUse("Bash", map[string]any{"command": "ls"})))
+	frames = streamViews(t, &rig.conn.recordingConn)
+	if len(frames) != 3 {
+		t.Fatalf("the throttle never released: %d frames", len(frames))
+	}
+	if !strings.Contains(frames[2].Content, "h.go") {
+		t.Errorf("content = %q, want the throttled steps folded in rather than lost", frames[2].Content)
+	}
+}
+
+// TestResultsAndProseDoNotRefresh — half the volume on this event is tool
+// output and the agent's own text. Neither belongs in the spinner, and
+// rejecting them before the lookup is what keeps the cost near zero.
+func TestResultsAndProseDoNotRefresh(t *testing.T) {
+	rig, bus, tasks, _ := busRig(t)
+	rig.ingest(t, "REQ-42")
+
+	bus.Publish(taskMessageEvent(chatTaskID(), protocol.TaskMessagePayload{Type: "tool_result", Tool: "Bash", Output: "sk-live-42"}))
+	bus.Publish(taskMessageEvent(chatTaskID(), protocol.TaskMessagePayload{Type: "text", Content: "the answer is 42"}))
+
+	if got := len(streamViews(t, &rig.conn.recordingConn)); got != 1 {
+		t.Errorf("wrote %d frames; only tool calls and errors are progress", got)
+	}
+	if tasks.count() != 0 {
+		t.Errorf("looked the task up %d times for messages that can never refresh anything", tasks.count())
+	}
+}
+
+// TestTheAnswerIsNeverThrottled — the floor between refreshes must not be able
+// to hold the answer back, however soon after a refresh it arrives.
+func TestTheAnswerIsNeverThrottled(t *testing.T) {
+	rig, bus, _, _ := busRig(t)
+	rig.ingest(t, "REQ-42")
+	bus.Publish(taskMessageEvent(chatTaskID(), toolUse("Read", map[string]any{"file_path": "x.go"})))
+
+	newOutboundUnder(rig).handleEvent(chatDoneEvent(rig.session, "答案是 42"))
+
+	frames := streamViews(t, &rig.conn.recordingConn)
+	last := frames[len(frames)-1]
+	if !last.Finish || last.Content != "答案是 42" {
+		t.Fatalf("last frame = %+v, want the sealed answer", last)
+	}
+}
+
+// TestProgressSubscribersAreRaceFree — task:message is published from the
+// daemon's HTTP handler, chat:done from another, and the guard timer from a
+// third. Run under -race.
+func TestProgressSubscribersAreRaceFree(t *testing.T) {
+	rig, bus, _, _ := busRig(t)
+	out := newOutboundUnder(rig)
+	rig.ingest(t, "REQ-42")
+
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			bus.Publish(taskMessageEvent(chatTaskID(), toolUse("Read", map[string]any{"file_path": "x.go"})))
+		}()
+		go func() {
+			defer wg.Done()
+			bus.Publish(taskMessageEvent(chatTaskID(), protocol.TaskMessagePayload{Type: "error", Content: "boom"}))
+		}()
+	}
+	wg.Wait()
+	out.handleEvent(chatDoneEvent(rig.session, "答案"))
 }

@@ -84,6 +84,12 @@ type streamHandle struct {
 type streamEntry struct {
 	handle streamHandle
 	guard  *time.Timer
+
+	// feed is the bubble's running list of steps, created on the first one.
+	// It lives here rather than beside the subscriber so its lifetime is the
+	// bubble's: whoever takes or drops the handle also disposes of the list,
+	// and nothing has to be swept separately.
+	feed *progressFeed
 }
 
 // streamStore maps chat_session_id to the open bubble for that session.
@@ -185,6 +191,33 @@ func (s *streamStore) peek(sessionID pgtype.UUID) (streamHandle, bool) {
 		return streamHandle{}, false
 	}
 	return entry.handle, true
+}
+
+// feedFor returns a session's open bubble and the list of steps shown inside
+// it, creating the list on first use. Like peek it leaves the handle in place
+// and disowns an expired one: a run whose window has closed gets no more
+// refreshes, and its list goes with it.
+func (s *streamStore) feedFor(sessionID pgtype.UUID) (streamHandle, *progressFeed, bool) {
+	key := util.UUIDToString(sessionID)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.byKey[key]
+	if !ok {
+		return streamHandle{}, nil, false
+	}
+	if s.expiredLocked(entry.handle) {
+		delete(s.byKey, key)
+		if entry.guard != nil {
+			entry.guard.Stop()
+		}
+		return streamHandle{}, nil, false
+	}
+	if entry.feed == nil {
+		entry.feed = newProgressFeed(s.now)
+		s.byKey[key] = entry
+	}
+	return entry.handle, entry.feed, true
 }
 
 // drop forgets a session's handle without sending anything — used when the

@@ -22,7 +22,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -39,6 +38,22 @@ import (
 // subscriber, neither of which has a caller's context to inherit.
 const streamCloseTimeout = 10 * time.Second
 
+// progressWriteTimeout bounds a mid-run refresh, and it is deliberately much
+// shorter than streamCloseTimeout.
+//
+// The bus is synchronous: a task:message subscriber runs on the goroutine that
+// published the event, which is the daemon's own POST
+// /api/daemon/tasks/{id}/messages handler — and that request has a five second
+// client-side deadline of its own. Waiting out the sender's full ack timeout
+// here would stall the transcript the whole workspace is reading in order to
+// paint a spinner in one chat. A refresh that has not been acked by now is not
+// worth another millisecond of somebody else's request.
+const progressWriteTimeout = 2 * time.Second
+
+// taskLookupTimeout bounds the one read that turns a task id into a chat
+// session, on the same borrowed goroutine.
+const taskLookupTimeout = 2 * time.Second
+
 // taskLookup is the one query the progress refresh needs. task:progress
 // carries a task id and no chat session, so the session the bubble is keyed on
 // has to be read back off the task row. *db.Queries satisfies it.
@@ -53,6 +68,11 @@ type TypingIndicatorManager struct {
 	streams *streamStore
 	tasks   taskLookup
 	log     *slog.Logger
+
+	// taskSessions remembers which chat a task belongs to — and which tasks
+	// belong to no chat at all — so a run's dozens of tool messages cost one
+	// database read between them.
+	taskSessions *taskSessionCache
 
 	// guardAfter is when the manager closes a bubble nobody else has. Zero
 	// disables the guard (tests that drive the clock themselves).
@@ -89,11 +109,12 @@ func NewTypingIndicator(cfg TypingIndicatorConfig) *TypingIndicatorManager {
 		guard = streamGuardAfter
 	}
 	return &TypingIndicatorManager{
-		senders:    cfg.Senders,
-		streams:    cfg.Streams,
-		tasks:      cfg.Tasks,
-		log:        logger,
-		guardAfter: guard,
+		senders:      cfg.Senders,
+		streams:      cfg.Streams,
+		tasks:        cfg.Tasks,
+		taskSessions: newTaskSessionCache(),
+		log:          logger,
+		guardAfter:   guard,
 	}
 }
 
@@ -173,15 +194,24 @@ func (m *TypingIndicatorManager) OnSettled(ctx context.Context, sessionID pgtype
 	m.closeBubble(ctx, sessionID, func(c copyPack) string { return c.StreamNotStarted }, "settled")
 }
 
-// Register subscribes the manager to the run failure event, and to the
-// progress event when a task lookup was configured. EventChatDone is
-// deliberately NOT subscribed here: the answer belongs in the bubble, and only
-// the outbound subscriber holds the answer. Registering for it here would
-// close the bubble first and leave the reply to arrive underneath it.
+// Register subscribes the manager to the run failure event, and — when a task
+// lookup was configured — to the two events that say where a run has got to.
+//
+// task:progress fires twice per run and both lines are the daemon's own
+// ("Launching claude", "Finishing task"), so on its own it leaves the whole
+// middle of a run blank. task:message is the transcript: one event per tool
+// call, batched about twice a second, and the only signal fine-grained enough
+// to answer what the agent is doing right now. Both feed the same list.
+//
+// EventChatDone is deliberately NOT subscribed here: the answer belongs in the
+// bubble, and only the outbound subscriber holds the answer. Registering for
+// it here would close the bubble first and leave the reply to arrive
+// underneath it.
 func (m *TypingIndicatorManager) Register(bus *events.Bus) {
 	bus.Subscribe(protocol.EventTaskFailed, m.handleTaskFailed)
 	if m.tasks != nil {
 		bus.Subscribe(protocol.EventTaskProgress, m.handleTaskProgress)
+		bus.Subscribe(protocol.EventTaskMessage, m.handleTaskMessage)
 	}
 }
 
@@ -195,35 +225,47 @@ func (m *TypingIndicatorManager) handleTaskFailed(e events.Event) {
 	m.closeBubble(ctx, sessionID, func(c copyPack) string { return c.StreamFailed }, "task failed")
 }
 
-// UpdateProgress rewrites an open bubble with a line about where the run has
-// got to, leaving it open. It is the whole in-flight-refresh surface: anything
-// that learns something worth saying mid-run — the bus subscriber below, or a
+// UpdateProgress adds one line to an open bubble's list of steps and refreshes
+// it, leaving it open. It is the whole in-flight-refresh surface: anything that
+// learns something worth saying mid-run — the bus subscribers below, or a
 // future caller closer to the agent — needs only a session and a sentence.
 //
-// Three properties are deliberate. Content is a full replacement, not a delta,
-// so the caller passes the whole line and never has to know what the bubble
-// says now. A refresh yields when the previous frame has not been acked (the
-// backpressure the official SDK calls replyStreamNonBlocking) because progress
-// is worth less than the answer behind it. And nothing here can close the
-// bubble: a refresh that fails leaves the spinner exactly as it was, for the
-// answer or the guard to finish properly.
+// The line is taken as written, so callers on this path must have vetted it
+// already; the subscribers below go through progress_render.go, which is where
+// the rule about what may reach a WeCom chat is enforced.
 func (m *TypingIndicatorManager) UpdateProgress(ctx context.Context, sessionID pgtype.UUID, text string) {
-	if m.senders == nil || m.streams == nil || !sessionID.Valid {
-		return
-	}
-	text = strings.TrimSpace(text)
+	text = safeFragment(text)
 	if text == "" {
 		return
 	}
-	h, ok := m.streams.peek(sessionID)
+	m.recordStep(ctx, sessionID, progressStep{kind: progressRaw, arg: text})
+}
+
+// recordStep folds one step into a session's bubble and writes the result.
+//
+// Three properties are deliberate. Content is a full replacement, not a delta,
+// so a frame carries the whole list and no caller has to know what the bubble
+// says now. A refresh yields when the previous frame has not been acked (the
+// backpressure the official SDK calls replyStreamNonBlocking) because progress
+// is worth less than the answer behind it, and it yields again to the feed's
+// own minimum interval, which folds a burst of tool calls into one frame. And
+// nothing here can close the bubble: a refresh that fails leaves the spinner
+// exactly as it was, for the answer or the guard to finish properly.
+func (m *TypingIndicatorManager) recordStep(ctx context.Context, sessionID pgtype.UUID, step progressStep) {
+	if m.senders == nil || m.streams == nil || !sessionID.Valid {
+		return
+	}
+	h, feed, ok := m.streams.feedFor(sessionID)
 	if !ok {
 		return // no bubble open — a non-wecom session, or one already answered
 	}
-	// Inside <think> tags the line renders as the client's thinking affordance
-	// rather than as the bot's answer, which matters because a run that dies
-	// before chat:done would otherwise leave "Launching claude" sitting there
-	// looking like a reply.
-	content := "<think>" + copyFor(h.Locale).StreamProgressPrefix + text + "</think>"
+	content := feed.record(step, copyFor(h.Locale), h.CreatedAt)
+	if content == "" {
+		// Inside the refresh interval. The step is in the list and the next
+		// frame carries it; sending one per tool call would spend the bot's
+		// socket on frames nobody can read that fast.
+		return
+	}
 	if err := m.senders.stream(ctx, h, content, false); err != nil {
 		if errors.Is(err, errStreamBusy) {
 			return // the previous frame is still in flight; skipping is the design
@@ -233,37 +275,79 @@ func (m *TypingIndicatorManager) UpdateProgress(ctx context.Context, sessionID p
 	}
 }
 
-// handleTaskProgress refreshes the bubble from the bus. The event carries a
-// task id and no chat session, so the session has to be read back off the task
-// row — which is why the store is checked for any open bubble at all first: on
-// a deployment with no WeCom traffic in flight this subscriber must not add a
-// database read to every task's progress.
+// handleTaskProgress plays the daemon's own two milestones into the bubble.
 func (m *TypingIndicatorManager) handleTaskProgress(e events.Event) {
-	if m.tasks == nil || m.streams == nil || m.streams.depth() == 0 {
+	if m.streams == nil || m.streams.depth() == 0 {
 		return
 	}
-	summary := progressSummary(e.Payload)
+	summary := safeFragment(progressSummary(e.Payload))
 	if summary == "" {
 		return
 	}
-	sessionID, ok := sessionIDFromEvent(e)
-	if !ok {
-		taskID, err := util.ParseUUID(taskIDFromEvent(e))
-		if err != nil || !taskID.Valid {
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), streamCloseTimeout)
-		defer cancel()
-		task, err := m.tasks.GetAgentTask(ctx, taskID)
-		if err != nil || !task.ChatSessionID.Valid {
-			return // an issue / autopilot run, or a task that has since gone
-		}
-		m.UpdateProgress(ctx, task.ChatSessionID, summary)
+	m.refreshFromTask(e, progressStep{kind: progressRaw, arg: summary})
+}
+
+// handleTaskMessage plays the run's transcript into the bubble — the tool
+// calls that are the whole middle of a run.
+//
+// The order of the two cheap rejections matters. The store is checked first so
+// that a deployment with no WeCom turn in flight pays nothing at all for this
+// subscription; the message is classified second, which drops tool results and
+// agent prose — most of the event's volume — before anything reaches the
+// database.
+func (m *TypingIndicatorManager) handleTaskMessage(e events.Event) {
+	if m.streams == nil || m.streams.depth() == 0 {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), streamCloseTimeout)
+	step, ok := stepFromTaskMessage(e.Payload)
+	if !ok {
+		return
+	}
+	m.refreshFromTask(e, step)
+}
+
+// refreshFromTask resolves the chat session behind a task event and records
+// the step against it. Neither event carries the session, so it comes off the
+// task row — via the cache, which is what keeps a run's dozens of tool
+// messages down to one read, and which also remembers the tasks that have no
+// chat session at all so an issue run never asks twice.
+//
+// Everything here runs on the goroutine that published the event: the daemon's
+// own HTTP handler. Hence the short deadlines.
+func (m *TypingIndicatorManager) refreshFromTask(e events.Event, step progressStep) {
+	sessionID, ok := sessionIDFromEvent(e)
+	if !ok {
+		if m.tasks == nil {
+			return
+		}
+		taskID := taskIDFromEvent(e)
+		if taskID == "" {
+			return
+		}
+		cached, hit := m.taskSessions.get(taskID)
+		if hit {
+			sessionID = cached
+		} else {
+			id, err := util.ParseUUID(taskID)
+			if err != nil || !id.Valid {
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), taskLookupTimeout)
+			task, err := m.tasks.GetAgentTask(ctx, id)
+			cancel()
+			if err != nil {
+				return // a task that has since gone; not cached, it may come back
+			}
+			sessionID = task.ChatSessionID
+			m.taskSessions.put(taskID, sessionID)
+		}
+		if !sessionID.Valid {
+			return // an issue / autopilot run, now known to have no bubble
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), progressWriteTimeout)
 	defer cancel()
-	m.UpdateProgress(ctx, sessionID, summary)
+	m.recordStep(ctx, sessionID, step)
 }
 
 // progressSummary reads the human-readable line off a task:progress payload,
@@ -286,13 +370,14 @@ func taskIDFromEvent(e events.Event) string {
 	if e.TaskID != "" {
 		return e.TaskID
 	}
-	if p, ok := e.Payload.(map[string]any); ok {
-		if s, _ := p["task_id"].(string); s != "" {
-			return s
-		}
-	}
-	if p, ok := e.Payload.(protocol.TaskProgressPayload); ok {
+	switch p := e.Payload.(type) {
+	case protocol.TaskProgressPayload:
 		return p.TaskID
+	case protocol.TaskMessagePayload:
+		return p.TaskID
+	case map[string]any:
+		s, _ := p["task_id"].(string)
+		return s
 	}
 	return ""
 }
