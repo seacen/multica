@@ -115,17 +115,19 @@ func mediaFrame(msgType, msgID string) frameEnvelope {
 	return frameEnvelope{Cmd: cmdMsgCallback, Body: body}
 }
 
-// TestUnsupportedMsgTypeGetsAReceipt: a voice note must draw an answer rather
-// than a Debug log. Fails on the pre-change code, which returned nil from
-// dispatchFrame without writing anything.
+// TestUnsupportedMsgTypeGetsAReceipt: a message kind the adapter cannot read
+// must draw an answer rather than a Debug log. Fails on the pre-change code,
+// which returned nil from dispatchFrame without writing anything. The example
+// is a location card — a voice note is no longer unsupported (WeCom sends its
+// transcript, see inbound_voice_test.go).
 func TestUnsupportedMsgTypeGetsAReceipt(t *testing.T) {
 	c, conn, _ := testChannel(t, func(context.Context, channel.InboundMessage) error {
-		t.Fatal("a voice message must not reach the engine handler")
+		t.Fatal("an unreadable message must not reach the engine handler")
 		return nil
 	})
 	sender := newWSSender(conn, nil)
 
-	if err := c.dispatchFrame(context.Background(), mediaFrame("voice", "msg-1"), sender, testLogger()); err != nil {
+	if err := c.dispatchFrame(context.Background(), mediaFrame("location", "msg-1"), sender, testLogger()); err != nil {
 		t.Fatalf("dispatchFrame: %v", err)
 	}
 

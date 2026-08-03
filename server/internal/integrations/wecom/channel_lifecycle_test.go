@@ -502,7 +502,7 @@ func TestUnsupportedTypeWithoutADedupKeyStaysSilent(t *testing.T) {
 			tc.setup(c)
 			sender := newWSSender(conn, testLogger())
 
-			if err := c.dispatchFrame(context.Background(), mediaFrame("voice", tc.msgID), sender, testLogger()); err != nil {
+			if err := c.dispatchFrame(context.Background(), mediaFrame("location", tc.msgID), sender, testLogger()); err != nil {
 				t.Fatalf("dispatchFrame: %v", err)
 			}
 			if n := len(conn.sends()); n != 0 {
@@ -512,15 +512,15 @@ func TestUnsupportedTypeWithoutADedupKeyStaysSilent(t *testing.T) {
 	}
 }
 
-// TestCapabilitiesAndTypeStayHonest — Capabilities is what stops the engine
-// resolving media for wecom; widening it without an upload path would produce
-// messages the adapter cannot deliver.
+// TestCapabilitiesAndTypeStayHonest — the mask is a promise about what the
+// adapter can actually do. CapVoice is honest because WeCom transcribes voice
+// notes itself; CapAttachment is not, because nothing downloads the media yet.
 func TestCapabilitiesAndTypeStayHonest(t *testing.T) {
 	c := &wecomChannel{}
 	if c.Type() != TypeWecom {
 		t.Errorf("Type = %q", c.Type())
 	}
-	want := channel.CapText | channel.CapTypingIndicator | channel.CapMessageEdit
+	want := channel.CapText | channel.CapVoice | channel.CapTypingIndicator | channel.CapMessageEdit
 	if c.Capabilities() != want {
 		t.Errorf("Capabilities = %v, want %v", c.Capabilities(), want)
 	}

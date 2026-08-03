@@ -97,10 +97,11 @@ var _ channel.Channel = (*wecomChannel)(nil)
 
 func (c *wecomChannel) Type() channel.Type { return TypeWecom }
 
-// Capabilities declares what the aibot adapter supports today. Attachments
-// arrive as MsgTypeImage / File / Audio / Video but we do not yet download the
-// media (WeChat's aibot API requires an additional aibot_upload_media_* dance
-// to send it back), so they stay undeclared.
+// Capabilities declares what the aibot adapter supports today. CapVoice is
+// declared because WeCom transcribes voice notes on its own side and delivers
+// the text, so the adapter handles them end to end without touching audio.
+// Photos and files still arrive as bodies we do not download, so CapAttachment
+// stays undeclared.
 //
 // The typing-indicator and message-edit bits are one mechanism, not two: a
 // streaming reply's opening frame IS the indicator and its closing frame IS
@@ -108,7 +109,7 @@ func (c *wecomChannel) Type() channel.Type { return TypeWecom }
 // the mask to decide "can this channel show progress" and one asking "can this
 // channel replace what it already said" both get a true answer.
 func (c *wecomChannel) Capabilities() channel.Capability {
-	return channel.CapText | channel.CapTypingIndicator | channel.CapMessageEdit
+	return channel.CapText | channel.CapVoice | channel.CapTypingIndicator | channel.CapMessageEdit
 }
 
 // Disconnect is a no-op: the WS connection's whole lifetime is scoped to

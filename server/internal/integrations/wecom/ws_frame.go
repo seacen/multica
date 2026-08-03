@@ -84,6 +84,13 @@ type aibotMsgCallback struct {
 	Text    struct {
 		Content string `json:"content"`
 	} `json:"text"`
+	// Voice carries the transcript, not audio. WeCom runs the speech
+	// recognition on its side and delivers only the result, so a voice note
+	// needs no download and no key — it is a sentence that happened to be
+	// spoken. Single chats only (100719).
+	Voice struct {
+		Content string `json:"content"`
+	} `json:"voice"`
 	// Mixed carries 图文混排 — a message the user composed with text runs
 	// and attachments interleaved. Each item is itself typed, so a mixed
 	// message that contains any text run has something we can ingest.
@@ -95,21 +102,31 @@ type aibotMsgCallback struct {
 			} `json:"text"`
 		} `json:"msg_item"`
 	} `json:"mixed"`
-	// Image / voice / file / video carry their own media fields; we do not
-	// surface them — the adapter declares CapText only.
+	// Image / file / video carry their own media fields; we do not surface
+	// them yet.
 }
 
 // routableText returns the text this callback can be ingested as, and
-// whether there is any. Plain text messages answer with their body; 图文混排
-// answers with its text runs joined (the attachments are dropped — the
-// adapter declares CapText, so there is nothing to do with them, and losing
-// the picture is better than losing the sentence written next to it).
-// Everything else — a bare voice note, photo or file — answers false and
-// takes the receipt path.
+// whether there is any. Plain text messages answer with their body; a voice
+// note answers with the transcript WeCom already made of it; 图文混排 answers
+// with its text runs joined (the attachments are dropped — the adapter
+// declares CapText, so there is nothing to do with them, and losing the
+// picture is better than losing the sentence written next to it). Everything
+// else — a photo or a file — answers false and takes the receipt path.
 func (mc aibotMsgCallback) routableText() (string, bool) {
 	switch strings.ToLower(mc.MsgType) {
 	case "text":
 		return mc.Text.Content, true
+	case "voice":
+		// Recognition can come back empty on background noise or a
+		// half-second press. An empty body would reach the agent as a turn
+		// with nothing in it, so treat it as nothing to ingest and let the
+		// receipt path say so.
+		transcript := strings.TrimSpace(mc.Voice.Content)
+		if transcript == "" {
+			return "", false
+		}
+		return transcript, true
 	case "mixed":
 		var runs []string
 		for _, item := range mc.Mixed.MsgItem {
