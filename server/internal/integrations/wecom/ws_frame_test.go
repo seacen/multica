@@ -544,3 +544,40 @@ func TestReqIDsAreDistinct(t *testing.T) {
 		seen[id] = true
 	}
 }
+
+// TestDefuseThinkTagsCoversTheShapesTheClientMatches — the client's scanner is
+// what decides, so every spelling it would fold has to be covered, and nothing
+// else may be.
+func TestDefuseThinkTagsCoversTheShapesTheClientMatches(t *testing.T) {
+	defused := []string{
+		"<think>",
+		"</think>",
+		"<THINK>",
+		"<Think>x</Think>",
+		"<thinking>",
+		"答案里带了 <think> 这个词",
+	}
+	for _, in := range defused {
+		got := defuseThinkTags(in)
+		if strings.Contains(strings.ToLower(got), "<think") || strings.Contains(strings.ToLower(got), "</think") {
+			t.Errorf("defuseThinkTags(%q) = %q, still matches the client's scanner", in, got)
+		}
+		if !strings.Contains(strings.ToLower(got), "think") {
+			t.Errorf("defuseThinkTags(%q) = %q, lost the word", in, got)
+		}
+	}
+
+	untouched := []string{
+		"",
+		"a < b && c > d",
+		"Vec<Thing>",
+		"<div>hi</div>",
+		"1<2",
+		"trailing <",
+	}
+	for _, in := range untouched {
+		if got := defuseThinkTags(in); got != in {
+			t.Errorf("defuseThinkTags(%q) = %q, want it untouched", in, got)
+		}
+	}
+}

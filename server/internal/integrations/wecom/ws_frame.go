@@ -393,6 +393,9 @@ func respondStreamBody(streamID, content string, finish bool) (map[string]any, e
 	if streamID == "" {
 		return nil, errors.New("wecom: stream frame requires a stream id")
 	}
+	if finish {
+		content = defuseThinkTags(content)
+	}
 	content = truncateStreamContent(content)
 	if finish && !hasVisibleChar(content) {
 		return nil, errors.New("wecom: closing stream frame needs visible content")
@@ -405,6 +408,49 @@ func respondStreamBody(streamID, content string, finish bool) (map[string]any, e
 			"content": content,
 		},
 	}, nil
+}
+
+// defuseThinkTags stops an answer that talks about <think> from being read as
+// one.
+//
+// The tag is the client's, not ours: per 101031 a stream body wrapped in
+// <think></think> renders as WeChat's own collapsed thinking affordance, which
+// is what the opening and progress frames are built from. An answer that
+// happens to contain the literal — quoting a prompt, explaining this very
+// feature, pasting XML — gets the same treatment, and half the reply
+// disappears into a fold with no edit and no unsend to undo it with.
+//
+// A zero-width space after the angle bracket is enough: the scanner no longer
+// matches, and the reader sees the same characters they would have seen. Only
+// the tag's own opening is touched, so comparisons, generics and HTML samples
+// in the rest of the answer come through as written. Callers apply this to
+// closing frames only — the frames before it are the affordance.
+func defuseThinkTags(s string) string {
+	if !strings.Contains(s, "<") {
+		return s
+	}
+	const zwsp = "​"
+	var b strings.Builder
+	lower := strings.ToLower(s)
+	last := 0
+	for i := 0; i+1 < len(s); i++ {
+		if s[i] != '<' {
+			continue
+		}
+		rest := lower[i+1:]
+		rest = strings.TrimPrefix(rest, "/")
+		if !strings.HasPrefix(rest, "think") {
+			continue
+		}
+		b.WriteString(s[last : i+1])
+		b.WriteString(zwsp)
+		last = i + 1
+	}
+	if last == 0 {
+		return s
+	}
+	b.WriteString(s[last:])
+	return b.String()
 }
 
 // truncateStreamContent cuts content to the protocol's byte limit on a

@@ -394,6 +394,59 @@ func TestClosingFrameAlwaysCarriesVisibleText(t *testing.T) {
 	}
 }
 
+// TestAnAnswerAboutThinkTagsIsStillReadable — <think></think> is not markup
+// this adapter invented, it is what the WeChat client folds into its own
+// thinking affordance, and the progress frames are built out of it. An answer
+// that happens to contain the literal — quoting a prompt, discussing this
+// feature, pasting XML — would be folded away with it, in a chat with no edit
+// and no unsend.
+func TestAnAnswerAboutThinkTagsIsStillReadable(t *testing.T) {
+	rig := newStreamRig(t)
+	rig.ingest(t, "REQ-42")
+
+	newOutboundUnder(rig).handleEvent(chatDoneEvent(rig.session, "进度是用 <think>…</think> 画出来的"))
+
+	frames := streamViews(t, &rig.conn.recordingConn)
+	last := frames[len(frames)-1]
+	if !last.Finish {
+		t.Fatalf("last frame = %+v, want the sealed answer", last)
+	}
+	if strings.Contains(last.Content, "<think>") || strings.Contains(last.Content, "</think>") {
+		t.Fatalf("the answer still carries a live think tag: %q", last.Content)
+	}
+	if !strings.Contains(last.Content, "think") || !strings.Contains(last.Content, "画出来的") {
+		t.Fatalf("the answer lost its words defusing the tag: %q", last.Content)
+	}
+}
+
+// TestOrdinaryMarkdownIsLeftAlone — the fix must reach the one construct that
+// breaks the bubble and nothing else. Comparisons, generics and HTML samples
+// are ordinary answer text.
+func TestOrdinaryMarkdownIsLeftAlone(t *testing.T) {
+	const answer = "if a < b && c > d { … }\n\n<div>hi</div>\n\n`Vec<Thing>`"
+	body, err := respondStreamBody("s1", answer, true)
+	if err != nil {
+		t.Fatalf("respondStreamBody: %v", err)
+	}
+	st, _ := body["stream"].(map[string]any)
+	if got, _ := st["content"].(string); got != answer {
+		t.Errorf("content = %q, want it untouched", got)
+	}
+}
+
+// TestAProgressFrameKeepsItsThinkTags — the mid-run frames ARE the affordance,
+// so the closing frame is the only place this may apply.
+func TestAProgressFrameKeepsItsThinkTags(t *testing.T) {
+	body, err := respondStreamBody("s1", "<think>正在读取 x.go</think>", false)
+	if err != nil {
+		t.Fatalf("respondStreamBody: %v", err)
+	}
+	st, _ := body["stream"].(map[string]any)
+	if got, _ := st["content"].(string); got != "<think>正在读取 x.go</think>" {
+		t.Errorf("content = %q, want the thinking wrapper intact", got)
+	}
+}
+
 // TestBodyBuilderRefusesABlankClosingFrame pins the same rule one level down,
 // where every future caller passes through.
 func TestBodyBuilderRefusesABlankClosingFrame(t *testing.T) {
