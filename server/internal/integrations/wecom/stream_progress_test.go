@@ -533,6 +533,51 @@ func TestATaskThatIsGoneIsAskedAboutOnce(t *testing.T) {
 	}
 }
 
+// TestASweptTaskStillClosesTheBubble — task:failed has two publishers with
+// different payloads. broadcastTaskEvent (FailTask) carries chat_session_id;
+// HandleFailedTasks — the sweepers, recover-orphans, the heartbeat timeout —
+// carries task_id and nothing else. That second one is the whole crashed-daemon
+// path, and it left the bubble spinning until the five-minute guard replaced it
+// with "still working, I'll reply separately" for a run that died long ago.
+func TestASweptTaskStillClosesTheBubble(t *testing.T) {
+	rig, bus, _, _ := busRig(t)
+	rig.ingest(t, "REQ-42")
+
+	bus.Publish(events.Event{
+		Type: protocol.EventTaskFailed,
+		Payload: map[string]any{
+			"task_id":        chatTaskID(),
+			"status":         "failed",
+			"failure_reason": "daemon heartbeat timeout",
+		},
+	})
+
+	frames := streamViews(t, &rig.conn.recordingConn)
+	if len(frames) != 2 || !frames[1].Finish {
+		t.Fatalf("want the bubble closed, got %+v", frames)
+	}
+	if frames[1].Content != copyPacks[LocaleZhHans].StreamFailed {
+		t.Errorf("closing content = %q, want the failure copy", frames[1].Content)
+	}
+}
+
+// TestAFailedTaskCostsNothingWithNoBubbleOpen — task:failed fires for every
+// issue and autopilot run in the workspace. Reading a task row for each of them
+// on a deployment with no WeCom turn in flight is the cost the two progress
+// subscribers already refuse to pay.
+func TestAFailedTaskCostsNothingWithNoBubbleOpen(t *testing.T) {
+	_, bus, tasks, _ := busRig(t)
+
+	bus.Publish(events.Event{
+		Type:    protocol.EventTaskFailed,
+		Payload: map[string]any{"task_id": issueTaskID(), "status": "failed"},
+	})
+
+	if tasks.count() != 0 {
+		t.Errorf("looked the task up %d times with no bubble anywhere", tasks.count())
+	}
+}
+
 // TestALookupThatFailedIsNotRetriedPerMessage — the read that failed is the
 // one worth caching most. A slow or flapping database is exactly when a batch
 // of transcript messages costs one round trip each, on the daemon's own

@@ -96,9 +96,11 @@ type TypingIndicatorConfig struct {
 	Streams *streamStore
 	Logger  *slog.Logger
 
-	// Tasks resolves a task id to its chat session for the progress refresh.
-	// Nil leaves the bus-driven refresh off; UpdateProgress still works for
-	// any caller that already knows the session.
+	// Tasks resolves a task id to its chat session — for the progress refresh,
+	// and for the task:failed the sweepers publish without one. Nil leaves the
+	// bus-driven refresh off and limits failure handling to the events that
+	// carry a session; UpdateProgress still works for any caller that already
+	// knows the session.
 	Tasks taskLookup
 
 	// GuardAfter overrides streamGuardAfter. Test-only.
@@ -224,8 +226,23 @@ func (m *TypingIndicatorManager) Register(bus *events.Bus) {
 	}
 }
 
+// handleTaskFailed stops the spinner on a run that died.
+//
+// task:failed has two publishers and they do not agree on the payload.
+// broadcastTaskEvent, which FailTask uses, carries chat_session_id.
+// HandleFailedTasks — every sweeper, recover-orphans, and the daemon heartbeat
+// timeout — carries task_id, agent_id, issue_id, status and failure_reason, and
+// no session anywhere. That second publisher is the whole crashed-daemon path,
+// so the bubble used to spin on until the guard replaced it with "still
+// working, I'll reply separately" — a promise about a run that had been dead
+// for five minutes. The task-id fallback the progress refresh already uses
+// covers it, and it stays on this side of the boundary: the adapter carries its
+// own routing rather than widening a payload three other consumers read.
 func (m *TypingIndicatorManager) handleTaskFailed(e events.Event) {
-	sessionID, ok := sessionIDFromEvent(e)
+	if m.streams == nil || m.streams.depth() == 0 {
+		return // nothing open — and no reason to read a row for someone else's run
+	}
+	sessionID, ok := m.sessionFor(e)
 	if !ok {
 		return // an issue / autopilot run, with no chat session and no bubble
 	}
@@ -330,61 +347,65 @@ func (m *TypingIndicatorManager) handleTaskMessage(e events.Event) {
 }
 
 // refreshFromTask resolves the chat session behind a task event and records
-// the step against it. Neither event carries the session, so it comes off the
-// task row — via the cache, which is what keeps a run's dozens of tool
-// messages down to one read, and which also remembers the tasks that have no
-// chat session at all so an issue run never asks twice.
-//
-// Everything here runs on the goroutine that published the event: the daemon's
-// own HTTP handler. Hence the short deadlines.
+// the step against it.
 func (m *TypingIndicatorManager) refreshFromTask(e events.Event, step progressStep) {
-	sessionID, ok := sessionIDFromEvent(e)
+	sessionID, ok := m.sessionFor(e)
 	if !ok {
-		if m.tasks == nil {
-			return
-		}
-		taskID := taskIDFromEvent(e)
-		if taskID == "" {
-			return
-		}
-		cached, hit := m.taskSessions.get(taskID)
-		if hit {
-			sessionID = cached
-		} else {
-			id, err := util.ParseUUID(taskID)
-			if err != nil || !id.Valid {
-				return
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), taskLookupTimeout)
-			task, err := m.tasks.GetAgentTask(ctx, id)
-			cancel()
-			switch {
-			case errors.Is(err, pgx.ErrNoRows):
-				// A row that is not there has no chat session and never will —
-				// a run cancelled and deleted while its transcript was still
-				// flushing. Remembering that is what stops its remaining
-				// messages from putting a read behind every one.
-				m.taskSessions.put(taskID, pgtype.UUID{})
-				return
-			case err != nil:
-				// A failure is not an answer, but re-asking is worse than
-				// waiting: the rest of this batch would each put another round
-				// trip on the daemon's request, on a database that has just
-				// shown it is in no state to serve them. Remembered for
-				// seconds, not minutes.
-				m.taskSessions.putFailure(taskID)
-				return
-			}
-			sessionID = task.ChatSessionID
-			m.taskSessions.put(taskID, sessionID)
-		}
-		if !sessionID.Valid {
-			return // an issue / autopilot run, now known to have no bubble
-		}
+		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), progressWriteTimeout)
 	defer cancel()
 	m.recordStep(ctx, sessionID, step)
+}
+
+// sessionFor finds the chat session behind a task lifecycle event. Most of
+// these events do not carry one — task:progress and task:message never do, and
+// the sweeper's task:failed does not either — so it comes off the task row, via
+// the cache. The cache is what keeps a run's dozens of tool messages down to one
+// read, and it remembers the tasks that have no chat session at all so an issue
+// run never asks twice.
+//
+// Everything here runs on the goroutine that published the event: the daemon's
+// own HTTP handler, or a sweeper tick. Hence the short deadline.
+func (m *TypingIndicatorManager) sessionFor(e events.Event) (pgtype.UUID, bool) {
+	if sessionID, ok := sessionIDFromEvent(e); ok {
+		return sessionID, true
+	}
+	if m.tasks == nil {
+		return pgtype.UUID{}, false
+	}
+	taskID := taskIDFromEvent(e)
+	if taskID == "" {
+		return pgtype.UUID{}, false
+	}
+	if cached, hit := m.taskSessions.get(taskID); hit {
+		return cached, cached.Valid
+	}
+	id, err := util.ParseUUID(taskID)
+	if err != nil || !id.Valid {
+		return pgtype.UUID{}, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), taskLookupTimeout)
+	task, err := m.tasks.GetAgentTask(ctx, id)
+	cancel()
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// A row that is not there has no chat session and never will — a run
+		// cancelled and deleted while its transcript was still flushing.
+		// Remembering that is what stops its remaining messages from putting a
+		// read behind every one.
+		m.taskSessions.put(taskID, pgtype.UUID{})
+		return pgtype.UUID{}, false
+	case err != nil:
+		// A failure is not an answer, but re-asking is worse than waiting: the
+		// rest of this batch would each put another round trip on the daemon's
+		// request, on a database that has just shown it is in no state to serve
+		// them. Remembered for seconds, not minutes.
+		m.taskSessions.putFailure(taskID)
+		return pgtype.UUID{}, false
+	}
+	m.taskSessions.put(taskID, task.ChatSessionID)
+	return task.ChatSessionID, task.ChatSessionID.Valid
 }
 
 // progressSummary reads the human-readable line off a task:progress payload,
