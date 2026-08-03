@@ -148,6 +148,11 @@ type progressCopy struct {
 	Service     string
 	ServiceArgs string
 
+	// Skill / SkillPlain name the packaged procedure a Skill call ran. The
+	// tool is always called Skill, so the skill's own name is the line.
+	Skill      string
+	SkillPlain string
+
 	// Tool / ToolArgs / Fallback cover a tool this adapter has not been
 	// taught. Saying something vague beats saying nothing: a step the user
 	// never sees happen is indistinguishable from a run that has stalled.
@@ -244,6 +249,8 @@ var copyPacks = map[Locale]copyPack{
 			PlanNamed:    "正在梳理计划：%s",
 			Service:      "正在调用 %s · %s",
 			ServiceArgs:  "正在调用 %s · %s：%s",
+			Skill:        "正在启用技能 %s",
+			SkillPlain:   "正在启用技能",
 			Tool:         "正在使用 %s",
 			ToolArgs:     "正在使用 %s：%s",
 			Fallback:     "正在处理",
@@ -301,6 +308,8 @@ var copyPacks = map[Locale]copyPack{
 			PlanNamed:    "Working out a plan: %s",
 			Service:      "Calling %s · %s",
 			ServiceArgs:  "Calling %s · %s: %s",
+			Skill:        "Using the %s skill",
+			SkillPlain:   "Using a skill",
 			Tool:         "Using %s",
 			ToolArgs:     "Using %s: %s",
 			Fallback:     "Working",

@@ -286,7 +286,7 @@ func TestNothingRendersOutsideTheDetailTier(t *testing.T) {
 	kinds := []progressKind{
 		progressRaw, progressRead, progressEdit, progressCommand, progressSearch,
 		progressWeb, progressSubtask, progressPlan, progressService, progressTool,
-		progressError, progressThinking,
+		progressError, progressSkill, progressThinking,
 	}
 	for _, k := range kinds {
 		step := progressStep{kind: k, arg: "x", arg2: "y"}

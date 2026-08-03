@@ -130,6 +130,7 @@ const (
 	progressSubtask
 	progressPlan
 	progressService
+	progressSkill
 	progressTool
 	progressError
 
@@ -159,18 +160,34 @@ type progressStep struct {
 }
 
 // progressKindByTool maps the tool names the providers actually emit onto the
-// kinds this adapter has words for. Keys are lowercased tool names; Claude
-// Code, Codex and Cursor all appear because one workspace can run any of them.
-// A name missing from here still produces a line — see step's default branch —
-// so a new tool degrades to "using X" rather than to silence.
+// kinds this adapter has words for. Keys are lowercased tool names, and one
+// workspace can run any provider, so they all live in one table.
+//
+// Where the names come from, because that is what makes this list checkable
+// rather than a guess: Claude Code and CodeBuddy pass the tool's own name
+// through (claude.go); Codex hardcodes exec_command and patch_apply
+// (codex.go); Cursor strips the suffix off "<name>ToolCall" (cursor.go); and
+// the ACP family — Qoder, Kimi, Kiro, Hermes — normalises the ACP title to
+// snake_case and passes an unrecognised one through as snake_case (hermes.go,
+// kimi.go, kiro.go), which is how the Gemini-CLI vocabulary that qwen-code
+// inherits arrives. progress_tools_test.go holds the same inventory.
+//
+// A name missing from here still produces a line — see stepFromToolUse's
+// default branch — so a new tool degrades to "正在使用 X" rather than to
+// silence. That degradation is safe and reads badly, which is the whole reason
+// to keep this table current: a run on a provider whose vocabulary is missing
+// is a wall of English identifiers in Chinese copy.
 var progressKindByTool = map[string]progressKind{
 	// reading
-	"read":         progressRead,
-	"read_file":    progressRead,
-	"readfile":     progressRead,
-	"notebookread": progressRead,
-	"view":         progressRead,
-	"open_file":    progressRead,
+	"read":            progressRead,
+	"read_file":       progressRead,
+	"readfile":        progressRead,
+	"notebookread":    progressRead,
+	"view":            progressRead,
+	"open_file":       progressRead,
+	"read_many_files": progressRead,
+	// An image is read too, and the path is the useful half of the line.
+	"vision_analyze": progressRead,
 
 	// changing files
 	"write":              progressEdit,
@@ -181,46 +198,80 @@ var progressKindByTool = map[string]progressKind{
 	"multi_edit":         progressEdit,
 	"notebookedit":       progressEdit,
 	"str_replace_editor": progressEdit,
+	"str_replace":        progressEdit,
 	"apply_patch":        progressEdit,
+	"apply_diff":         progressEdit,
 	"patch_apply":        progressEdit,
+	"patch":              progressEdit,
 	"create_file":        progressEdit,
+	"replace":            progressEdit,
+	"code":               progressEdit,
+	"delete":             progressEdit,
+	"delete_file":        progressEdit,
+	"remove_file":        progressEdit,
 
 	// running things
-	"bash":             progressCommand,
-	"bashoutput":       progressCommand,
-	"killshell":        progressCommand,
-	"shell":            progressCommand,
-	"exec":             progressCommand,
-	"exec_command":     progressCommand,
-	"run_terminal_cmd": progressCommand,
-	"terminal":         progressCommand,
+	"bash":              progressCommand,
+	"bashoutput":        progressCommand,
+	"killshell":         progressCommand,
+	"shell":             progressCommand,
+	"exec":              progressCommand,
+	"exec_command":      progressCommand,
+	"run_terminal_cmd":  progressCommand,
+	"run_shell_command": progressCommand,
+	"terminal":          progressCommand,
+	"execute_code":      progressCommand,
+	"run_code":          progressCommand,
+	// A slash command is a named command the agent runs, and the name is
+	// exactly what the line should carry.
+	"slashcommand":  progressCommand,
+	"slash_command": progressCommand,
 
 	// looking through the code
-	"grep":            progressSearch,
-	"glob":            progressSearch,
-	"search":          progressSearch,
-	"file_search":     progressSearch,
-	"codebase_search": progressSearch,
-	"list_dir":        progressSearch,
-	"ls":              progressSearch,
+	"grep":                progressSearch,
+	"glob":                progressSearch,
+	"search":              progressSearch,
+	"file_search":         progressSearch,
+	"codebase_search":     progressSearch,
+	"search_files":        progressSearch,
+	"search_file_content": progressSearch,
+	"list_dir":            progressSearch,
+	"list_directory":      progressSearch,
+	"list_files":          progressSearch,
+	"ls":                  progressSearch,
 
 	// looking things up outside
-	"webfetch":   progressWeb,
-	"web_fetch":  progressWeb,
-	"websearch":  progressWeb,
-	"web_search": progressWeb,
-	"fetch":      progressWeb,
+	"webfetch":          progressWeb,
+	"web_fetch":         progressWeb,
+	"websearch":         progressWeb,
+	"web_search":        progressWeb,
+	"web_extract":       progressWeb,
+	"google_web_search": progressWeb,
+	"fetch":             progressWeb,
 
 	// handing work off
 	"task":           progressSubtask,
 	"agent":          progressSubtask,
 	"dispatch_agent": progressSubtask,
+	"delegate_task":  progressSubtask,
+
+	// running a packaged procedure — its own kind because a skill is not
+	// reading, editing, running or searching, and the skill's name is what
+	// the line is worth reading for
+	"skill": progressSkill,
 
 	// planning
-	"todowrite":    progressPlan,
-	"todoread":     progressPlan,
-	"update_plan":  progressPlan,
-	"exitplanmode": progressPlan,
+	"todowrite":     progressPlan,
+	"todoread":      progressPlan,
+	"todo_write":    progressPlan,
+	"updatetodos":   progressPlan,
+	"update_todos":  progressPlan,
+	"update_plan":   progressPlan,
+	"exitplanmode":  progressPlan,
+	"enterplanmode": progressPlan,
+	// The ACP families expose deliberation as a tool call of its own. It is
+	// the agent working something out, which is the plan line's subject.
+	"thinking": progressPlan,
 }
 
 // stepFromTaskMessage classifies one task:message, or reports that it is not
@@ -301,6 +352,8 @@ func stepFromToolUse(tool string, input map[string]any) progressStep {
 		return progressStep{kind: progressSubtask, arg: subtaskFragment(input)}
 	case progressPlan:
 		return progressStep{kind: progressPlan, arg: planFragment(input)}
+	case progressSkill:
+		return progressStep{kind: progressSkill, arg: skillFragment(input)}
 	}
 	// An unknown tool still gets a line: a step the user never sees happen is
 	// indistinguishable from a run that has stalled. With no idea which of its
@@ -371,6 +424,11 @@ func (s progressStep) line(c copyPack, level progressLevel) string {
 			return fmt.Sprintf(p.Service, s.arg, s.arg2)
 		}
 		return fmt.Sprintf(p.ServiceArgs, s.arg, s.arg2, s.args)
+	case progressSkill:
+		if s.arg == "" {
+			return p.SkillPlain
+		}
+		return fmt.Sprintf(p.Skill, s.arg)
 	case progressError:
 		if s.arg == "" {
 			return p.Failed
@@ -485,6 +543,12 @@ func subtaskFragment(input map[string]any) string {
 // covers it.
 func planFragment(input map[string]any) string {
 	return firstString(input, "plan", "description", "summary", "title")
+}
+
+// skillFragment returns the skill being run. The tool is always called Skill;
+// which skill it loaded is the whole content of the step.
+func skillFragment(input map[string]any) string {
+	return firstString(input, "skill", "name", "command", "id")
 }
 
 // argsFragment renders a call's parameters as key=value, for the two kinds of
