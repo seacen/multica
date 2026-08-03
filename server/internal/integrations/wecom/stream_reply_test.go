@@ -256,6 +256,43 @@ func TestSecondMessageJoinsTheOpenBubble(t *testing.T) {
 	}
 }
 
+// TestAnOpeningFrameThatLostTheRaceKeepsItsHandle — the opening frame yields
+// its ack slot to anything already in flight on the same req_id and comes back
+// errStreamBusy. Dropping the handle there is the worst of both: the frame that
+// beat it to the socket carried a new stream id, so the bubble exists on the
+// user's screen, and nothing is left that could ever close it.
+func TestAnOpeningFrameThatLostTheRaceKeepsItsHandle(t *testing.T) {
+	rig := newStreamRig(t)
+	sender := rig.senders.get(rig.inst.ID)
+	if _, ok := sender.awaitAck("REQ-42", false); !ok {
+		t.Fatal("could not occupy the ack slot")
+	}
+
+	rig.ingest(t, "REQ-42")
+
+	h, ok := rig.streams.peek(rig.session)
+	if !ok {
+		t.Fatal("the handle was dropped; nothing can close the bubble now")
+	}
+	if h.ReqID != "REQ-42" {
+		t.Errorf("handle req_id = %q, want the callback's", h.ReqID)
+	}
+}
+
+// TestAnOpeningFrameTheServerRefusedIsLetGo — the other half. A refusal that
+// says the stream is unusable means no bubble was ever painted, so keeping the
+// handle would swallow the answer instead of delivering it.
+func TestAnOpeningFrameTheServerRefusedIsLetGo(t *testing.T) {
+	rig := newStreamRig(t)
+	rig.conn.rejectWith(errcodeStreamBadReqID, "bad req_id")
+
+	rig.ingest(t, "REQ-42")
+
+	if _, ok := rig.streams.peek(rig.session); ok {
+		t.Error("kept a handle for a stream the server refused outright")
+	}
+}
+
 // ---- the answer ----
 
 func newOutboundUnder(rig *streamRig) *Outbound {

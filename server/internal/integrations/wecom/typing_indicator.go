@@ -178,19 +178,37 @@ func (m *TypingIndicatorManager) OnIngested(ctx context.Context, inst engine.Res
 		return
 	}
 
+	// Three ways the opening frame does not land, and only one of them is a
+	// reason to give the bubble up.
+	//
+	// An ack that did not come back says nothing about whether the frame did:
+	// re-sending the same stream id later creates the message if the opening
+	// frame was lost, so the worst case is a user who waits without a spinner
+	// rather than one who never gets an answer.
+	//
+	// Busy and superseded mean something stronger. Both say another frame on
+	// this req_id got to the socket first — a straggling refresh from the
+	// previous turn is enough — and that frame carried a stream id of its own,
+	// which is exactly how a bubble is created. So the spinner is on the user's
+	// screen. Dropping the handle there arms no guard and leaves nothing that
+	// could ever close it.
+	//
+	// A verdict from the server is the one that ends it: 846605 and 846608 mean
+	// this stream will never take a frame, so no bubble was painted and keeping
+	// the handle would swallow the answer rather than deliver it.
 	if err := m.senders.stream(ctx, h, streamThinkingPlaceholder, false); err != nil {
-		if !errors.Is(err, errStreamAckTimeout) {
+		switch {
+		case errors.Is(err, errStreamAckTimeout),
+			errors.Is(err, errStreamBusy),
+			errors.Is(err, errStreamSuperseded):
+			m.log.DebugContext(ctx, "wecom typing: opening frame did not land, keeping the handle",
+				"chat_session_id", util.UUIDToString(sessionID), "error", err)
+		default:
 			m.streams.drop(sessionID)
 			m.log.WarnContext(ctx, "wecom typing: opening frame refused",
 				"chat_session_id", util.UUIDToString(sessionID), "error", err)
 			return
 		}
-		// The frame went out and the verdict did not come back. Keep the
-		// handle: re-sending the same stream id later creates the message if
-		// the opening frame was lost, so the worst case is a user who waits
-		// without a spinner rather than one who never gets an answer.
-		m.log.DebugContext(ctx, "wecom typing: opening frame unacknowledged, keeping the handle",
-			"chat_session_id", util.UUIDToString(sessionID))
 	}
 	m.armGuard(sessionID, h)
 }
