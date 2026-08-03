@@ -78,6 +78,18 @@ const (
 	// progressMaxArgs bounds how many parameters of one call get rendered
 	// before the length cap would cut them off anyway.
 	progressMaxArgs = 8
+
+	// progressThinkingRunes is how much of the agent's reasoning the bubble
+	// keeps. Thinking has no natural end — it arrives as 500ms increments for
+	// as long as the run lasts — so what is kept is the tail, and this is how
+	// long that tail is.
+	//
+	// 1200 is about a screen and a half of phone text: enough to follow a
+	// train of thought, short enough that the step list above it is still on
+	// the first screen. It also has to fit beside everything else in one
+	// frame: 1200 CJK runes is under 4KB, the eight-line step window is under
+	// 4KB more, and the server takes 20480.
+	progressThinkingRunes = 1200
 )
 
 // progressLevel is how much of a run one bubble may show. It is decided once,
@@ -120,6 +132,11 @@ const (
 	progressService
 	progressTool
 	progressError
+
+	// progressThinking is the odd one out: not a thing the agent did but what
+	// it was reasoning while doing it. It arrives as increments and lands in
+	// the feed's rolling tail rather than as a line in the step list.
+	progressThinking
 )
 
 // progressStep is one thing the agent did, already stripped of everything no
@@ -209,13 +226,12 @@ var progressKindByTool = map[string]progressKind{
 // stepFromTaskMessage classifies one task:message, or reports that it is not
 // progress at all.
 //
-// Only tool calls and errors qualify. A tool_result is the other half of a
-// call the user has already been told about, and its output is exactly the
-// kind of content this file exists to keep out of the chat. Agent text and
-// thinking are the answer being written, and the answer gets its own frame.
-// Rejecting all three here is also what keeps the cost of this subscriber near
-// zero: together they are most of the event's volume, and none of them reaches
-// the database lookup behind this function.
+// Tool calls, errors and thinking qualify. What does not: tool_result, whose
+// output is the content block this file exists to keep out of the chat, and
+// text, which is the answer being written and gets its own closing frame.
+// Rejecting those two here is what keeps this subscriber cheap — together they
+// are most of the event's volume and neither reaches the database lookup
+// behind this function.
 func stepFromTaskMessage(payload any) (progressStep, bool) {
 	msg := taskMessageFields(payload)
 	switch msg.msgType {
@@ -223,6 +239,8 @@ func stepFromTaskMessage(payload any) (progressStep, bool) {
 		return stepFromToolUse(msg.tool, msg.input), true
 	case "error":
 		return progressStep{kind: progressError, arg: safeFragment(msg.content)}, true
+	case "thinking":
+		return progressStep{kind: progressThinking, arg: safeThinking(msg.content)}, true
 	}
 	return progressStep{}, false
 }
@@ -307,6 +325,11 @@ func (s progressStep) line(c copyPack, level progressLevel) string {
 	p := c.Progress
 	switch s.kind {
 	case progressRaw:
+		return s.arg
+	case progressThinking:
+		// Already cleaned by safeThinking; the feed routes it to the tail
+		// rather than to the step list. It passes through here so the tier
+		// gate above covers it like everything else.
 		return s.arg
 	case progressRead:
 		if s.arg == "" {
@@ -558,6 +581,48 @@ func safeFragment(s string) string {
 	return s
 }
 
+// safeThinking cleans one increment of the agent's reasoning.
+//
+// It is deliberately gentler than safeFragment in one way and stricter in
+// another. Gentler: line breaks survive, because this is a paragraph and not a
+// step, and folding a page of reasoning onto one line is a way of not showing
+// it. No trimming either — increments are cut wherever 500ms fell, so trimming
+// each one would weld the last word of one to the first word of the next.
+//
+// Stricter: this is the only text in the frame the agent wrote freely, and the
+// frame is a <think> block. A run reasoning about this very feature writes the
+// literal, and a literal </think> would close the wrapper early and spill the
+// rest of the bubble into the reply as if the agent had said it. So the tag is
+// defused the same way the closing frame defuses it in an answer — a
+// zero-width space after the angle bracket, which stops the client's scanner
+// and leaves the reader the characters they would have seen (ws_frame.go).
+func safeThinking(s string) string {
+	s = strings.Map(func(r rune) rune {
+		switch {
+		case r == '\n':
+			return r
+		case r == '\t':
+			return ' '
+		case r < 0x20 || r == 0x7f:
+			return -1
+		}
+		return r
+	}, s)
+	return defuseThinkTags(s)
+}
+
+// tailRunes keeps the last n runes of s, marking that something was dropped.
+// Cutting by rune rather than byte is what keeps a multi-byte character from
+// being sliced in half; the ellipsis is what stops the tail from reading as if
+// the agent had begun mid-sentence.
+func tailRunes(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return "…" + string(runes[len(runes)-n:])
+}
+
 // ---- the rolling feed ----
 
 // progressLine is one step as the user reads it, with how many times in a row
@@ -576,6 +641,12 @@ type progressFeed struct {
 	lines     []progressLine
 	lastFlush time.Time
 	now       func() time.Time
+
+	// thinking is the tail of everything the agent has reasoned so far,
+	// already cleaned and capped at progressThinkingRunes. It accumulates
+	// rather than replacing, because the transcript delivers it as 500ms
+	// increments of one continuous stream.
+	thinking string
 }
 
 func newProgressFeed(now func() time.Time) *progressFeed {
@@ -600,9 +671,16 @@ func (f *progressFeed) record(step progressStep, c copyPack, openedAt time.Time,
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if n := len(f.lines); n > 0 && f.lines[n-1].text == text {
-		f.lines[n-1].count++
-	} else {
+	switch {
+	case step.kind == progressThinking:
+		// One continuous stream arriving in pieces, so it appends and keeps
+		// its tail. Folding it into the step list instead would push eight
+		// increments of reasoning through the window and leave no room for
+		// anything the agent actually did.
+		f.thinking = tailRunes(f.thinking+text, progressThinkingRunes)
+	case len(f.lines) > 0 && f.lines[len(f.lines)-1].text == text:
+		f.lines[len(f.lines)-1].count++
+	default:
 		f.lines = append(f.lines, progressLine{text: text, count: 1})
 		if len(f.lines) > progressMaxLines {
 			f.lines = append(f.lines[:0], f.lines[len(f.lines)-progressMaxLines:]...)
@@ -621,6 +699,14 @@ func (f *progressFeed) record(step progressStep, c copyPack, openedAt time.Time,
 // the client renders it as its own thinking affordance rather than as the
 // bot's answer — a run that dies before chat:done would otherwise leave a list
 // of half-finished steps looking like a reply. Caller holds f.mu.
+//
+// The order is steps, then reasoning, then the clock, and it is chosen so the
+// top of the bubble holds still. The step list is bounded at eight lines and
+// is the part a glance answers "is it doing what I asked" from; the reasoning
+// is up to 1200 runes and grows, so putting it first would push the steps and
+// the clock off the first screen every time the agent thought some more. The
+// clock stays last because it is the one line that is always worth seeing and
+// clients that preview a collapsed block preview its end.
 func (f *progressFeed) renderLocked(c copyPack, elapsed time.Duration) string {
 	var b strings.Builder
 	b.WriteString("<think>")
@@ -633,12 +719,29 @@ func (f *progressFeed) renderLocked(c copyPack, elapsed time.Duration) string {
 			b.WriteString(strconv.Itoa(l.count))
 		}
 	}
+	if thought := tidyThinking(f.thinking); thought != "" {
+		b.WriteString("\n\n")
+		b.WriteString(strings.TrimSpace(c.Progress.Thinking))
+		b.WriteString("\n")
+		b.WriteString(thought)
+	}
 	if elapsed >= time.Second {
 		b.WriteString("\n")
 		b.WriteString(fmt.Sprintf(c.Progress.Elapsed, formatElapsed(elapsed)))
 	}
 	b.WriteString("</think>")
 	return b.String()
+}
+
+// tidyThinking makes the accumulated tail presentable at the moment it is
+// rendered rather than as each increment arrives — the increments are cut
+// wherever the batching fell, so a blank line can be split across two of them
+// and only the whole is worth looking at.
+func tidyThinking(s string) string {
+	for strings.Contains(s, "\n\n\n") {
+		s = strings.ReplaceAll(s, "\n\n\n", "\n\n")
+	}
+	return strings.TrimSpace(s)
 }
 
 // formatElapsed renders a duration the same way the web chat's status pill

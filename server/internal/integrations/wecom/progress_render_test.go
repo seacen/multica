@@ -103,19 +103,27 @@ func TestEnglishInstallationsReadEnglish(t *testing.T) {
 	}
 }
 
-// TestOnlyToolCallsAndErrorsRefreshTheBubble — a tool_result or a chunk of
-// agent prose is either noise or the answer itself, and the answer has its own
-// frame. Rejecting them here is also what keeps the database read off the hot
-// path: these are most of the volume.
-func TestOnlyToolCallsAndErrorsRefreshTheBubble(t *testing.T) {
+// TestOnlyTheRunsOwnWorkRefreshesTheBubble — a tool_result is a content block
+// and a chunk of text is the answer, which has its own closing frame.
+// Rejecting both here is also what keeps the database read off the hot path:
+// they are most of the volume.
+func TestOnlyTheRunsOwnWorkRefreshesTheBubble(t *testing.T) {
 	for _, msg := range []protocol.TaskMessagePayload{
 		{Type: "tool_result", Tool: "Bash", Output: "ok"},
 		{Type: "text", Content: "here is the answer"},
-		{Type: "thinking", Content: "hmm"},
 		{Type: "", Content: "x"},
 	} {
 		if _, ok := stepFromTaskMessage(msg); ok {
 			t.Errorf("%q produced a progress step; it should not refresh the bubble", msg.Type)
+		}
+	}
+	for _, msg := range []protocol.TaskMessagePayload{
+		{Type: "tool_use", Tool: "Bash", Input: map[string]any{"command": "ls"}},
+		{Type: "error", Content: "boom"},
+		{Type: "thinking", Content: "hmm"},
+	} {
+		if _, ok := stepFromTaskMessage(msg); !ok {
+			t.Errorf("%q produced no step; it is part of watching the run work", msg.Type)
 		}
 	}
 }

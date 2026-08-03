@@ -160,6 +160,11 @@ type progressCopy struct {
 	Failed      string
 	FailedNamed string
 
+	// Thinking heads the agent's own reasoning, which sits under the step
+	// list. It needs a heading because without one a paragraph of prose in
+	// the middle of a status block reads as the answer arriving early.
+	Thinking string
+
 	// Elapsed closes the list with how long the user has been waiting. A
 	// spinner with no clock on it reads as stuck.
 	Elapsed string
@@ -244,6 +249,7 @@ var copyPacks = map[Locale]copyPack{
 			Fallback:     "正在处理",
 			Failed:       "上一步出错了，正在继续",
 			FailedNamed:  "上一步出错了：%s，正在继续",
+			Thinking:     "思考：",
 			Elapsed:      "已用时 %s",
 		},
 	},
@@ -300,6 +306,7 @@ var copyPacks = map[Locale]copyPack{
 			Fallback:     "Working",
 			Failed:       "That step errored — carrying on",
 			FailedNamed:  "That step errored: %s — carrying on",
+			Thinking:     "Thinking:",
 			Elapsed:      "%s elapsed",
 		},
 	},

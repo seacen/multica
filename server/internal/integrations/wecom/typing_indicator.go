@@ -446,13 +446,13 @@ func (m *TypingIndicatorManager) handleTaskProgress(e events.Event) {
 }
 
 // handleTaskMessage plays the run's transcript into the bubble — the tool
-// calls that are the whole middle of a run.
+// calls and the reasoning between them, which are the whole middle of a run.
 //
 // The order of the two cheap rejections matters. The store is checked first so
 // that a deployment with no WeCom turn in flight pays nothing at all for this
 // subscription; the message is classified second, which drops tool results and
-// agent prose — most of the event's volume — before anything reaches the
-// database.
+// the answer being written — most of the event's volume — before anything
+// reaches the database.
 func (m *TypingIndicatorManager) handleTaskMessage(e events.Event) {
 	if m.streams == nil || m.streams.depth() == 0 {
 		return
