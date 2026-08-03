@@ -713,11 +713,15 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				wecomTyping := wecom.NewTypingIndicator(wecom.TypingIndicatorConfig{
 					Senders: wecomSenders,
 					Streams: wecomStreams,
-					Logger:  slog.Default(),
+					// task:progress names a task and not a chat session, so
+					// the refresh reads the session back off the task row.
+					Tasks:  queries,
+					Logger: slog.Default(),
 				})
-				// Subscribes task:failed only: a failed run publishes no
+				// Subscribes task:failed — a failed run publishes no
 				// chat:done, so this is the sole path that stops the bubble
-				// spinning after a failure.
+				// spinning after a failure — and task:progress, which rewrites
+				// the open bubble as the run moves along.
 				wecomTyping.Register(bus)
 
 				channelRouter.Register(wecom.TypeWecom, wecom.NewResolverSet(

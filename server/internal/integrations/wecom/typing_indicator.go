@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -30,6 +31,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
 	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
 	"github.com/multica-ai/multica/server/internal/util"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
@@ -37,11 +39,19 @@ import (
 // subscriber, neither of which has a caller's context to inherit.
 const streamCloseTimeout = 10 * time.Second
 
+// taskLookup is the one query the progress refresh needs. task:progress
+// carries a task id and no chat session, so the session the bubble is keyed on
+// has to be read back off the task row. *db.Queries satisfies it.
+type taskLookup interface {
+	GetAgentTask(ctx context.Context, id pgtype.UUID) (db.AgentTaskQueue, error)
+}
+
 // TypingIndicatorManager opens the streaming bubble when a message is ingested
 // and owns it until something closes it.
 type TypingIndicatorManager struct {
 	senders *sendersRegistry
 	streams *streamStore
+	tasks   taskLookup
 	log     *slog.Logger
 
 	// guardAfter is when the manager closes a bubble nobody else has. Zero
@@ -56,6 +66,11 @@ type TypingIndicatorConfig struct {
 	Senders *sendersRegistry
 	Streams *streamStore
 	Logger  *slog.Logger
+
+	// Tasks resolves a task id to its chat session for the progress refresh.
+	// Nil leaves the bus-driven refresh off; UpdateProgress still works for
+	// any caller that already knows the session.
+	Tasks taskLookup
 
 	// GuardAfter overrides streamGuardAfter. Test-only.
 	GuardAfter time.Duration
@@ -76,6 +91,7 @@ func NewTypingIndicator(cfg TypingIndicatorConfig) *TypingIndicatorManager {
 	return &TypingIndicatorManager{
 		senders:    cfg.Senders,
 		streams:    cfg.Streams,
+		tasks:      cfg.Tasks,
 		log:        logger,
 		guardAfter: guard,
 	}
@@ -157,12 +173,16 @@ func (m *TypingIndicatorManager) OnSettled(ctx context.Context, sessionID pgtype
 	m.closeBubble(ctx, sessionID, func(c copyPack) string { return c.StreamNotStarted }, "settled")
 }
 
-// Register subscribes the manager to the run failure event. EventChatDone is
+// Register subscribes the manager to the run failure event, and to the
+// progress event when a task lookup was configured. EventChatDone is
 // deliberately NOT subscribed here: the answer belongs in the bubble, and only
 // the outbound subscriber holds the answer. Registering for it here would
 // close the bubble first and leave the reply to arrive underneath it.
 func (m *TypingIndicatorManager) Register(bus *events.Bus) {
 	bus.Subscribe(protocol.EventTaskFailed, m.handleTaskFailed)
+	if m.tasks != nil {
+		bus.Subscribe(protocol.EventTaskProgress, m.handleTaskProgress)
+	}
 }
 
 func (m *TypingIndicatorManager) handleTaskFailed(e events.Event) {
@@ -173,6 +193,108 @@ func (m *TypingIndicatorManager) handleTaskFailed(e events.Event) {
 	ctx, cancel := context.WithTimeout(context.Background(), streamCloseTimeout)
 	defer cancel()
 	m.closeBubble(ctx, sessionID, func(c copyPack) string { return c.StreamFailed }, "task failed")
+}
+
+// UpdateProgress rewrites an open bubble with a line about where the run has
+// got to, leaving it open. It is the whole in-flight-refresh surface: anything
+// that learns something worth saying mid-run — the bus subscriber below, or a
+// future caller closer to the agent — needs only a session and a sentence.
+//
+// Three properties are deliberate. Content is a full replacement, not a delta,
+// so the caller passes the whole line and never has to know what the bubble
+// says now. A refresh yields when the previous frame has not been acked (the
+// backpressure the official SDK calls replyStreamNonBlocking) because progress
+// is worth less than the answer behind it. And nothing here can close the
+// bubble: a refresh that fails leaves the spinner exactly as it was, for the
+// answer or the guard to finish properly.
+func (m *TypingIndicatorManager) UpdateProgress(ctx context.Context, sessionID pgtype.UUID, text string) {
+	if m.senders == nil || m.streams == nil || !sessionID.Valid {
+		return
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	h, ok := m.streams.peek(sessionID)
+	if !ok {
+		return // no bubble open — a non-wecom session, or one already answered
+	}
+	// Inside <think> tags the line renders as the client's thinking affordance
+	// rather than as the bot's answer, which matters because a run that dies
+	// before chat:done would otherwise leave "Launching claude" sitting there
+	// looking like a reply.
+	content := "<think>" + copyFor(h.Locale).StreamProgressPrefix + text + "</think>"
+	if err := m.senders.stream(ctx, h, content, false); err != nil {
+		if errors.Is(err, errStreamBusy) {
+			return // the previous frame is still in flight; skipping is the design
+		}
+		m.log.DebugContext(ctx, "wecom typing: progress refresh failed",
+			"chat_session_id", util.UUIDToString(sessionID), "error", err)
+	}
+}
+
+// handleTaskProgress refreshes the bubble from the bus. The event carries a
+// task id and no chat session, so the session has to be read back off the task
+// row — which is why the store is checked for any open bubble at all first: on
+// a deployment with no WeCom traffic in flight this subscriber must not add a
+// database read to every task's progress.
+func (m *TypingIndicatorManager) handleTaskProgress(e events.Event) {
+	if m.tasks == nil || m.streams == nil || m.streams.depth() == 0 {
+		return
+	}
+	summary := progressSummary(e.Payload)
+	if summary == "" {
+		return
+	}
+	sessionID, ok := sessionIDFromEvent(e)
+	if !ok {
+		taskID, err := util.ParseUUID(taskIDFromEvent(e))
+		if err != nil || !taskID.Valid {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), streamCloseTimeout)
+		defer cancel()
+		task, err := m.tasks.GetAgentTask(ctx, taskID)
+		if err != nil || !task.ChatSessionID.Valid {
+			return // an issue / autopilot run, or a task that has since gone
+		}
+		m.UpdateProgress(ctx, task.ChatSessionID, summary)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), streamCloseTimeout)
+	defer cancel()
+	m.UpdateProgress(ctx, sessionID, summary)
+}
+
+// progressSummary reads the human-readable line off a task:progress payload,
+// typed or in its map form after a serialization round trip.
+func progressSummary(payload any) string {
+	switch p := payload.(type) {
+	case protocol.TaskProgressPayload:
+		return p.Summary
+	case map[string]any:
+		if s, _ := p["summary"].(string); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// taskIDFromEvent prefers the envelope's routing hint and falls back to the
+// payload.
+func taskIDFromEvent(e events.Event) string {
+	if e.TaskID != "" {
+		return e.TaskID
+	}
+	if p, ok := e.Payload.(map[string]any); ok {
+		if s, _ := p["task_id"].(string); s != "" {
+			return s
+		}
+	}
+	if p, ok := e.Payload.(protocol.TaskProgressPayload); ok {
+		return p.TaskID
+	}
+	return ""
 }
 
 // armGuard schedules the close that happens when nothing else does. WeCom

@@ -94,6 +94,11 @@ type copyPack struct {
 	StreamNotStarted   string
 	StreamFailed       string
 	StreamStillWorking string
+
+	// StreamProgressPrefix leads a mid-run progress line. The line itself
+	// comes from the run and is not ours to translate, so the prefix is what
+	// tells the reader which language the bot is speaking.
+	StreamProgressPrefix string
 }
 
 // label returns the display name for an inbox notification type.
@@ -146,11 +151,12 @@ var copyPacks = map[Locale]copyPack{
 			"due_date_changed":   "截止日期变更",
 			"start_date_changed": "开始日期变更",
 		},
-		InboxTypeFallback:  "新消息",
-		StreamNoReply:      "（这轮没有需要回复的内容）",
-		StreamNotStarted:   "已收到，但这条暂时没能开始处理。",
-		StreamFailed:       "⚠️ 这次没跑通，请稍后再试一次。",
-		StreamStillWorking: "还在处理，完成后我再单独回复你。",
+		InboxTypeFallback:    "新消息",
+		StreamNoReply:        "（这轮没有需要回复的内容）",
+		StreamNotStarted:     "已收到，但这条暂时没能开始处理。",
+		StreamFailed:         "⚠️ 这次没跑通，请稍后再试一次。",
+		StreamStillWorking:   "还在处理，完成后我再单独回复你。",
+		StreamProgressPrefix: "正在处理：",
 	},
 	LocaleEn: {
 		AgentOffline:        "⚠️ The agent is offline right now. Your message was received and will be handled once it's back.",
@@ -176,10 +182,11 @@ var copyPacks = map[Locale]copyPack{
 			"due_date_changed":   "Due date changed",
 			"start_date_changed": "Start date changed",
 		},
-		InboxTypeFallback:  "Notification",
-		StreamNoReply:      "(nothing to reply with this round)",
-		StreamNotStarted:   "Got it, but this one couldn't start processing.",
-		StreamFailed:       "⚠️ That run didn't go through. Please try again.",
-		StreamStillWorking: "Still working on it — I'll reply separately when it's done.",
+		InboxTypeFallback:    "Notification",
+		StreamNoReply:        "(nothing to reply with this round)",
+		StreamNotStarted:     "Got it, but this one couldn't start processing.",
+		StreamFailed:         "⚠️ That run didn't go through. Please try again.",
+		StreamStillWorking:   "Still working on it — I'll reply separately when it's done.",
+		StreamProgressPrefix: "Working on it: ",
 	},
 }
