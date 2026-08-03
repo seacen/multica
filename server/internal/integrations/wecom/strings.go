@@ -128,6 +128,12 @@ type copyPack struct {
 	StreamFailed       string
 	StreamStillWorking string
 
+	// StreamQueued closes nothing either. It answers a message that arrived
+	// while the previous round was still running: that round owns the only
+	// bubble, this message starts one of its own, and it waits. Without it the
+	// wait is silent for as long as the first run takes.
+	StreamQueued string
+
 	// StreamStuck is the odd one out: it does not close a bubble, it explains
 	// one that can no longer be closed. When the server disowns a stream
 	// mid-run (846608, 846605) the spinner is left turning on the user's screen
@@ -284,6 +290,7 @@ var copyPacks = map[Locale]copyPack{
 		StreamNotStarted:     "已收到，但这条暂时没能开始处理。",
 		StreamFailed:         "⚠️ 这次没跑通，请稍后再试一次。",
 		StreamStillWorking:   "还在处理，完成后我再单独回复你。",
+		StreamQueued:         "已收到，前一条还在处理中，稍后一起回复你。",
 		StreamStuck:          "⚠️ 上面那条进度不会再更新了，这轮的结果我用新消息发你。",
 		StreamProgressPrefix: "正在处理：",
 		Progress: progressCopy{
@@ -350,6 +357,7 @@ var copyPacks = map[Locale]copyPack{
 		StreamNotStarted:     "Got it, but this one couldn't start processing.",
 		StreamFailed:         "⚠️ That run didn't go through. Please try again.",
 		StreamStillWorking:   "Still working on it — I'll reply separately when it's done.",
+		StreamQueued:         "Got it. I'm still working on your last message, and I'll reply to both once it's done.",
 		StreamStuck:          "⚠️ The status above won't update any further. I'll send this round's result as a new message.",
 		StreamProgressPrefix: "Working on it: ",
 		Progress: progressCopy{

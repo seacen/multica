@@ -37,6 +37,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
 	"github.com/multica-ai/multica/server/internal/util"
 )
 
@@ -60,6 +61,22 @@ const streamGuardAfter = 5 * time.Minute
 // long run, not the length of a stream. An hour covers those and still bounds
 // the map to the sessions answered in the last hour.
 const roundMemory = time.Hour
+
+// sameRoundWindow is how close two messages have to be to be one agent run.
+//
+// It is the engine's debounce window rather than a number of its own, because
+// it is the same question asked twice. The engine's batcher re-arms a
+// per-session timer on every inbound message and fires one run when the session
+// has been quiet for that long (engine/batcher.go), so messages less than a
+// window apart are collected into a single run and anything later is a run of
+// its own. A local constant here would be a second copy of that rule, free to
+// drift from the one that decides.
+//
+// The gap is measured from the PREVIOUS message, not from when the bubble
+// opened, for the same reason: the timer re-arms, so a message every two
+// seconds is one run no matter how long the burst goes on, and the bubble's age
+// says nothing about which run the next message belongs to.
+const sameRoundWindow = engine.DefaultChatRunBatchWindow
 
 // roundEnding says whether the words a closer is writing are the last this
 // round will need. Only the guard's are not: "still working, I'll reply
@@ -189,7 +206,38 @@ type streamEntry struct {
 	// way; the round is not, and the handle is the only address the round's
 	// ending has.
 	unusable bool
+
+	// lastIngest is when this session last took a message — the bubble's own
+	// opening for the first one, and every follow-up after that. It is what
+	// separates a burst from a queue; see sameRoundWindow.
+	lastIngest time.Time
+
+	// queuedTold says the user has been told that a later message is waiting
+	// behind the run this bubble belongs to. Said once per bubble: the news is
+	// the same for the second message and the fifth, and a receipt per message
+	// is the bot talking over itself.
+	queuedTold bool
 }
+
+// followUpVerdict is the store's answer to "another message just landed on a
+// session that already has a bubble — does the user need to hear about it".
+type followUpVerdict int
+
+const (
+	// followUpNoBubble — nothing open. The round ended between the claim that
+	// failed and this call, so there is no bubble and nothing to say about one.
+	followUpNoBubble followUpVerdict = iota
+	// followUpSameRound — inside the debounce window. The run trigger has not
+	// fired yet, so this message joins the run the bubble already stands for
+	// and the bubble is its receipt too.
+	followUpSameRound
+	// followUpQueued — past the window, so the run behind the bubble is under
+	// way and this message starts a round that waits for it. Nobody has said so
+	// yet and this caller is the one that may.
+	followUpQueued
+	// followUpToldAlready — as above, except the user already knows.
+	followUpToldAlready
+)
 
 // streamStore maps chat_session_id to the open bubble for that session, and —
 // for a while after the bubble is gone — to what the round it belonged to still
@@ -230,8 +278,52 @@ func (s *streamStore) claim(sessionID pgtype.UUID, h streamHandle) bool {
 	if h.CreatedAt.IsZero() {
 		h.CreatedAt = s.now()
 	}
-	s.byKey[key] = streamEntry{handle: h}
+	s.byKey[key] = streamEntry{handle: h, lastIngest: h.CreatedAt}
 	return true
+}
+
+// followUp records another message arriving in a session whose bubble is
+// already open, and says whether the user is owed a word about it.
+//
+// The claim that just failed proves only that a bubble exists, which covers two
+// situations the user experiences completely differently. Inside the debounce
+// window the message is part of the run the bubble already stands for, and the
+// spinner on screen is the receipt for it as well. Past the window the run
+// trigger has already fired, the first run is under way — for as long as the
+// agent needs, which is what makes this visible at all — and this message
+// begins a round that sits in agent_task_queue until that one finishes.
+//
+// So the gap decides, and the timestamp it is measured from is the previous
+// message rather than the bubble's opening: the debouncer re-arms on every
+// message, so a slow burst is still one run and only the gaps within it say so
+// (sameRoundWindow).
+//
+// The latch is the other half. A queued round is queued once; three messages
+// piling onto it are three copies of the same news.
+func (s *streamStore) followUp(sessionID pgtype.UUID) followUpVerdict {
+	key := util.UUIDToString(sessionID)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.byKey[key]
+	if !ok {
+		return followUpNoBubble
+	}
+	now := s.now()
+	gap := now.Sub(entry.lastIngest)
+	entry.lastIngest = now
+
+	verdict := followUpQueued
+	switch {
+	case gap < sameRoundWindow:
+		verdict = followUpSameRound
+	case entry.queuedTold:
+		verdict = followUpToldAlready
+	default:
+		entry.queuedTold = true
+	}
+	s.byKey[key] = entry
+	return verdict
 }
 
 // arm attaches the expiry guard to a claimed handle. A run that finished

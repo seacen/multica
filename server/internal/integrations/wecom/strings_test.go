@@ -44,7 +44,8 @@ func TestEveryLocaleFillsEveryString(t *testing.T) {
 	for name, pack := range copyPacks {
 		if pack.AgentOffline == "" || pack.AgentArchived == "" || pack.UnsupportedMsgType == "" ||
 			pack.BindingPromptPrefix == "" || pack.BindingPending == "" ||
-			pack.IssueCreatedPrefix == "" || pack.InboxDetailLink == "" || pack.InboxTypeFallback == "" {
+			pack.IssueCreatedPrefix == "" || pack.InboxDetailLink == "" || pack.InboxTypeFallback == "" ||
+			pack.StreamQueued == "" {
 			t.Fatalf("locale %q has an empty string field", name)
 		}
 		if len(pack.InboxTypeLabels) == 0 {

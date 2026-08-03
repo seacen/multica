@@ -206,8 +206,9 @@ func (m *TypingIndicatorManager) OnIngested(ctx context.Context, inst engine.Res
 		Level:          m.levelFor(ctx, inst, msg),
 	}
 	if !m.streams.claim(sessionID, h) {
-		// A bubble is already open for this session. Two messages inside one
-		// debounce window are one run and belong in one bubble.
+		// A bubble is already open for this session, which is two different
+		// situations wearing the same face. The store tells them apart.
+		m.sayTheMessageIsQueued(ctx, sessionID, h)
 		return
 	}
 
@@ -244,6 +245,42 @@ func (m *TypingIndicatorManager) OnIngested(ctx context.Context, inst engine.Res
 		}
 	}
 	m.armGuard(sessionID, h)
+}
+
+// sayTheMessageIsQueued answers a message that found a bubble already open.
+//
+// Two messages inside one debounce window are one run and one bubble, and the
+// spinner already on screen is the receipt for both — a second word there would
+// be the bot interrupting itself. Past the window the run behind the bubble is
+// under way and this message starts a round that waits for it, which is the
+// case this exists for: the wait is as long as the first run, minutes of it,
+// and it used to pass without a bubble, a receipt, or anything else to show the
+// message had been read.
+//
+// The receipt is a plain message rather than a line in the bubble, for two
+// reasons. The bubble belongs to the run in flight and its body is that run's
+// progress; a receipt written into it would read as a step the agent took, and
+// the eight-line window would scroll it away a few tool calls later. And a
+// plain message goes through the holding queue, so one written during a
+// reconnect is delivered late rather than lost — a stream frame in the same
+// moment is simply gone (senders_registry.go).
+//
+// progressLevel does not gate it. That rule decides who may watch a run work,
+// and this carries no part of the run, only that the message arrived. A group
+// room getting nothing back is the same silence the receipt is here to end.
+func (m *TypingIndicatorManager) sayTheMessageIsQueued(ctx context.Context, sessionID pgtype.UUID, h streamHandle) {
+	if m.streams.followUp(sessionID) != followUpQueued {
+		return
+	}
+	if err := m.senders.send(h.InstallationID, pendingSend{
+		ChatID:   h.ChatID,
+		ChatType: h.ChatType,
+		Content:  copyFor(h.Locale).StreamQueued,
+	}); err != nil {
+		m.log.WarnContext(ctx, "wecom typing: could not say the message is queued",
+			"chat_session_id", util.UUIDToString(sessionID),
+			"installation_id", util.UUIDToString(h.InstallationID), "error", err)
+	}
 }
 
 // levelFor decides how much of the run this bubble may show, once, while the
