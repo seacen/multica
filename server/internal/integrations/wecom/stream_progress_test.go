@@ -533,6 +533,49 @@ func TestATaskThatIsGoneIsAskedAboutOnce(t *testing.T) {
 	}
 }
 
+// TestLastTurnsProgressNeverPaintsTheNewBubble — the store is keyed on the chat
+// session and the feed knows nothing about runs, so a transcript still flushing
+// from the previous turn resolves to the same session and lands in the bubble
+// the user's NEXT question opened. The steps are real; they are just the wrong
+// run's, and the user reads them as what is happening now.
+func TestLastTurnsProgressNeverPaintsTheNewBubble(t *testing.T) {
+	rig, bus, _, clock := busRig(t)
+	rig.ingest(t, "REQ-42")
+
+	// This turn's run takes the bubble.
+	bus.Publish(taskMessageEvent(chatTaskID(), toolUse("Read", map[string]any{"file_path": "this-turn.go"})))
+	clock.advance(progressMinInterval)
+
+	// The previous turn's run, still flushing, resolving to the same session.
+	bus.Publish(taskMessageEvent(issueTaskID(), toolUse("Read", map[string]any{"file_path": "last-turn.go"})))
+
+	for _, f := range streamViews(t, &rig.conn.recordingConn) {
+		if strings.Contains(f.Content, "last-turn.go") {
+			t.Fatalf("a step from another run reached this turn's bubble: %q", f.Content)
+		}
+	}
+}
+
+// TestTheFirstRunToSpeakOwnsTheBubble — the flip side. Whichever run gets there
+// first is the one the bubble belongs to, and it must keep getting through.
+func TestTheFirstRunToSpeakOwnsTheBubble(t *testing.T) {
+	rig, bus, _, clock := busRig(t)
+	rig.ingest(t, "REQ-42")
+
+	for i, name := range []string{"one.go", "two.go", "three.go"} {
+		bus.Publish(taskMessageEvent(chatTaskID(), toolUse("Read", map[string]any{"file_path": name})))
+		if i < 2 {
+			clock.advance(progressMinInterval)
+		}
+	}
+
+	frames := streamViews(t, &rig.conn.recordingConn)
+	last := frames[len(frames)-1]
+	if !strings.Contains(last.Content, "one.go") || !strings.Contains(last.Content, "two.go") {
+		t.Fatalf("the owning run's own steps stopped getting through: %q", last.Content)
+	}
+}
+
 // TestASweptTaskStillClosesTheBubble — task:failed has two publishers with
 // different payloads. broadcastTaskEvent (FailTask) carries chat_session_id;
 // HandleFailedTasks — the sweepers, recover-orphans, the heartbeat timeout —

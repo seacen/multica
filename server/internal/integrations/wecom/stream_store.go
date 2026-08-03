@@ -93,6 +93,14 @@ type streamEntry struct {
 	// bubble's: whoever takes or drops the handle also disposes of the list,
 	// and nothing has to be swept separately.
 	feed *progressFeed
+
+	// taskID is the run this bubble belongs to, adopted from the first step
+	// that reaches it. A chat session outlives its turns and the daemon flushes
+	// a transcript in arrears, so the previous turn's tool calls can still be
+	// arriving after the user has asked the next question — they resolve to the
+	// same session and would be painted into the new bubble as if they were
+	// what is happening now.
+	taskID string
 }
 
 // streamStore maps chat_session_id to the open bubble for that session.
@@ -200,7 +208,13 @@ func (s *streamStore) peek(sessionID pgtype.UUID) (streamHandle, bool) {
 // it, creating the list on first use. Like peek it leaves the handle in place
 // and disowns an expired one: a run whose window has closed gets no more
 // refreshes, and its list goes with it.
-func (s *streamStore) feedFor(sessionID pgtype.UUID) (streamHandle, *progressFeed, bool) {
+//
+// taskID says which run is asking. The first run to speak adopts the bubble and
+// every other one is refused, which is what keeps the previous turn's trailing
+// transcript out of the bubble this turn opened. An empty taskID is a caller
+// that already knows the session — UpdateProgress — and is trusted rather than
+// matched.
+func (s *streamStore) feedFor(sessionID pgtype.UUID, taskID string) (streamHandle, *progressFeed, bool) {
 	key := util.UUIDToString(sessionID)
 
 	s.mu.Lock()
@@ -216,8 +230,19 @@ func (s *streamStore) feedFor(sessionID pgtype.UUID) (streamHandle, *progressFee
 		}
 		return streamHandle{}, nil, false
 	}
+	if taskID != "" && entry.taskID != "" && entry.taskID != taskID {
+		return streamHandle{}, nil, false
+	}
+	dirty := false
+	if taskID != "" && entry.taskID == "" {
+		entry.taskID = taskID
+		dirty = true
+	}
 	if entry.feed == nil {
 		entry.feed = newProgressFeed(s.now)
+		dirty = true
+	}
+	if dirty {
 		s.byKey[key] = entry
 	}
 	return entry.handle, entry.feed, true

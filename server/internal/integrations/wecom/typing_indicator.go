@@ -264,7 +264,7 @@ func (m *TypingIndicatorManager) UpdateProgress(ctx context.Context, sessionID p
 	if text == "" {
 		return
 	}
-	m.recordStep(ctx, sessionID, progressStep{kind: progressRaw, arg: text})
+	m.recordStep(ctx, sessionID, "", progressStep{kind: progressRaw, arg: text})
 }
 
 // recordStep folds one step into a session's bubble and writes the result.
@@ -284,13 +284,15 @@ func (m *TypingIndicatorManager) UpdateProgress(ctx context.Context, sessionID p
 // the answer's own ack timeout learning the same thing. Letting the handle go
 // costs nothing that was still available: the answer arrives as a plain
 // message, which is exactly where it was heading anyway.
-func (m *TypingIndicatorManager) recordStep(ctx context.Context, sessionID pgtype.UUID, step progressStep) {
+func (m *TypingIndicatorManager) recordStep(ctx context.Context, sessionID pgtype.UUID, taskID string, step progressStep) {
 	if m.senders == nil || m.streams == nil || !sessionID.Valid {
 		return
 	}
-	h, feed, ok := m.streams.feedFor(sessionID)
+	h, feed, ok := m.streams.feedFor(sessionID, taskID)
 	if !ok {
-		return // no bubble open — a non-wecom session, or one already answered
+		// No bubble open — a non-wecom session, one already answered, or a
+		// bubble that belongs to a different run than the one speaking.
+		return
 	}
 	content := feed.record(step, copyFor(h.Locale), h.CreatedAt)
 	if content == "" {
@@ -347,7 +349,8 @@ func (m *TypingIndicatorManager) handleTaskMessage(e events.Event) {
 }
 
 // refreshFromTask resolves the chat session behind a task event and records
-// the step against it.
+// the step against it, under the id of the run that produced it — the bubble
+// only takes steps from the run it adopted.
 func (m *TypingIndicatorManager) refreshFromTask(e events.Event, step progressStep) {
 	sessionID, ok := m.sessionFor(e)
 	if !ok {
@@ -355,7 +358,7 @@ func (m *TypingIndicatorManager) refreshFromTask(e events.Event, step progressSt
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), progressWriteTimeout)
 	defer cancel()
-	m.recordStep(ctx, sessionID, step)
+	m.recordStep(ctx, sessionID, taskIDFromEvent(e), step)
 }
 
 // sessionFor finds the chat session behind a task lifecycle event. Most of
