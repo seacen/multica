@@ -426,32 +426,57 @@ func TestAVerdictBelongsToTheFrameThatEarnedIt(t *testing.T) {
 	}
 }
 
-// TestAVerdictThatNeverComesCostsOneFrame — counting acks is what attributes
-// them, so a verdict the server never sends would put the rest of the turn out
-// of step for good. The frame that waited it out writes the loss off.
-func TestAVerdictThatNeverComesCostsOneFrame(t *testing.T) {
+// TestALateVerdictIsNotHandedToTheNextFrame — the mid-run budget is shorter
+// than the server's worst case, so a refresh's verdict routinely lands after
+// its caller has stopped waiting. Whoever wrote next must not be given it: a
+// closing frame that reads a stale "accepted" returns success, the caller has
+// no reason to fall back, and the answer is never sent anywhere.
+func TestALateVerdictIsNotHandedToTheNextFrame(t *testing.T) {
 	conn := &recordingConn{}
 	sender := newWSSender(conn, testLogger())
-	sender.streams["REQ-42"] = &streamAcks{sent: 4, acked: 1, at: time.Now()}
+	sender.ackTimeout = 20 * time.Millisecond
 
-	w, _ := sender.awaitAck("REQ-42", false)
-	w.seq = 4
-	sender.forgetAck("REQ-42", w)
+	if err := sender.respondStream(context.Background(), "REQ-42", "S-1", "<think>正在读取</think>", false); !errors.Is(err, errStreamAckTimeout) {
+		t.Fatalf("refresh returned %v, want the wait given up on", err)
+	}
+	sender.ackTimeout = 2 * time.Second // the answer waits it out properly
 
 	answered := make(chan error, 1)
 	go func() {
 		answered <- sender.respondStream(context.Background(), "REQ-42", "S-1", "答案是 42", true)
 	}()
-	waitForStreamFrames(t, conn, 1)
+	waitForStreamFrames(t, conn, 2)
 
+	// The refresh's verdict, arriving after nobody is waiting for it.
 	sender.deliverAck("REQ-42", 0, "")
 	select {
 	case err := <-answered:
-		if err != nil {
-			t.Errorf("the answer never got its verdict: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("one unanswered frame put every later one out of step")
+		t.Fatalf("the closing frame took the refresh's verdict: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Its own verdict — a refusal, which is what sends the answer out as a
+	// new message instead of losing it.
+	sender.deliverAck("REQ-42", errcodeStreamExpired, "stream expired")
+	if err := <-answered; !streamUnusable(err) {
+		t.Fatalf("the closing frame's verdict was %v, want the server's refusal", err)
+	}
+}
+
+// TestAVerdictThatNeverComesCostsTheBubbleNotTheAnswer — the other half. When
+// the verdict really is lost the turn cannot be put back in step, so every
+// later frame times out too. That costs the bubble and nothing else: an ack
+// timeout is exactly what tells the caller to send a plain message.
+func TestAVerdictThatNeverComesCostsTheBubbleNotTheAnswer(t *testing.T) {
+	conn := &recordingConn{}
+	sender := newWSSender(conn, testLogger())
+	sender.ackTimeout = 20 * time.Millisecond
+
+	_ = sender.respondStream(context.Background(), "REQ-42", "S-1", "<think>正在读取</think>", false)
+
+	err := sender.respondStream(context.Background(), "REQ-42", "S-1", "答案是 42", true)
+	if !errors.Is(err, errStreamAckTimeout) {
+		t.Fatalf("closing frame returned %v, want the caller told to send a new message", err)
 	}
 }
 

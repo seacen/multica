@@ -83,6 +83,11 @@ type wsSender struct {
 	// stream frame, so the ordinary pushes that share this connection never
 	// touch it.
 	streams map[string]*streamAcks
+
+	// ackTimeout is how long a frame waits for its verdict. A field rather
+	// than the constant so a test can exercise the give-up path without
+	// standing still for five seconds.
+	ackTimeout time.Duration
 }
 
 // ackWaiter is one frame's standing request for a verdict. seq is where the
@@ -109,6 +114,10 @@ type ackWaiter struct {
 //
 // sealed is the other half: a finished stream is immutable, so a progress
 // frame that lost the race to the answer must never reach the wire behind it.
+//
+// acked counts verdicts that arrived and only those. Nothing ever advances it
+// on a caller's behalf — see cancelAck for why a write-off is worse than a
+// count that stays short.
 type streamAcks struct {
 	sent   uint64
 	acked  uint64
@@ -128,10 +137,11 @@ func newWSSender(conn wsConn, log *slog.Logger) *wsSender {
 		log = slog.Default()
 	}
 	return &wsSender{
-		conn:    conn,
-		log:     log,
-		waiters: make(map[string]*ackWaiter),
-		streams: make(map[string]*streamAcks),
+		conn:       conn,
+		log:        log,
+		waiters:    make(map[string]*ackWaiter),
+		streams:    make(map[string]*streamAcks),
+		ackTimeout: ackTimeout,
 	}
 }
 
@@ -227,31 +237,26 @@ func (s *wsSender) awaitAck(reqID string, force bool) (*ackWaiter, bool) {
 	return w, true
 }
 
-// cancelAck retires a waiter whose caller has stopped waiting. The verdict is
-// still expected — a mid-run refresh gives up after a second because the
-// daemon's request is not ours to hold, not because the server has gone quiet —
-// so the count is left alone and the late ack is discarded when it lands.
+// cancelAck retires a waiter whose caller has stopped waiting, for either of
+// the two reasons a caller stops: its own budget ran out (a mid-run refresh
+// gives up after a second because the daemon's request is not ours to hold), or
+// the full ack timeout elapsed with nothing on the wire.
+//
+// Both leave the count alone, and that is the whole attribution rule: acked
+// counts verdicts that ARRIVED, never verdicts we gave up on. Advancing it to
+// cover a frame nobody is waiting for would hand that frame's real verdict —
+// which lands a moment later, because the server does answer every frame — to
+// whoever wrote next, and every frame after it in the turn as well. The one
+// that pays is the closing frame: a stale "accepted" makes a refused answer
+// read as delivered, so the caller never falls back and the reply is sent
+// nowhere at all. Leaving the count short costs a turn whose verdict is truly
+// lost its bubble, since every later frame then times out — and an ack timeout
+// is exactly the signal that sends the answer as a plain message.
 func (s *wsSender) cancelAck(reqID string, w *ackWaiter) {
 	s.ackMu.Lock()
 	defer s.ackMu.Unlock()
 	if cur, ok := s.waiters[reqID]; ok && cur == w {
 		delete(s.waiters, reqID)
-	}
-}
-
-// forgetAck retires a waiter whose verdict never came at all, and writes off
-// everything it was waiting behind. Five seconds of silence on a live socket
-// means the ack is not coming; leaving the count short would put every later
-// frame of the turn permanently out of step, and the closing frame is the one
-// that would pay for it.
-func (s *wsSender) forgetAck(reqID string, w *ackWaiter) {
-	s.ackMu.Lock()
-	defer s.ackMu.Unlock()
-	if cur, ok := s.waiters[reqID]; ok && cur == w {
-		delete(s.waiters, reqID)
-	}
-	if st, ok := s.streams[reqID]; ok && st.acked < w.seq {
-		st.acked = w.seq
 	}
 }
 
@@ -344,7 +349,7 @@ func (s *wsSender) respondStream(ctx context.Context, reqID, streamID, content s
 		return err
 	}
 
-	timer := time.NewTimer(ackTimeout)
+	timer := time.NewTimer(s.ackTimeout)
 	defer timer.Stop()
 	select {
 	case res := <-w.ch:
@@ -356,7 +361,7 @@ func (s *wsSender) respondStream(ctx context.Context, reqID, streamID, content s
 		}
 		return nil
 	case <-timer.C:
-		s.forgetAck(reqID, w)
+		s.cancelAck(reqID, w)
 		return errStreamAckTimeout
 	case <-ctx.Done():
 		s.cancelAck(reqID, w)
