@@ -141,9 +141,9 @@ func chatDoneContent(payload any) string {
 // handleInboxNew is the inbox:new subscriber that delivers a member
 // notification via the smart bot. When the recipient member has a WeCom
 // binding with a live connection, the notification is pushed to the aibot.
-// On any miss — non-member recipient, no wecom binding, no live sender,
-// send failure — the handler is a no-op and the member simply receives the
-// notification through the in-app inbox as usual.
+// On any miss — non-member recipient, no wecom binding, a revoked
+// installation, an unsendable body — the handler is a no-op and the member
+// simply receives the notification through the in-app inbox as usual.
 func (o *Outbound) handleInboxNew(e events.Event) {
 	payload, ok := e.Payload.(map[string]any)
 	if !ok {
@@ -196,15 +196,23 @@ func (o *Outbound) tryDeliverInbox(ctx context.Context, item map[string]any, rec
 		return false
 	}
 
-	// The card's type label and link text follow the installation's locale.
-	// A lookup failure is not fatal — the default copy still says something
-	// useful, and dropping a notification over a language choice would be
-	// worse than sending it in the wrong one.
+	// One row answers two questions: whether the bot is still installed, and
+	// which language its copy speaks. A revoked installation stops here — the
+	// binding row outlives the revoke, so the member still looks reachable.
+	// A lookup failure is not fatal for the locale — the default copy still
+	// says something useful, and dropping a notification over a language
+	// choice would be worse than sending it in the wrong one.
 	cp := copyFor(DefaultLocale)
 	if inst, err := o.q.GetChannelInstallation(ctx, db.GetChannelInstallationParams{
 		ID:          binding.InstallationID,
 		ChannelType: channelTypeWecom,
 	}); err == nil {
+		if inst.Status != string(InstallationActive) {
+			o.logger.DebugContext(ctx, "wecom outbound: inbox push skipped, installation not active",
+				"installation_id", uuidStringPub(binding.InstallationID),
+				"status", inst.Status, "recipient_id", recipientIDStr)
+			return false
+		}
 		cp = copyFor(localeOfRow(inst))
 	} else {
 		o.logger.WarnContext(ctx, "wecom outbound: installation lookup for inbox locale failed",

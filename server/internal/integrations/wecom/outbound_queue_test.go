@@ -276,3 +276,38 @@ func TestInboxPushSurvivesAReconnect(t *testing.T) {
 		t.Fatalf("after reconnect the inbox card arrived %d times, want 1", n)
 	}
 }
+
+// TestInboxPushStopsAtARevokedInstallation — the binding row outlives the
+// revoke, so the member still looks reachable. Pushing anyway sends a card
+// from a bot the workspace has uninstalled, and with the holding queue in
+// place it would sit there waiting for a connection that should never come
+// back. The chat-done path checks the installation status; this one must too.
+func TestInboxPushStopsAtARevokedInstallation(t *testing.T) {
+	inst := uuidOf(13)
+	q := &fakeOutboundQueries{
+		memberBind: db.ChannelUserBinding{InstallationID: inst, ChannelUserID: "T-alex"},
+		workspace:  db.Workspace{Slug: "acme"},
+		install:    db.ChannelInstallation{ID: inst, Status: string(InstallationRevoked)},
+	}
+	reg := NewSendersRegistry()
+	conn := &recordingConn{}
+	reg.set(inst, newWSSender(conn, testLogger()))
+	o := NewOutbound(q, reg, testLogger())
+
+	item := map[string]any{
+		"recipient_type": "member",
+		"recipient_id":   uuidText(uuidOf(14)),
+		"workspace_id":   uuidText(uuidOf(15)),
+		"type":           "issue_assigned",
+		"title":          "修一下登录",
+	}
+	if o.tryDeliverInbox(context.Background(), item, uuidText(uuidOf(14)), uuidText(uuidOf(15))) {
+		t.Fatal("a revoked installation must not report a delivery")
+	}
+	if got := contentsOf(conn); len(got) != 0 {
+		t.Fatalf("a revoked installation was pushed to: %v", got)
+	}
+	if n := reg.pending.depth(inst); n != 0 {
+		t.Fatalf("queue depth %d, want nothing held for a revoked installation", n)
+	}
+}
