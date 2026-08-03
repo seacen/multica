@@ -86,11 +86,17 @@ func (r *sendersRegistry) send(id pgtype.UUID, msg pendingSend) error {
 	if _, err := sendMsgTextBody(msg.ChatID, msg.ChatType, msg.Content); err != nil {
 		return err
 	}
+	// A backlog outranks a live connection. Connect registers the sender and
+	// drains on a separate goroutine, so for a moment both are true — and a
+	// message written straight out in that moment lands ahead of the answers
+	// that have been waiting for the socket, which reads as the conversation
+	// running backwards. Joining the queue keeps one order for everything.
 	sender := r.get(id)
-	if sender == nil {
+	if sender == nil || r.pending.depth(id) > 0 {
 		r.pending.enqueue(id, msg)
-		r.log.Debug("wecom outbound: no live connection, message held for reconnect",
-			"installation_id", util.UUIDToString(id), "depth", r.pending.depth(id))
+		r.log.Debug("wecom outbound: message queued behind the backlog",
+			"installation_id", util.UUIDToString(id),
+			"connected", sender != nil, "depth", r.pending.depth(id))
 		return nil
 	}
 	if err := sender.sendText(msg.ChatID, msg.ChatType, msg.Content); err != nil {

@@ -169,6 +169,35 @@ func TestFlushRequeuesWhenTheSocketDiesMidDrain(t *testing.T) {
 	}
 }
 
+// TestANewReplyDoesNotOvertakeTheBacklog — Connect registers the sender and
+// then drains the queue on its own goroutine, so for a moment there is both a
+// live connection and a backlog. A reply that arrives in that moment used to go
+// straight out and land ahead of the answers that had been waiting for the
+// socket, which reads as the conversation running backwards.
+func TestANewReplyDoesNotOvertakeTheBacklog(t *testing.T) {
+	reg := NewSendersRegistry()
+	reg.log = testLogger()
+	inst := uuidOf(16)
+
+	if err := reg.send(inst, pendingSend{ChatID: "T-alex", ChatType: chatTypeSingleInt, Content: "held"}); err != nil {
+		t.Fatalf("send with no connection: %v", err)
+	}
+
+	// The socket is back but the drain has not run yet.
+	conn := &recordingConn{}
+	reg.set(inst, newWSSender(conn, testLogger()))
+	if err := reg.send(inst, pendingSend{ChatID: "T-alex", ChatType: chatTypeSingleInt, Content: "fresh"}); err != nil {
+		t.Fatalf("send with a live connection: %v", err)
+	}
+	reg.flushPending(inst)
+
+	got := contentsOf(conn)
+	want := []string{"held", "fresh"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("the user read %v, want %v", got, want)
+	}
+}
+
 // TestRegistrySendRejectsAnUnsendableMessage — a body the wire will never
 // accept must not sit in the queue forever.
 func TestRegistrySendRejectsAnUnsendableMessage(t *testing.T) {
