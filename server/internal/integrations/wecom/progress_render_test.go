@@ -52,7 +52,7 @@ func lineFor(t *testing.T, msg protocol.TaskMessagePayload, loc Locale) string {
 	if !ok {
 		t.Fatalf("%s/%s produced no step at all", msg.Type, msg.Tool)
 	}
-	return step.line(copyFor(loc))
+	return step.line(copyFor(loc), progressLevelDetail)
 }
 
 // TestEveryToolCallReadsAsAnAction — the mapping table, stated as what the
@@ -203,7 +203,7 @@ func TestPayloadSurvivesASerializationRoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatal("the map form produced no step")
 	}
-	if got := step.line(copyFor(LocaleZhHans)); got != "正在读取 config.go" {
+	if got := step.line(copyFor(LocaleZhHans), progressLevelDetail); got != "正在读取 config.go" {
 		t.Errorf("line = %q", got)
 	}
 }
@@ -222,12 +222,12 @@ func TestTheBubbleAccumulatesSteps(t *testing.T) {
 	pack := copyFor(LocaleZhHans)
 	opened := clock.now()
 
-	first := feed.record(progressStep{kind: progressRead, arg: "a.go"}, pack, opened)
+	first := feed.record(progressStep{kind: progressRead, arg: "a.go"}, pack, opened, progressLevelDetail)
 	if !strings.Contains(first, "正在读取 a.go") {
 		t.Fatalf("first frame = %q", first)
 	}
 	clock.advance(progressMinInterval)
-	second := feed.record(progressStep{kind: progressCommand}, pack, opened)
+	second := feed.record(progressStep{kind: progressCommand}, pack, opened, progressLevelDetail)
 	if !strings.Contains(second, "正在读取 a.go") || !strings.Contains(second, "正在执行命令") {
 		t.Errorf("second frame = %q, want both steps", second)
 	}
@@ -253,7 +253,7 @@ func TestTheOldestStepScrollsOff(t *testing.T) {
 
 	var last string
 	for i := 0; i < pushes; i++ {
-		last = feed.record(progressStep{kind: progressTool, arg: fmt.Sprintf("step%03d", i)}, pack, opened)
+		last = feed.record(progressStep{kind: progressTool, arg: fmt.Sprintf("step%03d", i)}, pack, opened, progressLevelDetail)
 		clock.advance(progressMinInterval)
 	}
 	if strings.Contains(last, "step000") {
@@ -280,7 +280,7 @@ func TestRepeatedStepsCountInsteadOfRepeating(t *testing.T) {
 
 	var last string
 	for i := 0; i < 3; i++ {
-		last = feed.record(progressStep{kind: progressSearch}, pack, opened)
+		last = feed.record(progressStep{kind: progressSearch}, pack, opened, progressLevelDetail)
 		clock.advance(progressMinInterval)
 	}
 	if strings.Count(last, "正在检索代码") != 1 {
@@ -299,15 +299,15 @@ func TestABurstOfStepsBecomesOneFrame(t *testing.T) {
 	pack := copyFor(LocaleZhHans)
 	opened := clock.now()
 
-	if got := feed.record(progressStep{kind: progressRead, arg: "a.go"}, pack, opened); got == "" {
+	if got := feed.record(progressStep{kind: progressRead, arg: "a.go"}, pack, opened, progressLevelDetail); got == "" {
 		t.Fatal("the first step must reach the user immediately")
 	}
 	clock.advance(200 * time.Millisecond)
-	if got := feed.record(progressStep{kind: progressRead, arg: "b.go"}, pack, opened); got != "" {
+	if got := feed.record(progressStep{kind: progressRead, arg: "b.go"}, pack, opened, progressLevelDetail); got != "" {
 		t.Errorf("a second frame %q went out inside the throttle window", got)
 	}
 	clock.advance(progressMinInterval)
-	merged := feed.record(progressStep{kind: progressRead, arg: "c.go"}, pack, opened)
+	merged := feed.record(progressStep{kind: progressRead, arg: "c.go"}, pack, opened, progressLevelDetail)
 	if merged == "" {
 		t.Fatal("the throttle never released")
 	}
@@ -323,7 +323,7 @@ func TestTheBubbleShowsHowLongItHasBeen(t *testing.T) {
 	opened := clock.now()
 	clock.advance(23 * time.Second)
 
-	frame := feed.record(progressStep{kind: progressSearch}, copyFor(LocaleZhHans), opened)
+	frame := feed.record(progressStep{kind: progressSearch}, copyFor(LocaleZhHans), opened, progressLevelDetail)
 	if !strings.Contains(frame, "已用时 23s") {
 		t.Errorf("frame = %q, want the elapsed time", frame)
 	}

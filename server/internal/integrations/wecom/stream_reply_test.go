@@ -124,13 +124,22 @@ func streamInbound(reqID, chatID string) channel.InboundMessage {
 
 // streamRig is one wired-up installation: a live socket, the registry that
 // finds it, the store, and the typing manager.
+//
+// The rig's default sender IS the principal, in their own chat, because that
+// is the turn every other test in this package is about. progress_level_test.go
+// is where the other audiences are set up.
 type streamRig struct {
-	conn    *ackingConn
-	senders *sendersRegistry
-	streams *streamStore
-	typing  *TypingIndicatorManager
-	inst    engine.ResolvedInstallation
-	session pgtype.UUID
+	conn       *ackingConn
+	senders    *sendersRegistry
+	streams    *streamStore
+	typing     *TypingIndicatorManager
+	identities *fakeIdentities
+	inst       engine.ResolvedInstallation
+	session    pgtype.UUID
+
+	// principalSender is the WeCom userid bound to the installation's
+	// principal — the sender ingest() speaks as.
+	principalSender string
 }
 
 func newStreamRig(t *testing.T) *streamRig {
@@ -146,25 +155,43 @@ func newStreamRig(t *testing.T) *streamRig {
 	senders.log = testLogger()
 	senders.set(instID, sender)
 
+	const principalSender = "T-alex"
+	principal := uuidOf(9)
+	identities := &fakeIdentities{byChannelUser: map[string]pgtype.UUID{principalSender: principal}}
+
 	streams := newStreamStore()
 	typing := NewTypingIndicator(TypingIndicatorConfig{
-		Senders: senders,
-		Streams: streams,
-		Logger:  testLogger(),
+		Senders:    senders,
+		Streams:    streams,
+		Identities: identities,
+		Logger:     testLogger(),
 	})
 	return &streamRig{
-		conn:    conn,
-		senders: senders,
-		streams: streams,
-		typing:  typing,
-		inst:    engine.ResolvedInstallation{ID: instID, Platform: Installation{Locale: string(LocaleZhHans)}},
-		session: uuidOf(21),
+		conn:       conn,
+		senders:    senders,
+		streams:    streams,
+		typing:     typing,
+		identities: identities,
+		inst: engine.ResolvedInstallation{
+			ID:              instID,
+			InstallerUserID: principal,
+			Platform:        Installation{Locale: string(LocaleZhHans)},
+		},
+		session:         uuidOf(21),
+		principalSender: principalSender,
 	}
 }
 
 func (r *streamRig) ingest(t *testing.T, reqID string) {
 	t.Helper()
-	r.typing.OnIngested(context.Background(), r.inst, streamInbound(reqID, "T-alex"), r.session)
+	r.ingestMessage(t, streamInbound(reqID, r.principalSender))
+}
+
+// ingestMessage opens the bubble for an envelope the test built itself — a
+// group room, or a colleague's own chat.
+func (r *streamRig) ingestMessage(t *testing.T, msg channel.InboundMessage) {
+	t.Helper()
+	r.typing.OnIngested(context.Background(), r.inst, msg, r.session)
 }
 
 // chatDone publishes what the agent's finished turn publishes.

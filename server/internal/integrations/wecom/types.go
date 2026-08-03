@@ -73,6 +73,12 @@ type Installation struct {
 	// (see strings.go). Empty means DefaultLocale — every installation that
 	// predates the field keeps the Chinese copy it already had.
 	Locale string
+
+	// PrincipalUserID overrides who this bot belongs to for the purpose of
+	// showing a run's steps (progress_render.go). Empty — which is every row
+	// that predates the field — means the installer. Set it when the person
+	// who installed the bot is not the person who uses it.
+	PrincipalUserID string
 }
 
 // InstallationCredentials is the plaintext-bearing view the WebSocket
@@ -96,6 +102,11 @@ type installConfig struct {
 	// default (Chinese). Stored per installation rather than per user because
 	// the bot speaks one language to a whole workspace's chats.
 	Locale string `json:"locale,omitempty"`
+
+	// PrincipalUserID is optional and absent on every existing row; absent
+	// means the installer. Same shape as Locale — an installation-level
+	// setting with a sensible default, not a new table.
+	PrincipalUserID string `json:"principal_user_id,omitempty"`
 }
 
 // encodeInstallConfig marshals an Installation's config-bearing fields into
@@ -109,6 +120,7 @@ func encodeInstallConfig(inst Installation) ([]byte, error) {
 		BotID:           inst.BotID,
 		SecretEncrypted: inst.SecretEncrypted,
 		Locale:          inst.Locale,
+		PrincipalUserID: inst.PrincipalUserID,
 	})
 }
 
@@ -131,6 +143,7 @@ func installationFromRow(row db.ChannelInstallation) (Installation, error) {
 		BotID:           cfg.BotID,
 		SecretEncrypted: cfg.SecretEncrypted,
 		Locale:          cfg.Locale,
+		PrincipalUserID: cfg.PrincipalUserID,
 	}, nil
 }
 

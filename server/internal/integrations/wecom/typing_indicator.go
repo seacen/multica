@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -73,10 +74,11 @@ type taskLookup interface {
 // TypingIndicatorManager opens the streaming bubble when a message is ingested
 // and owns it until something closes it.
 type TypingIndicatorManager struct {
-	senders *sendersRegistry
-	streams *streamStore
-	tasks   taskLookup
-	log     *slog.Logger
+	senders    *sendersRegistry
+	streams    *streamStore
+	tasks      taskLookup
+	identities identityLookup
+	log        *slog.Logger
 
 	// taskSessions remembers which chat a task belongs to — and which tasks
 	// belong to no chat at all — so a run's dozens of tool messages cost one
@@ -103,6 +105,17 @@ type TypingIndicatorConfig struct {
 	// knows the session.
 	Tasks taskLookup
 
+	// Identities resolves the WeCom sender id on an inbound message to the
+	// Multica user behind it, which is the only way to tell the principal's
+	// own chat from a colleague's. Nil leaves every bubble on the closed tier:
+	// a deployment that cannot prove who is asking must not assume.
+	//
+	// The Router resolves the same binding a moment earlier and its
+	// TypingNotifier interface does not carry the answer across, so this reads
+	// it again. That costs one indexed row per turn, on the detached goroutine
+	// the Router already gives OnIngested, so it is nowhere near the ACK.
+	Identities identityLookup
+
 	// GuardAfter overrides streamGuardAfter. Test-only.
 	GuardAfter time.Duration
 }
@@ -123,6 +136,7 @@ func NewTypingIndicator(cfg TypingIndicatorConfig) *TypingIndicatorManager {
 		senders:      cfg.Senders,
 		streams:      cfg.Streams,
 		tasks:        cfg.Tasks,
+		identities:   cfg.Identities,
 		taskSessions: newTaskSessionCache(),
 		log:          logger,
 		guardAfter:   guard,
@@ -171,6 +185,7 @@ func (m *TypingIndicatorManager) OnIngested(ctx context.Context, inst engine.Res
 		ChatID:         chatID,
 		ChatType:       aibotChatTypeFromChannel(msg.Source.ChatType),
 		Locale:         localeOf(inst),
+		Level:          m.levelFor(ctx, inst, msg),
 	}
 	if !m.streams.claim(sessionID, h) {
 		// A bubble is already open for this session. Two messages inside one
@@ -211,6 +226,67 @@ func (m *TypingIndicatorManager) OnIngested(ctx context.Context, inst engine.Res
 		}
 	}
 	m.armGuard(sessionID, h)
+}
+
+// levelFor decides how much of the run this bubble may show, once, while the
+// facts it needs are still in hand: who asked, and where.
+//
+// One condition, stated two ways. The chat has to be a one-to-one, and the
+// person on the other end of it has to be the principal. A group fails the
+// first: the WeCom session key for a room is the room, so every member reads
+// the same bubble, and the person who asked is one of several. A colleague's
+// own chat fails the second: private, but not to the principal.
+//
+// Everything unknown resolves to the closed tier. No lookup configured, no
+// sender id, a binding that is not there, a database that did not answer —
+// none of those prove the reader is the principal, and this is the side to be
+// wrong on. The cost of being wrong the other way is a file path in a chat
+// that cannot unsend it.
+func (m *TypingIndicatorManager) levelFor(ctx context.Context, inst engine.ResolvedInstallation, msg channel.InboundMessage) progressLevel {
+	if aibotChatTypeFromChannel(msg.Source.ChatType) != chatTypeSingleInt {
+		return progressLevelNone
+	}
+	principal := principalOf(inst)
+	if !principal.Valid || m.identities == nil {
+		return progressLevelNone
+	}
+	senderID := strings.TrimSpace(msg.Source.SenderID)
+	if senderID == "" {
+		return progressLevelNone
+	}
+	binding, err := m.identities.GetChannelUserBindingByUserID(ctx, db.GetChannelUserBindingByUserIDParams{
+		InstallationID: inst.ID,
+		ChannelUserID:  senderID,
+	})
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			m.log.WarnContext(ctx, "wecom typing: cannot tell who is asking, showing no steps",
+				"installation_id", util.UUIDToString(inst.ID), "error", err)
+		}
+		return progressLevelNone
+	}
+	if binding.MulticaUserID != principal {
+		return progressLevelNone
+	}
+	return progressLevelDetail
+}
+
+// principalOf names whose bot this is.
+//
+// The installer is the default and is right for the case this adapter is built
+// for: one person sets the bot up on their own workspace and talks to it. It
+// stops being right the moment an admin installs on someone else's behalf, so
+// an installation may name the principal itself — same shape as the locale,
+// an optional key in the config JSONB, absent on every row that predates it. A
+// value that will not parse falls back rather than failing: a typo should cost
+// the wrong audience, not the whole feature.
+func principalOf(inst engine.ResolvedInstallation) pgtype.UUID {
+	if p, ok := inst.Platform.(Installation); ok && strings.TrimSpace(p.PrincipalUserID) != "" {
+		if id, err := util.ParseUUID(strings.TrimSpace(p.PrincipalUserID)); err == nil && id.Valid {
+			return id
+		}
+	}
+	return inst.InstallerUserID
 }
 
 // OnSettled closes a bubble whose message never became a run — agent offline
@@ -312,7 +388,15 @@ func (m *TypingIndicatorManager) recordStep(ctx context.Context, sessionID pgtyp
 		// bubble that belongs to a different run than the one speaking.
 		return
 	}
-	content := feed.record(step, copyFor(h.Locale), h.CreatedAt)
+	if h.Level == progressLevelNone {
+		// A group, or a colleague's own chat. The bubble stays as the opening
+		// frame painted it and the answer seals it; nothing in between is
+		// theirs to read. Stopping here rather than one layer down is what
+		// keeps a bubble that shows nothing from spending a socket write per
+		// tool call for the length of the run.
+		return
+	}
+	content := feed.record(step, copyFor(h.Locale), h.CreatedAt, h.Level)
 	if content == "" {
 		// Inside the refresh interval. The step is in the list and the next
 		// frame carries it; sending one per tool call would spend the bot's

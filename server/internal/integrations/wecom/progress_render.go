@@ -22,6 +22,11 @@ package wecom
 // credentials, customer data and file bodies. The bubble says "正在执行命令";
 // the transcript in the web UI is where someone entitled to the detail goes
 // and looks.
+//
+// WHO IS ENTITLED is the other half of the rule, and it lives in progressLevel
+// below. The paragraph above answers "what may a step say"; the tier answers
+// "to whom", and outside the principal's own one-to-one chat the answer is
+// nothing at all. Neither gate makes the other redundant.
 
 import (
 	"fmt"
@@ -50,6 +55,27 @@ const (
 	// progressFragmentRunes caps the one vetted fragment a line may carry, so
 	// a pathological name cannot turn one step into a paragraph.
 	progressFragmentRunes = 40
+)
+
+// progressLevel is how much of a run one bubble may show. It is decided once,
+// when the message is ingested and the audience is known, and carried on the
+// stream handle for the bubble's whole life.
+//
+// Two tiers and no middle one. A run's steps are the principal's own working
+// notes; anyone else in the conversation is a bystander to them, and a tier
+// that showed bystanders "reading a file" without saying which would be honest
+// but would still put a scrolling activity log into somebody else's chat. So
+// the choice is the whole list or none of it.
+type progressLevel uint8
+
+const (
+	// progressLevelNone shows the bubble and the answer, and nothing in
+	// between. It is the zero value on purpose: a handle nobody classified
+	// shows nothing.
+	progressLevelNone progressLevel = iota
+
+	// progressLevelDetail shows the run as it happens, arguments included.
+	progressLevelDetail
 )
 
 // progressKind is what a step is, independent of language. The event arrives
@@ -216,9 +242,20 @@ func stepFromToolUse(tool string, input map[string]any) progressStep {
 	return progressStep{kind: progressTool, arg: safeFragment(tool)}
 }
 
-// line words a step in one locale. The only values interpolated are the
-// step's own fragments, which the vetting helpers have already cleaned.
-func (s progressStep) line(c copyPack) string {
+// line words a step in one locale, for one audience. The only values
+// interpolated are the step's own fragments, which the vetting helpers have
+// already cleaned.
+//
+// The tier check is HERE, at the single point where a step becomes words,
+// rather than in each branch below or in each caller. That is what makes it
+// hold for a tool type nobody has written yet: a new kind gets a case in this
+// switch, and inherits the gate whether its author thought about audiences or
+// not. recordStep has a cheaper check of its own, but this is the one that is
+// exhaustive.
+func (s progressStep) line(c copyPack, level progressLevel) string {
+	if level != progressLevelDetail {
+		return ""
+	}
 	p := c.Progress
 	switch s.kind {
 	case progressRaw:
@@ -394,8 +431,8 @@ func newProgressFeed(now func() time.Time) *progressFeed {
 //
 // openedAt is when the user asked, which is what the elapsed clock counts
 // from — not when the first step happened.
-func (f *progressFeed) record(step progressStep, c copyPack, openedAt time.Time) string {
-	text := strings.TrimSpace(step.line(c))
+func (f *progressFeed) record(step progressStep, c copyPack, openedAt time.Time, level progressLevel) string {
+	text := strings.TrimSpace(step.line(c, level))
 	if text == "" {
 		return ""
 	}

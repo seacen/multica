@@ -78,6 +78,12 @@ type streamHandle struct {
 	// frame does not need a second installation read to know what to say.
 	Locale Locale
 
+	// Level is how much of the run this bubble may show. It is settled at
+	// ingest, when who asked and where they asked is still known, and read
+	// again on every refresh — the events that drive those refreshes carry a
+	// task id and nothing about a person.
+	Level progressLevel
+
 	CreatedAt time.Time
 }
 

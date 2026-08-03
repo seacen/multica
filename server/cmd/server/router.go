@@ -715,8 +715,14 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					Streams: wecomStreams,
 					// task:progress names a task and not a chat session, so
 					// the refresh reads the session back off the task row.
-					Tasks:  queries,
-					Logger: slog.Default(),
+					Tasks: queries,
+					// Who is asking decides how much of the run the bubble
+					// shows: the principal's own chat watches it work, a group
+					// or a colleague's chat gets the bubble and the answer and
+					// nothing in between. Without this the adapter cannot tell
+					// them apart and shows nobody anything.
+					Identities: wecomStore,
+					Logger:     slog.Default(),
 				})
 				// Subscribes task:failed — a failed run publishes no
 				// chat:done, so this is the sole path that stops the bubble
