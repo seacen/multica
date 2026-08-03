@@ -84,6 +84,14 @@ type copyPack struct {
 	MediaTooLarge   string
 	MediaUnreadable string
 
+	// MediaSendFailed goes the other way: the agent produced a file and it did
+	// not reach the chat. The answer is already on screen and may well point at
+	// the file, so silence would leave the user waiting for something that is
+	// not coming. One line covers the whole turn however many files failed —
+	// the reason (too big, storage down, WeCom refused it) is a log line, not
+	// something the reader can act on.
+	MediaSendFailed string
+
 	// BindingPromptPrefix / BindingPromptSuffix wrap the bind URL.
 	// BindingPending replaces the whole thing when the mint was throttled and
 	// there is no URL to print.
@@ -250,6 +258,7 @@ var copyPacks = map[Locale]copyPack{
 		QuotePrefix:         "引用：",
 		MediaTooLarge:       "⚠️ 有附件超过 100MB，我读不了，麻烦压缩一下或换个方式发给我。",
 		MediaUnreadable:     "⚠️ 有附件我没能读取（链接可能已过期），麻烦重新发一次。",
+		MediaSendFailed:     "⚠️ 有文件没能发出来，我这边保留着，需要的话我再试一次。",
 		BindingPromptPrefix: "👋 请先绑定你的 Multica 账号，才能与我对话：\n",
 		BindingPromptSuffix: "\n（链接 15 分钟内有效）",
 		BindingPending:      "👋 绑定链接刚才已经发给你了，请点上一条消息里的链接完成绑定。",
@@ -315,6 +324,7 @@ var copyPacks = map[Locale]copyPack{
 		QuotePrefix:         "Quoted: ",
 		MediaTooLarge:       "⚠️ One of those attachments is over 100MB, which I can't read. Please compress it or send it another way.",
 		MediaUnreadable:     "⚠️ I couldn't read one of those attachments — the link may have expired. Please send it again.",
+		MediaSendFailed:     "⚠️ I couldn't send one of the files. It is still here — say the word and I'll try again.",
 		BindingPromptPrefix: "👋 Link your Multica account before we can talk:\n",
 		BindingPromptSuffix: "\n(the link is good for 15 minutes)",
 		BindingPending:      "👋 I already sent you a link — tap the one in the message above to finish linking.",

@@ -222,6 +222,9 @@ type fakeOutboundQueries struct {
 	memberErr   error
 	workspace   db.Workspace
 	workspaceEr error
+
+	attachments   []db.Attachment
+	attachmentErr error
 }
 
 func (f *fakeOutboundQueries) GetChannelChatSessionBindingBySession(context.Context, db.GetChannelChatSessionBindingBySessionParams) (db.ChannelChatSessionBinding, error) {
@@ -238,6 +241,10 @@ func (f *fakeOutboundQueries) FindChannelBindingForMember(context.Context, db.Fi
 
 func (f *fakeOutboundQueries) GetWorkspace(context.Context, pgtype.UUID) (db.Workspace, error) {
 	return f.workspace, f.workspaceEr
+}
+
+func (f *fakeOutboundQueries) ListAttachmentsByChatMessage(context.Context, db.ListAttachmentsByChatMessageParams) ([]db.Attachment, error) {
+	return f.attachments, f.attachmentErr
 }
 
 // TestAgentReplySurvivesAReconnect is the user-visible statement of the bug:

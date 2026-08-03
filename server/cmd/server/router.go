@@ -762,7 +762,21 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				// there is not. Mirrors slack.NewOutbound(...).Register(bus).
 				// Without it the agent's reply lands only in Multica's web UI
 				// — the user in WeChat Work sees no response.
-				wecom.NewOutbound(queries, wecomSenders, wecomStreams, slog.Default()).Register(bus)
+				//
+				// Outbound media: a file the agent produced with `multica
+				// attachment upload` is bound to the reply it wrote, and this
+				// is what carries it the last hop — read back out of object
+				// storage and up the same socket as its own message behind the
+				// answer. Wired only when there is a storage backend; without
+				// one there is nothing to read, and the answer stays text, as
+				// it was.
+				wecomOutboundOpts := []wecom.OutboundOption{}
+				if store != nil {
+					wecomOutboundOpts = append(wecomOutboundOpts, wecom.WithAttachments(store))
+				} else {
+					slog.Warn("wecom: no storage backend; files an agent produces stay out of the chat")
+				}
+				wecom.NewOutbound(queries, wecomSenders, wecomStreams, slog.Default(), wecomOutboundOpts...).Register(bus)
 
 				slog.Info("wecom integration enabled (smart bot, long connection)")
 			}

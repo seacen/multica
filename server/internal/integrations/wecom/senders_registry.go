@@ -123,6 +123,33 @@ func (r *sendersRegistry) stream(ctx context.Context, h streamHandle, content st
 	return sender.respondStream(ctx, h.ReqID, h.StreamID, content, finish)
 }
 
+// uploadMedia carries one file up the installation's live connection and
+// returns the media_id a message can be built around.
+//
+// Like stream and unlike send it never queues. An upload is a conversation with
+// one socket — the upload_id it hands back means nothing on the next one — so a
+// file that cannot go up now has to be attempted again from the start, and the
+// caller says so in words rather than holding megabytes for a reconnect that
+// may be hours away.
+func (r *sendersRegistry) uploadMedia(ctx context.Context, id pgtype.UUID, m outboundMedia) (string, error) {
+	sender := r.get(id)
+	if sender == nil {
+		return "", errNoLiveConnection
+	}
+	return sender.uploadMedia(ctx, m)
+}
+
+// sendMedia delivers an uploaded file as a message. reqID is the turn's
+// callback id when there is still one; it is only used if WeCom refuses the
+// push (media_upload.go).
+func (r *sendersRegistry) sendMedia(ctx context.Context, id pgtype.UUID, chatID string, chatType int, reqID string, m mediaSend) error {
+	sender := r.get(id)
+	if sender == nil {
+		return errNoLiveConnection
+	}
+	return sender.sendMedia(ctx, chatID, chatType, reqID, m)
+}
+
 // flushPending drains an installation's holding queue over the live
 // connection, oldest first. Connect calls it once the subscribe ack lands.
 // A write that fails puts its message back at the head and stops the drain —

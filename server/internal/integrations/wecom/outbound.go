@@ -43,6 +43,7 @@ type outboundQueries interface {
 	GetChannelInstallation(ctx context.Context, arg db.GetChannelInstallationParams) (db.ChannelInstallation, error)
 	FindChannelBindingForMember(ctx context.Context, arg db.FindChannelBindingForMemberParams) (db.ChannelUserBinding, error)
 	GetWorkspace(ctx context.Context, id pgtype.UUID) (db.Workspace, error)
+	ListAttachmentsByChatMessage(ctx context.Context, arg db.ListAttachmentsByChatMessageParams) ([]db.Attachment, error)
 }
 
 // Outbound delivers an agent's chat reply back to WeCom over the same
@@ -53,6 +54,17 @@ type Outbound struct {
 	senders *sendersRegistry
 	streams *streamStore
 	logger  *slog.Logger
+
+	// objects reads back the files the agent produced. nil — a deployment with
+	// no storage backend — leaves the answer text-only, which is what it was
+	// before (outbound_media.go).
+	objects mediaObjectStore
+
+	// spawn runs the attachment delivery. The bus publishes synchronously on
+	// the goroutine that finished the run, and an upload is megabytes and round
+	// trips, so production hands it to a goroutine of its own. A test swaps in
+	// a same-goroutine runner and sees the whole delivery without waiting.
+	spawn func(func())
 }
 
 // NewOutbound builds the WeCom outbound subscriber. senders is the same
@@ -63,11 +75,24 @@ type Outbound struct {
 //
 // streams is the same store the typing indicator writes to; nil disables the
 // in-place reply and leaves every answer going out as a new message.
-func NewOutbound(q outboundQueries, senders *sendersRegistry, streams *streamStore, logger *slog.Logger) *Outbound {
+//
+// WithAttachments is the one option: pass the deployment's object storage and
+// the files an agent produced are delivered into the chat behind the answer.
+func NewOutbound(q outboundQueries, senders *sendersRegistry, streams *streamStore, logger *slog.Logger, opts ...OutboundOption) *Outbound {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Outbound{q: q, senders: senders, streams: streams, logger: logger}
+	o := &Outbound{
+		q:       q,
+		senders: senders,
+		streams: streams,
+		logger:  logger,
+		spawn:   func(f func()) { go f() },
+	}
+	for _, opt := range opts {
+		opt(o)
+	}
+	return o
 }
 
 // Register subscribes to the chat-done event on the bus.
@@ -116,6 +141,10 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 		// is that message.
 		if !handle.Unusable {
 			if err := o.finishStream(ctx, handle, text); err == nil {
+				// The words are on screen. Whatever the agent produced
+				// alongside them follows as its own message — a stream frame
+				// cannot carry a file, and the bubble is sealed either way.
+				o.deliverAttachments(e, handle.address(), handle.ReqID)
 				return nil
 			}
 		}
@@ -124,8 +153,12 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 		// before a reconnect could replay it.
 		content = text
 	}
-	if content == "" {
-		return nil // nothing to say (empty completion, no bubble to close)
+	// An empty completion normally ends the turn here. It does not when the
+	// agent produced a file and said nothing about it: the platform writes an
+	// assistant message for exactly that case, and returning now would throw
+	// the work away.
+	if content == "" && !o.mayCarryAttachments(e) {
+		return nil // nothing to say, no bubble to close, nothing to send
 	}
 
 	binding, err := o.q.GetChannelChatSessionBindingBySession(ctx, db.GetChannelChatSessionBindingBySessionParams{
@@ -155,29 +188,41 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 	// ago) means the reply waits for the next one rather than disappearing —
 	// see outbound_queue.go. The user asked a question; an answer a minute
 	// late still answers it.
-	chatType := aibotChatTypeFromChannel(channel.ChatType(binding.ChatType))
-	if err := o.senders.send(inst.ID, pendingSend{
-		ChatID:   binding.ChannelChatID,
-		ChatType: chatType,
-		Content:  content,
-	}); err != nil {
-		return err
+	addr := roundAddress{
+		InstallationID: inst.ID,
+		ChatID:         binding.ChannelChatID,
+		ChatType:       aibotChatTypeFromChannel(channel.ChatType(binding.ChatType)),
+		Locale:         localeOfRow(inst),
 	}
-	// An answer is the round's ending whether it went into the bubble or
-	// underneath it, and this is the branch where no handle was consumed to
-	// record that. Without the note, a task:failed arriving behind a delivered
-	// answer — an auto-retry's first attempt, a sweeper that ran late — reaches
-	// the typing indicator with nothing to tell it the round is over, and
-	// contradicts the answer the user is already reading.
-	if o.streams != nil {
-		o.streams.remember(sessionID, roundAddress{
-			InstallationID: inst.ID,
-			ChatID:         binding.ChannelChatID,
-			ChatType:       chatType,
-			Locale:         localeOfRow(inst),
-		}, roundOver)
+	if content != "" {
+		if err := o.senders.send(inst.ID, pendingSend{
+			ChatID:   addr.ChatID,
+			ChatType: addr.ChatType,
+			Content:  content,
+		}); err != nil {
+			return err
+		}
+		// An answer is the round's ending whether it went into the bubble or
+		// underneath it, and this is the branch where no handle was consumed to
+		// record that. Without the note, a task:failed arriving behind a
+		// delivered answer — an auto-retry's first attempt, a sweeper that ran
+		// late — reaches the typing indicator with nothing to tell it the round
+		// is over, and contradicts the answer the user is already reading.
+		if o.streams != nil {
+			o.streams.remember(sessionID, addr, roundOver)
+		}
 	}
+	// No req_id to fall back on here: either no bubble was ever opened for this
+	// turn, or the one that was is beyond writing to.
+	o.deliverAttachments(e, addr, "")
 	return nil
+}
+
+// mayCarryAttachments reports whether this turn is worth the lookups even
+// though the agent said nothing. Everything it checks is already in hand, so a
+// deployment with no storage — or an event naming no message — costs no query.
+func (o *Outbound) mayCarryAttachments(e events.Event) bool {
+	return o.objects != nil && e.WorkspaceID != "" && chatDoneMessageID(e.Payload) != ""
 }
 
 // takeStream hands over the bubble open for this session, if the typing
