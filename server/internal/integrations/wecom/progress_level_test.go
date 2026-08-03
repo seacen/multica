@@ -78,7 +78,7 @@ func groupInbound(reqID, chatID, senderID string) channel.InboundMessage {
 	mc.From.UserID = senderID
 	mc.MsgType = "text"
 	mc.Text.Content = "帮我查一下"
-	return channelMessageFromCallback("BOT-1", mc, mc.Text.Content, reqID)
+	return channelMessageFromCallback("BOT-1", mc, copyFor(DefaultLocale), mc.Text.Content, reqID)
 }
 
 // levelRig is a stream rig whose task lookups are answered, so a transcript

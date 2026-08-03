@@ -262,12 +262,20 @@ func (r *sessionBinder) EnsureSession(ctx context.Context, p engine.EnsureSessio
 }
 
 func (r *sessionBinder) AppendMessage(ctx context.Context, p engine.AppendParams) (engine.AppendResult, error) {
+	// CommandText is the user's OWN line. A message that quotes another one
+	// is stored with the quote in front, so parsing /issue off the stored
+	// body would read somebody else's text — and miss the command that
+	// follows it. Raw carries the un-quoted line for exactly this.
+	command := p.Message.Text
+	if wm, err := wecomMsgFromRaw(p.Message); err == nil {
+		command = wm.CommandBody
+	}
 	return r.session.AppendUserMessage(ctx, engine.AppendInput{
 		SessionID:      p.SessionID,
 		Sender:         p.Sender,
 		InstallationID: p.InstallationID,
 		Body:           p.Message.Text,
-		CommandText:    p.Message.Text, // wecom has no enrichment; command == body
+		CommandText:    command,
 		MessageID:      p.Message.MessageID,
 		ClaimToken:     p.ClaimToken,
 		// The budget the agent run waits out before giving up on the

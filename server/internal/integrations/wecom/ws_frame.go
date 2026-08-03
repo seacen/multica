@@ -104,6 +104,42 @@ type aibotMsgCallback struct {
 	Mixed struct {
 		MsgItem []mixedItem `json:"msg_item"`
 	} `json:"mixed"`
+	// Quote is the message this one is a reply to, present when the sender
+	// used 引用. It carries the quoted message's own msgtype and body and
+	// nothing else — no sender, no id, no timestamp (100719).
+	Quote *quotedMessage `json:"quote"`
+}
+
+// quotedMessage is the 引用 payload: any message kind, nested. It reuses
+// mixedItem because the shape is the same one — a msgtype and the typed body
+// that goes with it — and a quoted 图文混排 nests its own runs inside.
+type quotedMessage struct {
+	mixedItem
+	Mixed struct {
+		MsgItem []mixedItem `json:"msg_item"`
+	} `json:"mixed"`
+}
+
+// render turns the quoted message into the text it contributes. A quoted
+// attachment renders as its placeholder and is deliberately NOT queued for
+// download: it belongs to a message somebody else sent, the agent would have
+// no way to tell it apart from what this sender just attached, and its url is
+// running down someone else's five-minute clock. Saying a picture was being
+// discussed is the part that carries the meaning.
+func (q *quotedMessage) render(c copyPack) string {
+	if q == nil {
+		return ""
+	}
+	if strings.EqualFold(q.MsgType, "mixed") {
+		var runs []string
+		for _, item := range q.Mixed.MsgItem {
+			if s := item.render(c); s != "" {
+				runs = append(runs, s)
+			}
+		}
+		return strings.Join(runs, "\n")
+	}
+	return q.mixedItem.render(c)
 }
 
 // mediaBody is the {url, aeskey} pair every downloadable kind carries. In
@@ -172,7 +208,50 @@ func (mc aibotMsgCallback) attachments() []InboundMedia {
 }
 
 // routableText returns the text this callback is stored and read as, and
-// whether there is any.
+// whether there is any. It is the message's own body with any quoted message
+// rendered above it — see ownText for the body and quotedMessage.render for
+// the quote.
+//
+// A quote decorates a message that was readable on its own; it does not
+// rescue one that was not. Ingesting the quote off the back of a kind we
+// cannot read would put somebody else's words in as this person's message.
+func (mc aibotMsgCallback) routableText(c copyPack) (string, bool) {
+	own, ok := mc.ownText(c)
+	quoted := mc.Quote.render(c)
+	if quoted == "" {
+		return own, ok
+	}
+	if !ok {
+		return "", false
+	}
+	block := renderQuoteBlock(c, quoted)
+	if strings.TrimSpace(own) == "" {
+		// Quoting something and saying nothing is "look at this", which is a
+		// message worth answering.
+		return block, true
+	}
+	return block + "\n" + own, true
+}
+
+// renderQuoteBlock marks every line of the quote, not only the first: an
+// unmarked second paragraph reads as the sender's own words.
+func renderQuoteBlock(c copyPack, quoted string) string {
+	var b strings.Builder
+	for i, line := range strings.Split(quoted, "\n") {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString("> ")
+		if i == 0 {
+			b.WriteString(c.QuotePrefix)
+		}
+		b.WriteString(line)
+	}
+	return b.String()
+}
+
+// ownText is the message minus anything it quotes — the words this person
+// typed, spoke or attached.
 //
 // Plain text answers with its body; a voice note answers with the transcript
 // WeCom already made of it; a photo, file or video answers with a bracketed
@@ -184,7 +263,7 @@ func (mc aibotMsgCallback) attachments() []InboundMedia {
 //
 // Everything else — a location card, a kind WeCom adds next year — answers
 // false and takes the receipt path.
-func (mc aibotMsgCallback) routableText(c copyPack) (string, bool) {
+func (mc aibotMsgCallback) ownText(c copyPack) (string, bool) {
 	switch strings.ToLower(mc.MsgType) {
 	case "text":
 		return mc.Text.Content, true
@@ -278,10 +357,16 @@ type InboundMessage struct {
 	// SenderUserID is the userid of the person who typed the message.
 	SenderUserID string `json:"sender_user_id,omitempty"`
 
-	// Content is the human-readable text body when MsgType == "text";
-	// empty for media / events. The cross-platform envelope's Text field
-	// is populated from this.
+	// Content is the human-readable body: the user's words, the placeholder
+	// standing in for an attachment, and any quoted message rendered above
+	// them. The cross-platform envelope's Text field is populated from this.
 	Content string `json:"content,omitempty"`
+
+	// CommandBody is the same message WITHOUT the quoted context — the line
+	// the user actually typed. Slash commands are parsed off the front of a
+	// body, and a quote sits in front of it, so /issue has to read this
+	// instead. Equal to Content whenever nothing was quoted.
+	CommandBody string `json:"command_body,omitempty"`
 
 	// ReqID is the frame req_id the server sent this message with. We
 	// keep it so a future aibot_respond_msg (5s window) can echo it back;
@@ -321,9 +406,10 @@ type InboundMedia struct {
 // group message on the wire — WeChat only forwards to the bot when it was
 // addressed, so any received group message counts as addressed.
 //
-// text is the ingestible body the caller resolved via routableText — the
-// message's own content for a text message, the joined text runs for 图文混排.
-func channelMessageFromCallback(botID string, mc aibotMsgCallback, text, reqID string) channel.InboundMessage {
+// text is the ingestible body the caller resolved via routableText; c is the
+// installation's copy pack, needed again here to derive the un-quoted command
+// body that slash-command parsing runs on.
+func channelMessageFromCallback(botID string, mc aibotMsgCallback, c copyPack, text, reqID string) channel.InboundMessage {
 	chatType := channel.ChatTypeP2P
 	if strings.EqualFold(mc.ChatType, "group") {
 		chatType = channel.ChatTypeGroup
@@ -335,6 +421,12 @@ func channelMessageFromCallback(botID string, mc aibotMsgCallback, text, reqID s
 		chatID = senderID
 	}
 
+	// The command is read off the user's own line. With a quote in front of
+	// it, the stored body starts with somebody else's message — and a "/issue"
+	// sitting in a quoted message is that person's old text, not a command
+	// this sender just gave.
+	command, _ := mc.ownText(c)
+
 	wm := InboundMessage{
 		BotID:        botID,
 		MsgID:        mc.MsgID,
@@ -343,6 +435,7 @@ func channelMessageFromCallback(botID string, mc aibotMsgCallback, text, reqID s
 		ChatID:       chatID,
 		SenderUserID: senderID,
 		Content:      text,
+		CommandBody:  command,
 		ReqID:        reqID,
 		Media:        mc.attachments(),
 	}
@@ -361,7 +454,7 @@ func channelMessageFromCallback(botID string, mc aibotMsgCallback, text, reqID s
 		// command" reply that just clutters the conversation. wecom is
 		// alone on this — Slack/Lark keep the historical "let the agent
 		// see /issue and respond too" behaviour.
-		SkipAgentRun: isIssueCommand(text),
+		SkipAgentRun: isIssueCommand(command),
 		Source: channel.Source{
 			ChannelType: TypeWecom,
 			ChatID:      chatID,

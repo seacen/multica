@@ -306,7 +306,8 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 			log.Warn("wecom: bad aibot_msg_callback body", "error", err)
 			return nil
 		}
-		text, ok := mc.routableText(copyFor(c.locale))
+		pack := copyFor(c.locale)
+		text, ok := mc.routableText(pack)
 		if !ok {
 			// Nothing in this message can be read: a kind the adapter does
 			// not know, or a known kind that arrived without the one field
@@ -315,7 +316,7 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 			c.replyUnsupportedMsgType(ctx, mc, sender, log)
 			return nil
 		}
-		msg := channelMessageFromCallback(c.botID, mc, text, env.Headers.ReqID)
+		msg := channelMessageFromCallback(c.botID, mc, pack, text, env.Headers.ReqID)
 		if err := c.handler(ctx, msg); err != nil {
 			return err
 		}

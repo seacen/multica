@@ -337,7 +337,7 @@ func TestChannelMessageFromCallbackRoutingIdentity(t *testing.T) {
 			if !ok {
 				t.Fatal("fixture is a text message")
 			}
-			msg := channelMessageFromCallback("wb1234567890abcdef", mc, text, env.Headers.ReqID)
+			msg := channelMessageFromCallback("wb1234567890abcdef", mc, copyFor(DefaultLocale), text, env.Headers.ReqID)
 
 			if msg.Source.ChannelType != TypeWecom {
 				t.Errorf("ChannelType = %q", msg.Source.ChannelType)
@@ -372,7 +372,7 @@ func TestChannelMessageFromCallbackRoutingIdentity(t *testing.T) {
 func TestChannelMessageRawCarriesThePlatformFields(t *testing.T) {
 	env, mc := decodeCallback(t, groupTextFrame)
 	text, _ := mc.routableText(copyFor(DefaultLocale))
-	msg := channelMessageFromCallback("wb1234567890abcdef", mc, text, env.Headers.ReqID)
+	msg := channelMessageFromCallback("wb1234567890abcdef", mc, copyFor(DefaultLocale), text, env.Headers.ReqID)
 
 	wm, err := wecomMsgFromRaw(msg)
 	if err != nil {
@@ -419,7 +419,7 @@ func TestIssueCommandSkipsTheAgentRun(t *testing.T) {
 		mc := aibotMsgCallback{MsgID: "m", MsgType: "text", ChatType: "single"}
 		mc.From.UserID = "T-alex"
 		mc.Text.Content = c.body
-		msg := channelMessageFromCallback("bot", mc, c.body, "req")
+		msg := channelMessageFromCallback("bot", mc, copyFor(DefaultLocale), c.body, "req")
 		if msg.SkipAgentRun != c.want {
 			t.Errorf("SkipAgentRun for %q = %v, want %v", c.body, msg.SkipAgentRun, c.want)
 		}

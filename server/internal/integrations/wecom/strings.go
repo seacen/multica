@@ -72,6 +72,11 @@ type copyPack struct {
 	MediaFile  string
 	MediaVideo string
 
+	// QuotePrefix heads the block a quoted message is rendered as. Every
+	// line of the quote is marked, not just the first — an unmarked second
+	// paragraph reads as the sender's own words.
+	QuotePrefix string
+
 	// MediaTooLarge / MediaUnreadable tell the sender that an attachment did
 	// not make it. Two reasons rather than one because the fix differs: a
 	// file over the limit needs splitting or a link, whereas an expired or
@@ -242,6 +247,7 @@ var copyPacks = map[Locale]copyPack{
 		MediaImage:          "[图片]",
 		MediaFile:           "[文件]",
 		MediaVideo:          "[视频]",
+		QuotePrefix:         "引用：",
 		MediaTooLarge:       "⚠️ 有附件超过 100MB，我读不了，麻烦压缩一下或换个方式发给我。",
 		MediaUnreadable:     "⚠️ 有附件我没能读取（链接可能已过期），麻烦重新发一次。",
 		BindingPromptPrefix: "👋 请先绑定你的 Multica 账号，才能与我对话：\n",
@@ -306,6 +312,7 @@ var copyPacks = map[Locale]copyPack{
 		MediaImage:          "[Image]",
 		MediaFile:           "[File]",
 		MediaVideo:          "[Video]",
+		QuotePrefix:         "Quoted: ",
 		MediaTooLarge:       "⚠️ One of those attachments is over 100MB, which I can't read. Please compress it or send it another way.",
 		MediaUnreadable:     "⚠️ I couldn't read one of those attachments — the link may have expired. Please send it again.",
 		BindingPromptPrefix: "👋 Link your Multica account before we can talk:\n",

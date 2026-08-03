@@ -31,6 +31,7 @@ func wecomInbound(botID, chatID, senderID string, chatType channel.ChatType) cha
 		ChatID:       chatID,
 		SenderUserID: senderID,
 		Content:      "你好",
+		CommandBody:  "你好",
 	}
 	if chatType == channel.ChatTypeGroup {
 		wm.ChatType = "group"
@@ -521,13 +522,42 @@ func TestAppendCarriesTheDedupFence(t *testing.T) {
 		t.Errorf("append input = %+v", in)
 	}
 	if in.Body != "你好" || in.CommandText != "你好" {
-		t.Errorf("body/command = %q/%q — wecom has no enrichment, they are the same text", in.Body, in.CommandText)
+		t.Errorf("body/command = %q/%q — nothing was quoted, so they are the same text", in.Body, in.CommandText)
 	}
 	if in.MessageID != "MSGID-001" {
 		t.Errorf("platform MessageID = %q", in.MessageID)
 	}
 	if in.MediaPendingSeconds != 0 {
 		t.Errorf("MediaPendingSeconds = %v for a text message, want 0", in.MediaPendingSeconds)
+	}
+}
+
+// TestAppendSendsTheUnquotedLineAsTheCommand — a message that quotes another
+// is stored with the quote in front of it, so parsing /issue off the stored
+// body would read somebody else's words and miss the command that follows.
+func TestAppendSendsTheUnquotedLineAsTheCommand(t *testing.T) {
+	fake := &fakeSessionBinder{}
+	b := &sessionBinder{session: fake}
+
+	msg := wecomInbound("wb-1", "T-alex", "T-alex", channel.ChatTypeP2P)
+	wm, err := wecomMsgFromRaw(msg)
+	if err != nil {
+		t.Fatalf("decode raw: %v", err)
+	}
+	wm.Content = "> 引用：Q3 毛利率 42.1%\n/issue 回填 Q3 数据"
+	wm.CommandBody = "/issue 回填 Q3 数据"
+	raw, _ := json.Marshal(wm)
+	msg.Raw = raw
+	msg.Text = wm.Content
+
+	if _, err := b.AppendMessage(context.Background(), engine.AppendParams{SessionID: uuidOf(6), Message: msg}); err != nil {
+		t.Fatalf("AppendMessage: %v", err)
+	}
+	if fake.appended.Body != wm.Content {
+		t.Errorf("Body = %q, want the quote and the question both stored", fake.appended.Body)
+	}
+	if fake.appended.CommandText != "/issue 回填 Q3 数据" {
+		t.Errorf("CommandText = %q, want the user's own line", fake.appended.CommandText)
 	}
 }
 

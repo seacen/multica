@@ -119,7 +119,7 @@ func streamInbound(reqID, chatID string) channel.InboundMessage {
 	mc.From.UserID = chatID
 	mc.MsgType = "text"
 	mc.Text.Content = "帮我查一下"
-	return channelMessageFromCallback("BOT-1", mc, mc.Text.Content, reqID)
+	return channelMessageFromCallback("BOT-1", mc, copyFor(DefaultLocale), mc.Text.Content, reqID)
 }
 
 // streamRig is one wired-up installation: a live socket, the registry that

@@ -146,7 +146,7 @@ func mediaMessage(t *testing.T, msgType string, body map[string]any) channel.Inb
 	if !ok {
 		t.Fatalf("callback of type %q is not routable; the fixture is wrong", msgType)
 	}
-	return channelMessageFromCallback("wb-1", mc, text, "req-1")
+	return channelMessageFromCallback("wb-1", mc, copyFor(DefaultLocale), text, "req-1")
 }
 
 func mediaInstallation() engine.ResolvedInstallation {
@@ -197,7 +197,7 @@ func TestHasMediaSaysNoWhenThereIsNoUrlToFetch(t *testing.T) {
 	// must not buy the message a media deadline and a deferred agent run.
 	mc := aibotMsgCallback{MsgType: "image"}
 	mc.Image = mediaBody{AESKey: testAESKey}
-	msg := channelMessageFromCallback("wb-1", mc, "[Image]", "req-1")
+	msg := channelMessageFromCallback("wb-1", mc, copyFor(DefaultLocale), "[Image]", "req-1")
 	if r.HasMedia(msg) {
 		t.Fatal("HasMedia said yes to a body with no url")
 	}
@@ -432,7 +432,7 @@ func TestResolveMediaRefusesAnUndecryptablePayload(t *testing.T) {
 			r := &wecomMediaResolver{storage: storage, ledger: newFakeMediaLedger(storage), http: &http.Client{}, logger: testLogger()}
 			mc := aibotMsgCallback{MsgID: "MSGID-BAD", ChatID: "T-alex", ChatType: "single", MsgType: "image"}
 			mc.Image = mediaBody{URL: srv.URL, AESKey: tc.aeskey}
-			msg := channelMessageFromCallback("wb-1", mc, "[Image]", "req-1")
+			msg := channelMessageFromCallback("wb-1", mc, copyFor(DefaultLocale), "[Image]", "req-1")
 
 			got := r.ResolveMedia(context.Background(), mediaInstallation(), engine.ResolvedIdentity{}, uuidOf(6), uuidOf(5), msg)
 			if len(storage.stored()) != 0 {
