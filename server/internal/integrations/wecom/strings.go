@@ -113,10 +113,11 @@ type copyPack struct {
 // progressCopy is what the bubble says while the run is still going: one whole
 // line per kind of work the agent can be doing.
 //
-// The %s in these lines is never an argument as the agent wrote it. It is a
-// fragment progress_render.go has already vetted — a file's base name, the
-// program a command invoked, a tool's own name — and nothing else may ever be
-// substituted here. See the privacy rule at the top of that file.
+// Every line comes in two forms, and which one is used depends on whether the
+// call named anything. The %s is the argument that identifies the work, and it
+// has been through progress_render.go's own cleaning first — never a content
+// block, never a control character, never longer than a few lines on a phone.
+// See the two rules at the top of that file.
 type progressCopy struct {
 	// Read / Edit name the file; the Plain variants cover a call that names
 	// no file this adapter recognises.
@@ -125,29 +126,39 @@ type progressCopy struct {
 	Edit      string
 	EditPlain string
 
-	// Command is a shell call; CommandNamed adds the program it invoked, and
-	// never its arguments.
+	// Command is a shell call; CommandNamed carries the command line.
 	Command      string
 	CommandNamed string
 
-	Search  string // looking through the code
-	Web     string // looking something up outside
-	Subtask string // handing work to a subagent
-	Plan    string // writing or revising the plan
+	// The four that used to say only what kind of work it was. Each Named
+	// variant carries the one thing that separates this call from the next
+	// one: the search term, the URL, the subagent's brief, the plan.
+	Search       string
+	SearchNamed  string
+	Web          string
+	WebNamed     string
+	Subtask      string
+	SubtaskNamed string
+	Plan         string
+	PlanNamed    string
 
-	// Service words an MCP call as "<server> · <tool>".
-	Service string
+	// Service words an MCP call as "<server> · <tool>"; ServiceArgs adds the
+	// call's parameters, which for an MCP tool are the only description of
+	// what it is doing that this adapter can produce.
+	Service     string
+	ServiceArgs string
 
-	// Tool / Fallback cover a tool this adapter has not been taught. Saying
-	// something vague beats saying nothing: a step the user never sees happen
-	// is indistinguishable from a run that has stalled.
+	// Tool / ToolArgs / Fallback cover a tool this adapter has not been
+	// taught. Saying something vague beats saying nothing: a step the user
+	// never sees happen is indistinguishable from a run that has stalled.
 	Tool     string
+	ToolArgs string
 	Fallback string
 
-	// Failed marks a step that errored. The error's own text stays out of the
-	// chat — the run may still recover, and the message routinely carries
-	// hostnames and credentials.
-	Failed string
+	// Failed marks a step that errored; FailedNamed carries the message. The
+	// run may still recover, which is why the line says so either way.
+	Failed      string
+	FailedNamed string
 
 	// Elapsed closes the list with how long the user has been waiting. A
 	// spinner with no clock on it reads as stuck.
@@ -217,15 +228,22 @@ var copyPacks = map[Locale]copyPack{
 			Edit:         "正在修改 %s",
 			EditPlain:    "正在修改文件",
 			Command:      "正在执行命令",
-			CommandNamed: "正在执行 %s 命令",
+			CommandNamed: "正在执行 %s",
 			Search:       "正在检索代码",
+			SearchNamed:  "正在检索 %s",
 			Web:          "正在查资料",
+			WebNamed:     "正在查 %s",
 			Subtask:      "正在派子任务",
+			SubtaskNamed: "正在派子任务：%s",
 			Plan:         "正在梳理计划",
+			PlanNamed:    "正在梳理计划：%s",
 			Service:      "正在调用 %s · %s",
+			ServiceArgs:  "正在调用 %s · %s：%s",
 			Tool:         "正在使用 %s",
+			ToolArgs:     "正在使用 %s：%s",
 			Fallback:     "正在处理",
 			Failed:       "上一步出错了，正在继续",
+			FailedNamed:  "上一步出错了：%s，正在继续",
 			Elapsed:      "已用时 %s",
 		},
 	},
@@ -268,13 +286,20 @@ var copyPacks = map[Locale]copyPack{
 			Command:      "Running a command",
 			CommandNamed: "Running %s",
 			Search:       "Searching the code",
+			SearchNamed:  "Searching for %s",
 			Web:          "Looking things up",
+			WebNamed:     "Looking up %s",
 			Subtask:      "Handing off a subtask",
+			SubtaskNamed: "Handing off a subtask: %s",
 			Plan:         "Working out a plan",
+			PlanNamed:    "Working out a plan: %s",
 			Service:      "Calling %s · %s",
+			ServiceArgs:  "Calling %s · %s: %s",
 			Tool:         "Using %s",
+			ToolArgs:     "Using %s: %s",
 			Fallback:     "Working",
 			Failed:       "That step errored — carrying on",
+			FailedNamed:  "That step errored: %s — carrying on",
 			Elapsed:      "%s elapsed",
 		},
 	},

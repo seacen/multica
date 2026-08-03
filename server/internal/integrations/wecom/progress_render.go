@@ -11,26 +11,35 @@ package wecom
 // lines are for an operator, not a user. So this file consumes the transcript
 // and emits a sentence.
 //
-// THE PRIVACY RULE, which every function below obeys and no future one may
-// relax: a progress line may name the KIND of work and, at most, one fragment
-// this file has vetted itself — a file's base name, the program a command
-// invoked, a tool's own name. It may never carry an argument as the agent
-// wrote it. Not the command line, not a file's contents, not a grep pattern,
-// not a URL, not a subagent's brief, not an error's text. WeCom is a consumer
-// chat surface with no redaction of its own and no way to unsend, the bubble
-// is read over shoulders and forwarded, and the transcript routinely contains
-// credentials, customer data and file bodies. The bubble says "正在执行命令";
-// the transcript in the web UI is where someone entitled to the detail goes
-// and looks.
+// TWO RULES decide what ends up in the chat, and they are independent.
 //
-// WHO IS ENTITLED is the other half of the rule, and it lives in progressLevel
-// below. The paragraph above answers "what may a step say"; the tier answers
-// "to whom", and outside the principal's own one-to-one chat the answer is
-// nothing at all. Neither gate makes the other redundant.
+// WHO — progressLevel, below. Outside the principal's own one-to-one chat a
+// step produces nothing at all. WeCom has no redaction of its own and no
+// unsend, a group bubble is read by the whole room, and a colleague's chat is
+// somebody else's private conversation. That gate is absolute and comes first.
+//
+// WHAT — a step may name the ARGUMENT that identifies the work: the path, the
+// command with its flags, the search term, the URL, the brief handed to a
+// subagent, the parameters of an MCP call, the text of an error. Those are
+// what make a step worth reading rather than a category, and the person
+// reading them owns the run.
+//
+// A step may NEVER carry a CONTENT BLOCK: a file's body, either half of an
+// edit, a patch's diff, a command's output, a page's text, a subagent's
+// report. Two reasons, and the second one holds even where the first does
+// not. They are 8KB apiece against a 20KB bubble, so one of them costs the
+// whole window and says less than the word it replaced. And nobody reads a
+// file in a chat bubble — the web transcript is where the body goes.
+//
+// Everything arriving on tool_result is a content block by definition, which
+// is why that whole message type is refused before it costs a database read.
+// On the input side the bodies are named keys, and progressBodyKeys is the
+// list.
 
 import (
+	"encoding/json"
 	"fmt"
-	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,9 +61,23 @@ const (
 	// getting one. The closing frame never passes through here.
 	progressMinInterval = 1500 * time.Millisecond
 
-	// progressFragmentRunes caps the one vetted fragment a line may carry, so
-	// a pathological name cannot turn one step into a paragraph.
-	progressFragmentRunes = 40
+	// progressFragmentRunes caps the argument a line may carry, so a
+	// pathological one cannot turn a step into a paragraph.
+	//
+	// 160 is chosen from the three things it has to hold at once. A phone in
+	// WeChat fits roughly 20 full-width or 40 half-width characters to a line,
+	// so 160 is at most four wrapped lines — long enough to read, short enough
+	// that a step still looks like a step. It clears the real arguments with
+	// room to spare: an absolute path runs 40-90 characters and a command with
+	// its flags 40-120, and cutting either at 40, as this used to, cut it in
+	// the middle. And the window's worst case stays inside the protocol's
+	// budget — eight lines of 160 CJK runes is under 4KB against the 20480 the
+	// server takes.
+	progressFragmentRunes = 160
+
+	// progressMaxArgs bounds how many parameters of one call get rendered
+	// before the length cap would cut them off anyway.
+	progressMaxArgs = 8
 )
 
 // progressLevel is how much of a run one bubble may show. It is decided once,
@@ -99,13 +122,23 @@ const (
 	progressError
 )
 
-// progressStep is one thing the agent did, already stripped of everything the
-// user may not see. arg and arg2 are only ever filled by the vetting helpers
-// below — never straight from the payload.
+// progressStep is one thing the agent did, already stripped of everything no
+// audience may see. Every field is filled by a helper below — never straight
+// from the payload, so the sanitising and the length cap cannot be skipped.
 type progressStep struct {
 	kind progressKind
+
+	// arg is the argument that identifies the work: the path, the command,
+	// the search term, the URL, the brief, the error. For an MCP call it is
+	// the server, and arg2 the operation.
 	arg  string
 	arg2 string
+
+	// args is a call's remaining parameters, rendered as a list of key=value.
+	// Only tools this adapter has no words for use it — an MCP call and an
+	// unknown tool — because for everything else the one argument above says
+	// more than a parameter dump would.
+	args string
 }
 
 // progressKindByTool maps the tool names the providers actually emit onto the
@@ -184,62 +217,77 @@ var progressKindByTool = map[string]progressKind{
 // zero: together they are most of the event's volume, and none of them reaches
 // the database lookup behind this function.
 func stepFromTaskMessage(payload any) (progressStep, bool) {
-	msgType, tool, input := taskMessageFields(payload)
-	switch msgType {
+	msg := taskMessageFields(payload)
+	switch msg.msgType {
 	case "tool_use":
-		return stepFromToolUse(tool, input), true
+		return stepFromToolUse(msg.tool, msg.input), true
 	case "error":
-		return progressStep{kind: progressError}, true
+		return progressStep{kind: progressError, arg: safeFragment(msg.content)}, true
 	}
 	return progressStep{}, false
 }
 
-// taskMessageFields reads the three fields that matter off a task:message
-// payload, typed in-process or in its map form after a serialization round
-// trip. Deliberately narrow: content and output are never read.
-func taskMessageFields(payload any) (msgType, tool string, input map[string]any) {
-	switch p := payload.(type) {
-	case protocol.TaskMessagePayload:
-		return p.Type, p.Tool, p.Input
-	case *protocol.TaskMessagePayload:
-		if p == nil {
-			return "", "", nil
-		}
-		return p.Type, p.Tool, p.Input
-	case map[string]any:
-		msgType, _ = p["type"].(string)
-		tool, _ = p["tool"].(string)
-		input, _ = p["input"].(map[string]any)
-		return msgType, tool, input
-	}
-	return "", "", nil
+// taskMessage is the slice of a task:message payload this file reads. Output
+// is deliberately absent: it is the content block, every time, whatever the
+// tool.
+type taskMessage struct {
+	msgType string
+	tool    string
+	content string
+	input   map[string]any
 }
 
-// stepFromToolUse decides what a tool call is doing and picks the one fragment
-// worth naming. Every branch either takes a vetted fragment or takes nothing.
+// taskMessageFields reads that slice off a payload, typed in-process or in its
+// map form after a serialization round trip.
+func taskMessageFields(payload any) taskMessage {
+	switch p := payload.(type) {
+	case protocol.TaskMessagePayload:
+		return taskMessage{msgType: p.Type, tool: p.Tool, content: p.Content, input: p.Input}
+	case *protocol.TaskMessagePayload:
+		if p == nil {
+			return taskMessage{}
+		}
+		return taskMessage{msgType: p.Type, tool: p.Tool, content: p.Content, input: p.Input}
+	case map[string]any:
+		var m taskMessage
+		m.msgType, _ = p["type"].(string)
+		m.tool, _ = p["tool"].(string)
+		m.content, _ = p["content"].(string)
+		m.input, _ = p["input"].(map[string]any)
+		return m
+	}
+	return taskMessage{}
+}
+
+// stepFromToolUse decides what a tool call is doing and picks the argument
+// worth naming. Every branch names keys it wants rather than sweeping the
+// input, which is what keeps a file's body out of a step about the file: the
+// body arrives under a key too, and a step that took whatever it found would
+// take that as readily as the path.
 func stepFromToolUse(tool string, input map[string]any) progressStep {
 	if server, name, ok := mcpToolParts(tool); ok {
-		return progressStep{kind: progressService, arg: server, arg2: name}
+		return progressStep{kind: progressService, arg: server, arg2: name, args: argsFragment(input)}
 	}
 	switch progressKindByTool[strings.ToLower(strings.TrimSpace(tool))] {
 	case progressRead:
-		return progressStep{kind: progressRead, arg: fileFragment(input)}
+		return progressStep{kind: progressRead, arg: pathFragment(input)}
 	case progressEdit:
-		return progressStep{kind: progressEdit, arg: fileFragment(input)}
+		return progressStep{kind: progressEdit, arg: pathFragment(input)}
 	case progressCommand:
 		return progressStep{kind: progressCommand, arg: commandFragment(input)}
 	case progressSearch:
-		return progressStep{kind: progressSearch}
+		return progressStep{kind: progressSearch, arg: searchFragment(input)}
 	case progressWeb:
-		return progressStep{kind: progressWeb}
+		return progressStep{kind: progressWeb, arg: webFragment(input)}
 	case progressSubtask:
-		return progressStep{kind: progressSubtask}
+		return progressStep{kind: progressSubtask, arg: subtaskFragment(input)}
 	case progressPlan:
-		return progressStep{kind: progressPlan}
+		return progressStep{kind: progressPlan, arg: planFragment(input)}
 	}
 	// An unknown tool still gets a line: a step the user never sees happen is
-	// indistinguishable from a run that has stalled.
-	return progressStep{kind: progressTool, arg: safeFragment(tool)}
+	// indistinguishable from a run that has stalled. With no idea which of its
+	// parameters matters, it gets the list.
+	return progressStep{kind: progressTool, arg: safeFragment(tool), args: argsFragment(input)}
 }
 
 // line words a step in one locale, for one audience. The only values
@@ -276,85 +324,198 @@ func (s progressStep) line(c copyPack, level progressLevel) string {
 		}
 		return fmt.Sprintf(p.CommandNamed, s.arg)
 	case progressSearch:
-		return p.Search
-	case progressWeb:
-		return p.Web
-	case progressSubtask:
-		return p.Subtask
-	case progressPlan:
-		return p.Plan
-	case progressService:
-		return fmt.Sprintf(p.Service, s.arg, s.arg2)
-	case progressError:
-		return p.Failed
-	case progressTool:
 		if s.arg == "" {
-			return p.Fallback
+			return p.Search
 		}
-		return fmt.Sprintf(p.Tool, s.arg)
+		return fmt.Sprintf(p.SearchNamed, s.arg)
+	case progressWeb:
+		if s.arg == "" {
+			return p.Web
+		}
+		return fmt.Sprintf(p.WebNamed, s.arg)
+	case progressSubtask:
+		if s.arg == "" {
+			return p.Subtask
+		}
+		return fmt.Sprintf(p.SubtaskNamed, s.arg)
+	case progressPlan:
+		if s.arg == "" {
+			return p.Plan
+		}
+		return fmt.Sprintf(p.PlanNamed, s.arg)
+	case progressService:
+		if s.args == "" {
+			return fmt.Sprintf(p.Service, s.arg, s.arg2)
+		}
+		return fmt.Sprintf(p.ServiceArgs, s.arg, s.arg2, s.args)
+	case progressError:
+		if s.arg == "" {
+			return p.Failed
+		}
+		return fmt.Sprintf(p.FailedNamed, s.arg)
+	case progressTool:
+		switch {
+		case s.arg == "":
+			return p.Fallback
+		case s.args == "":
+			return fmt.Sprintf(p.Tool, s.arg)
+		}
+		return fmt.Sprintf(p.ToolArgs, s.arg, s.args)
 	}
 	return ""
 }
 
-// fileFragment returns the BASE NAME of the file a tool call names, and
-// nothing else. The directory is dropped as well as the contents: a path can
-// be a customer's name or an unreleased project's, and the base name is what
-// tells the user which file without telling them where it lives.
-func fileFragment(input map[string]any) string {
-	for _, key := range []string{"file_path", "path", "notebook_path", "target_file", "filename", "file"} {
+// progressBodyKeys names the input keys that carry a CONTENT BLOCK rather than
+// an argument — a file being written, either half of an edit, a notebook cell,
+// a patch. They are the same thing tool_result carries, arriving on the way in
+// instead of the way out, and they are excluded for the same two reasons: one
+// of them is routinely the whole 20KB budget, and a file body is not something
+// anyone reads in a chat bubble.
+//
+// Keys are matched lowercased. Only argsFragment consults this list — the
+// per-kind helpers below name the keys they want, so a body key never comes up
+// for them.
+var progressBodyKeys = map[string]bool{
+	"content":        true,
+	"contents":       true,
+	"text":           true,
+	"body":           true,
+	"data":           true,
+	"source":         true,
+	"new_source":     true,
+	"newsource":      true,
+	"new_string":     true,
+	"newstring":      true,
+	"old_string":     true,
+	"oldstring":      true,
+	"new_str":        true,
+	"old_str":        true,
+	"file_text":      true,
+	"streamcontent":  true,
+	"stream_content": true,
+	"diff":           true,
+	"patch":          true,
+	"changes":        true,
+	"edits":          true,
+	"replacement":    true,
+	"output":         true,
+	"result":         true,
+}
+
+// firstString returns the first of the named keys that holds a non-empty
+// string, cleaned. Keys are tried in order, so the most specific one wins.
+func firstString(input map[string]any, keys ...string) string {
+	for _, key := range keys {
 		v, _ := input[key].(string)
-		v = strings.TrimSpace(v)
-		if v == "" {
+		if frag := safeFragment(v); frag != "" {
+			return frag
+		}
+	}
+	return ""
+}
+
+// pathFragment returns the file a tool call names, path and all.
+//
+// The directory used to be dropped along with the contents, on the grounds
+// that a path can be a customer's name or an unreleased project's. It still
+// can — and the person now reading it is the one who asked for the work, in
+// their own chat, which is the whole point of the tier this runs under. The
+// base name alone was ambiguous exactly when it mattered: four handler.go in
+// one repo look identical in a bubble.
+func pathFragment(input map[string]any) string {
+	return firstString(input,
+		"file_path", "path", "notebook_path", "target_file", "filename", "file",
+		"directory", "dir", "absolute_path")
+}
+
+// commandFragment returns the command as the agent wrote it, flags and all.
+//
+// This used to return the program name only, and drop it entirely when a
+// wrapper shell got there first — so `bash -lc 'go test ./...'`, which is how
+// half of them arrive, read as "正在执行命令" and said nothing. The flags are
+// the part that distinguishes a run from a rerun.
+func commandFragment(input map[string]any) string {
+	return firstString(input, "command", "cmd", "script", "command_line", "commandline")
+}
+
+// searchFragment returns what a search was for. The term is the step: "正在
+// 检索代码" is true of every search a run makes and separates none of them.
+func searchFragment(input map[string]any) string {
+	return firstString(input,
+		"pattern", "query", "regex", "search_term", "searchterm", "keyword", "q",
+		"glob", "path", "file_path", "directory")
+}
+
+// webFragment returns the URL fetched or the question asked.
+func webFragment(input map[string]any) string {
+	return firstString(input, "url", "query", "q", "search_query", "prompt")
+}
+
+// subtaskFragment returns the brief handed to a subagent — the one place a
+// step can say what a run is delegating rather than that it delegated.
+func subtaskFragment(input map[string]any) string {
+	return firstString(input, "prompt", "description", "task", "instructions", "subagent_type")
+}
+
+// planFragment returns the plan being written. A todo list arrives as an array
+// of objects rather than a string, which firstString declines; the plain line
+// covers it.
+func planFragment(input map[string]any) string {
+	return firstString(input, "plan", "description", "summary", "title")
+}
+
+// argsFragment renders a call's parameters as key=value, for the two kinds of
+// tool this adapter has no words for: an MCP call and a name it has never
+// seen. Both are exactly the cases where the parameters are the only thing
+// that says what is happening.
+//
+// Three things are excluded. A content block, by key (progressBodyKeys). A
+// nested object or array, because it is either a body or a structure that
+// would not fit on a line either way. And an empty value, which says nothing.
+// Keys are sorted so the same call reads the same way twice — the input is a
+// map and Go's iteration order is not stable, and a step that reshuffles
+// itself between frames looks like a different step.
+func argsFragment(input map[string]any) string {
+	if len(input) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(input))
+	for k := range input {
+		if progressBodyKeys[strings.ToLower(strings.TrimSpace(k))] {
 			continue
 		}
-		// Windows separators too — the daemon runs wherever the user's machine is.
-		v = v[strings.LastIndexAny(v, `\`)+1:]
-		if base := safeFragment(path.Base(v)); base != "" && base != "." && base != "/" {
-			return base
-		}
+		keys = append(keys, k)
 	}
-	return ""
-}
+	sort.Strings(keys)
 
-// commandFragment returns the program a command invoked and drops its whole
-// argument list. `git`, `go`, `pytest` tell the user what kind of work is
-// happening; the arguments are where the URLs, hostnames and credentials are.
-// A wrapper shell is treated as no name at all — "正在执行 bash 命令" says
-// nothing the plain line does not.
-func commandFragment(input map[string]any) string {
-	var raw string
-	for _, key := range []string{"command", "cmd", "script"} {
-		if v, _ := input[key].(string); strings.TrimSpace(v) != "" {
-			raw = strings.TrimSpace(v)
+	var parts []string
+	for _, k := range keys {
+		var val string
+		switch v := input[k].(type) {
+		case string:
+			val = v
+		case bool:
+			val = strconv.FormatBool(v)
+		case float64:
+			val = strconv.FormatFloat(v, 'f', -1, 64)
+		case int:
+			val = strconv.Itoa(v)
+		case json.Number:
+			val = v.String()
+		default:
+			continue
+		}
+		if strings.TrimSpace(val) == "" {
+			continue
+		}
+		parts = append(parts, k+"="+val)
+		// The join is capped anyway; stopping early keeps a tool with fifty
+		// parameters from building a string only to throw it away.
+		if len(parts) >= progressMaxArgs {
 			break
 		}
 	}
-	if raw == "" {
-		return ""
-	}
-	first, _, _ := strings.Cut(raw, " ")
-	first = first[strings.LastIndexAny(first, `/\`)+1:]
-	if first == "" || len(first) > 16 {
-		return ""
-	}
-	switch first {
-	case "bash", "sh", "zsh", "fish", "env", "sudo", "nohup", "time":
-		return ""
-	}
-	// Anything that is not a plain program name — an env assignment, a pipe, a
-	// quoted string, a path fragment with spaces — is dropped rather than
-	// guessed at. A conservative allow-list is the point: this is the one
-	// place a command's own text could reach the chat.
-	for i, r := range first {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z':
-		case i > 0 && (r >= '0' && r <= '9'):
-		case i > 0 && (r == '-' || r == '_' || r == '.' || r == '+'):
-		default:
-			return ""
-		}
-	}
-	return first
+	return safeFragment(strings.Join(parts, ", "))
 }
 
 // mcpToolParts splits an MCP tool name — `mcp__<server>__<tool>` — into the

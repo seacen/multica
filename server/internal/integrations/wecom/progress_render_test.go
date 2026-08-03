@@ -1,13 +1,12 @@
 package wecom
 
 // progress_render_test.go — turning an agent's tool calls into a sentence a
-// non-engineer can read, without carrying anything private out of the run.
+// non-engineer can read, and the rolling window they land in.
 //
-// Two properties are load-bearing here and neither is obvious from the code:
-// every tool the providers actually emit has to produce *some* line (a blank
-// one is a step the user never sees happen), and no line may contain an
-// argument as the agent wrote it. The second is why most of this file is
-// negative assertions.
+// The property this file pins is that every tool the providers actually emit
+// produces SOME line: a blank one is a step the user never sees happen, which
+// is indistinguishable from a run that has stalled. What a line may say lives
+// in progress_detail_test.go; who may read it in progress_level_test.go.
 
 import (
 	"fmt"
@@ -63,23 +62,25 @@ func TestEveryToolCallReadsAsAnAction(t *testing.T) {
 		msg  protocol.TaskMessagePayload
 		want string
 	}{
-		{"read names the file", toolUse("Read", map[string]any{"file_path": "/Users/dana/dev/server/config.go"}), "正在读取 config.go"},
+		{"read names the file", toolUse("Read", map[string]any{"file_path": "/Users/dana/dev/server/config.go"}), "正在读取 /Users/dana/dev/server/config.go"},
 		{"read without a path", toolUse("Read", nil), "正在读取文件"},
-		{"codex read_file", toolUse("read_file", map[string]any{"path": "cmd/main.go"}), "正在读取 main.go"},
-		{"edit names the file", toolUse("Edit", map[string]any{"file_path": "/srv/app/handler.go"}), "正在修改 handler.go"},
+		{"codex read_file", toolUse("read_file", map[string]any{"path": "cmd/main.go"}), "正在读取 cmd/main.go"},
+		{"edit names the file", toolUse("Edit", map[string]any{"file_path": "/srv/app/handler.go"}), "正在修改 /srv/app/handler.go"},
 		{"write names the file", toolUse("Write", map[string]any{"file_path": "notes.md"}), "正在修改 notes.md"},
 		{"codex patch_apply", toolUse("patch_apply", nil), "正在修改文件"},
-		{"bash names the program", toolUse("Bash", map[string]any{"command": "git status --short"}), "正在执行 git 命令"},
-		{"bash without a usable word", toolUse("Bash", map[string]any{"command": "FOO=1 ./x"}), "正在执行命令"},
-		{"grep", toolUse("Grep", map[string]any{"pattern": "token"}), "正在检索代码"},
-		{"glob", toolUse("Glob", map[string]any{"pattern": "**/*.go"}), "正在检索代码"},
-		{"webfetch", toolUse("WebFetch", map[string]any{"url": "https://example.com/x"}), "正在查资料"},
-		{"websearch", toolUse("WebSearch", map[string]any{"query": "golang"}), "正在查资料"},
-		{"subagent", toolUse("Task", map[string]any{"description": "dig"}), "正在派子任务"},
+		{"bash carries the command line", toolUse("Bash", map[string]any{"command": "git status --short"}), "正在执行 git status --short"},
+		{"bash without a command", toolUse("Bash", nil), "正在执行命令"},
+		{"grep", toolUse("Grep", map[string]any{"pattern": "token"}), "正在检索 token"},
+		{"glob", toolUse("Glob", map[string]any{"pattern": "**/*.go"}), "正在检索 **/*.go"},
+		{"search without a term", toolUse("Grep", nil), "正在检索代码"},
+		{"webfetch", toolUse("WebFetch", map[string]any{"url": "https://example.com/x"}), "正在查 https://example.com/x"},
+		{"websearch", toolUse("WebSearch", map[string]any{"query": "golang"}), "正在查 golang"},
+		{"subagent", toolUse("Task", map[string]any{"description": "dig"}), "正在派子任务：dig"},
 		{"todo", toolUse("TodoWrite", nil), "正在梳理计划"},
 		{"unknown tool", toolUse("Frobnicate", nil), "正在使用 Frobnicate"},
 		{"mcp tool", toolUse("mcp__calendar__list_events", nil), "正在调用 calendar · list_events"},
-		{"error message", protocol.TaskMessagePayload{Type: "error", Content: "boom"}, "上一步出错了，正在继续"},
+		{"error message", protocol.TaskMessagePayload{Type: "error", Content: "boom"}, "上一步出错了：boom，正在继续"},
+		{"error with no message", protocol.TaskMessagePayload{Type: "error"}, "上一步出错了，正在继续"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -94,7 +95,7 @@ func TestEveryToolCallReadsAsAnAction(t *testing.T) {
 // so a line built for one must not leak the other's language.
 func TestEnglishInstallationsReadEnglish(t *testing.T) {
 	got := lineFor(t, toolUse("Read", map[string]any{"file_path": "a/b/config.go"}), LocaleEn)
-	if got != "Reading config.go" {
+	if got != "Reading a/b/config.go" {
 		t.Errorf("line = %q, want the English pack", got)
 	}
 	if strings.ContainsAny(got, "正在读取") {
@@ -119,77 +120,9 @@ func TestOnlyToolCallsAndErrorsRefreshTheBubble(t *testing.T) {
 	}
 }
 
-// TestNoArgumentEverReachesTheUser is the privacy contract. WeCom is a
-// consumer chat surface with no redaction of its own, so whatever this
-// function emits is what a colleague reading over a shoulder sees.
-func TestNoArgumentEverReachesTheUser(t *testing.T) {
-	secrets := []struct {
-		name   string
-		msg    protocol.TaskMessagePayload
-		banned []string
-	}{
-		{
-			"a command's arguments",
-			toolUse("Bash", map[string]any{"command": "curl -H 'Authorization: Bearer sk-live-42' https://internal.example.com/payroll"}),
-			[]string{"sk-live-42", "Authorization", "internal.example.com", "payroll"},
-		},
-		{
-			"a file's contents",
-			toolUse("Write", map[string]any{"file_path": "/srv/app/.env", "content": "AWS_SECRET_ACCESS_KEY=hunter2"}),
-			[]string{"hunter2", "AWS_SECRET_ACCESS_KEY", "/srv/app"},
-		},
-		{
-			"a search pattern",
-			toolUse("Grep", map[string]any{"pattern": "password\\s*=\\s*(.+)", "path": "/srv/secrets"}),
-			[]string{"password", "/srv/secrets"},
-		},
-		{
-			"a subagent's brief",
-			toolUse("Task", map[string]any{"prompt": "email the Q3 layoff list to dana", "description": "layoffs"}),
-			[]string{"layoff", "dana"},
-		},
-		{
-			"a fetched url",
-			toolUse("WebFetch", map[string]any{"url": "https://intranet.example.com/hr/salaries.csv"}),
-			[]string{"intranet", "salaries"},
-		},
-		{
-			"an error's detail",
-			protocol.TaskMessagePayload{Type: "error", Content: "psql: FATAL: password authentication failed for user \"dana\""},
-			[]string{"password", "dana", "FATAL"},
-		},
-	}
-	for _, tc := range secrets {
-		t.Run(tc.name, func(t *testing.T) {
-			line := lineFor(t, tc.msg, LocaleZhHans)
-			for _, bad := range tc.banned {
-				if strings.Contains(strings.ToLower(line), strings.ToLower(bad)) {
-					t.Errorf("line %q leaked %q", line, bad)
-				}
-			}
-			if strings.TrimSpace(line) == "" {
-				t.Error("redacting the argument must not silence the step")
-			}
-		})
-	}
-}
-
-// TestAFileNameCannotBreakTheThinkTag — the bubble body is markup, and the
-// only untrusted fragment in it is a name the agent chose.
-func TestAFileNameCannotBreakTheThinkTag(t *testing.T) {
-	line := lineFor(t, toolUse("Read", map[string]any{"file_path": "a/</think>evil<think>.go"}), LocaleZhHans)
-	if strings.Contains(line, "<") || strings.Contains(line, ">") {
-		t.Errorf("line = %q still carries angle brackets", line)
-	}
-	long := lineFor(t, toolUse("Read", map[string]any{"file_path": strings.Repeat("字", 300) + ".go"}), LocaleZhHans)
-	if len([]rune(long)) > 80 {
-		t.Errorf("line is %d runes; one step must stay one line", len([]rune(long)))
-	}
-	multi := lineFor(t, toolUse("Read", map[string]any{"file_path": "a\nb\nc.go"}), LocaleZhHans)
-	if strings.Contains(multi, "\n") {
-		t.Errorf("line = %q spans lines; the bubble lists one step per line", multi)
-	}
-}
+// What a line may and may not carry now lives in progress_detail_test.go —
+// the argument is shown, the content block is not — and who may read it at all
+// in progress_level_test.go.
 
 // TestPayloadSurvivesASerializationRoundTrip — the same subscriber sees typed
 // payloads in-process and maps once the event has been through JSON.
@@ -203,7 +136,7 @@ func TestPayloadSurvivesASerializationRoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatal("the map form produced no step")
 	}
-	if got := step.line(copyFor(LocaleZhHans), progressLevelDetail); got != "正在读取 config.go" {
+	if got := step.line(copyFor(LocaleZhHans), progressLevelDetail); got != "正在读取 /x/y/config.go" {
 		t.Errorf("line = %q", got)
 	}
 }

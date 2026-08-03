@@ -242,11 +242,8 @@ func TestToolCallsShowUpInTheBubble(t *testing.T) {
 	if last.ID != opening.ID || last.ReqID != opening.ReqID {
 		t.Errorf("refresh %+v addresses a different bubble than the question opened", last)
 	}
-	if !strings.Contains(last.Content, "正在读取 config.go") || !strings.Contains(last.Content, "正在执行 go 命令") {
+	if !strings.Contains(last.Content, "正在读取 /srv/app/config.go") || !strings.Contains(last.Content, "正在执行 go test ./...") {
 		t.Errorf("content = %q, want both steps", last.Content)
-	}
-	if strings.Contains(last.Content, "go test ./...") {
-		t.Errorf("content = %q leaked the command", last.Content)
 	}
 }
 
