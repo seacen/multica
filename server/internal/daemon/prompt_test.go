@@ -448,6 +448,17 @@ func TestBuildChatPromptTwoLayerChannelPolicy(t *testing.T) {
 				"You cannot attach a file to it",
 			},
 		},
+		{
+			// WeCom takes files now: the adapter uploads whatever is bound to
+			// the reply and sends it into the chat behind it. The delivery axis
+			// therefore says yes here while the history axis still says no,
+			// which is the pair a single channel gate cannot express.
+			name:        "wecom: upload, no history",
+			channelType: execenv.ChannelTypeWecom,
+			wantUpload:  true,
+			wantHistory: false,
+			wantPhrases: []string{"WeCom"},
+		},
 	}
 
 	for _, tc := range cases {

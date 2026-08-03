@@ -27,6 +27,7 @@ func deliveryInvariantFixtures() map[string]TaskContextForEnv {
 		"chat_direct": {ChatSessionID: "c-1", AgentName: "Eve", AgentID: "eve-1"},
 		"chat_slack":  {ChatSessionID: "c-1", ChatChannelType: ChannelTypeSlack, AgentName: "Eve", AgentID: "eve-1"},
 		"chat_feishu": {ChatSessionID: "c-1", ChatChannelType: ChannelTypeFeishu, AgentName: "Eve", AgentID: "eve-1"},
+		"chat_wecom":  {ChatSessionID: "c-1", ChatChannelType: ChannelTypeWecom, AgentName: "Eve", AgentID: "eve-1"},
 	}
 }
 
@@ -71,9 +72,10 @@ func TestBriefSurfaceDeliveryPolicy(t *testing.T) {
 			mustHave: []string{"`multica attachment upload <local-path>`"},
 			mustNot:  []string{"text-only"},
 		},
-		// IM surfaces are text-only. The upload command must not appear: it binds
-		// to a Multica chat reply, which an IM reply is not, so suggesting it
-		// would have the agent upload a file and report it as delivered.
+		// Slack and Lark are still text-only. The upload command must not
+		// appear there: it binds to a Multica chat reply, which their replies
+		// are not, so suggesting it would have the agent upload a file and
+		// report it as delivered.
 		"chat_slack": {
 			mustHave: []string{"Slack conversation is text-only", "does NOT apply"},
 			mustNot:  []string{"run `multica attachment upload"},
@@ -81,6 +83,14 @@ func TestBriefSurfaceDeliveryPolicy(t *testing.T) {
 		"chat_feishu": {
 			mustHave: []string{"Feishu/Lark conversation is text-only", "does NOT apply"},
 			mustNot:  []string{"run `multica attachment upload"},
+		},
+		// WeCom is not, any more: the adapter uploads the bound file over the
+		// bot's long connection and sends it into the chat behind the reply.
+		// The agent has to be told, or it goes on describing files in words it
+		// could simply have delivered.
+		"chat_wecom": {
+			mustHave: []string{"`multica attachment upload <local-path>`", "WeCom"},
+			mustNot:  []string{"text-only", "does NOT apply"},
 		},
 		"autopilot": {
 			mustHave: []string{"this surface is text-only"},

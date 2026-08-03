@@ -708,7 +708,15 @@ func writeOutput(b *strings.Builder, kind taskKind, ctx TaskContextForEnv) {
 		// IM platform, where `attachment upload` has nothing to bind to. The
 		// orthogonal HISTORY layer (which read commands exist) is Slack-only and
 		// lives in the per-turn chat prompt — do not collapse the two.
-		if ctx.ChatChannelType != "" {
+		if ChannelCarriesFiles(ctx.ChatChannelType) {
+			// The adapter goes back for whatever the upload bound to this
+			// reply and pushes it into the conversation as its own message.
+			// That "separate message" is worth stating: an agent told only
+			// that files work here writes "see the chart below" and then
+			// nothing appears below, because a picture cannot be embedded in
+			// an IM reply the way it can in the web chat.
+			fmt.Fprintf(b, "**Delivering files here:** run `multica attachment upload <local-path>` — it binds the file to your reply and Multica then sends it into the %s conversation as a separate message right after your text. That command is the ONLY way a file reaches the user; a path written into your reply text is not. Write your reply so it reads correctly with the file arriving after it, not inline.\n", ChannelDisplayName(ctx.ChatChannelType))
+		} else if ctx.ChatChannelType != "" {
 			fmt.Fprintf(b, "**Delivering files here:** this %s conversation is text-only — Multica cannot push a file you produced back into it. `multica attachment upload` does NOT apply: it binds to a Multica chat reply, which this is not. Say in words what you produced and where it can be obtained; never upload and then write as though the file arrived, and never link its local path.\n", ChannelDisplayName(ctx.ChatChannelType))
 		} else {
 			b.WriteString("**Delivering files here:** run `multica attachment upload <local-path>` — it binds the file to your reply and it renders as an attachment card. That command is the ONLY way a file reaches the user; a path written into your reply text is not.\n")

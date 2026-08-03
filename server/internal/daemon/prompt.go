@@ -549,9 +549,12 @@ func buildChatPrompt(task Task) string {
 	// channel at all", unlike the history block above which is Slack-only; the
 	// two layers must not be collapsed into one condition (MUL-4899). The brief's
 	// `## Output` section states the same policy for every surface.
-	if task.ChatChannelType == "" {
+	switch {
+	case task.ChatChannelType == "":
 		b.WriteString("\nTo include a file or image you produced in your reply, run `multica attachment upload <local-path>`. The file binds to your reply automatically and appears as an attachment card below it even if you paste nothing. The command also returns a `markdown` snippet you may paste on its own line to place the item where you want it (files render as a card, images inline).\n")
-	} else {
+	case execenv.ChannelCarriesFiles(task.ChatChannelType):
+		fmt.Fprintf(&b, "\nTo include a file or image you produced in your reply, run `multica attachment upload <local-path>`. It binds to your reply and Multica sends it into the %s conversation as a separate message right after your text — there is no way to place it inline, so write your reply to read correctly with the file arriving after it.\n", channelDisplayName(task.ChatChannelType))
+	default:
 		fmt.Fprintf(&b, "\nThis reply is delivered to %s as text. You cannot attach a file to it: `multica attachment upload` binds to a Multica chat reply, which this is not. If you produce a file, describe it in words — never write its local path as a link, and never upload it and then write as though it arrived.\n", channelDisplayName(task.ChatChannelType))
 	}
 	return b.String()
