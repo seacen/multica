@@ -3,8 +3,9 @@ package wecom
 // replier.go — the WeCom OutboundReplier. Handles the engine's needs_binding
 // / agent_offline / agent_archived / issue_created outcomes by sending a
 // text message back over the same aibot WebSocket the inbound loop owns
-// (aibot has no REST outbound; every write is on the socket, looked up via
-// the sendersRegistry).
+// (aibot has no REST outbound; every write is on the socket). It goes
+// through sendersRegistry.send, the one outbound entry point, so a notice
+// raised mid-reconnect waits for the socket instead of vanishing.
 
 import (
 	"context"
@@ -153,10 +154,15 @@ func (r *OutboundReplier) sendBindingPrompt(ctx context.Context, inst engine.Res
 	return r.post(ctx, inst, msg, c.BindingPromptPrefix+bindURL+c.BindingPromptSuffix)
 }
 
-// post looks up the installation's live wsSender in the registry and
-// pushes aibot_send_msg with the given text. Returns "connection not
-// ready" when the Supervisor has no active connection (mid-reconnect
-// after lease flip, or right after Revoke).
+// post hands the text to the registry's outbound queue, which writes it to
+// the live connection when there is one and holds it for the next one when
+// there is not (see outbound_queue.go). These notices matter most exactly
+// when the socket is flapping: a binding prompt dropped mid-reconnect
+// leaves the user unable to bind at all, and the offline / archived /
+// issue-created notices answer a message the user already sent.
+//
+// An error here means the wire will never accept this body — a missing
+// chat id, a bad chat type — not that delivery is late.
 func (r *OutboundReplier) post(ctx context.Context, inst engine.ResolvedInstallation, msg channel.InboundMessage, text string) error {
 	_ = ctx
 	if r.senders == nil {
@@ -165,16 +171,11 @@ func (r *OutboundReplier) post(ctx context.Context, inst engine.ResolvedInstalla
 	if !inst.ID.Valid {
 		return errors.New("wecom: installation id is zero")
 	}
-	sender := r.senders.get(inst.ID)
-	if sender == nil {
-		return errors.New("wecom: connection not ready")
-	}
-	chatID := msg.Source.ChatID
-	if chatID == "" {
-		return errors.New("wecom: missing chat_id")
-	}
-	chatType := aibotChatTypeFromChannel(msg.Source.ChatType)
-	return sender.sendText(chatID, chatType, text)
+	return r.senders.send(inst.ID, pendingSend{
+		ChatID:   msg.Source.ChatID,
+		ChatType: aibotChatTypeFromChannel(msg.Source.ChatType),
+		Content:  text,
+	})
 }
 
 func issueCreatedText(res engine.Result, c copyPack) string {
