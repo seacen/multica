@@ -437,6 +437,15 @@ func (m *TypingIndicatorManager) armGuard(sessionID pgtype.UUID, h streamHandle)
 // closeBubble seals a session's bubble with the copy pick chooses, if there is
 // still a bubble to seal. Taking the handle first makes this idempotent: two
 // closers racing produce one closing frame.
+//
+// A closing frame that cannot go out falls back to a plain message, the same
+// way the answer does in outbound.go. The words matter more here than there:
+// StreamFailed is the only "that run did not go through" WeCom ever produces —
+// the replier speaks for needs_binding, offline, archived and issue_created,
+// and for nothing else — so a frame lost to a reconnect window used to leave
+// the user with a spinner and no explanation that would ever arrive. The
+// addressing comes off the handle, captured at ingest, because by now the
+// binding row may point at a different chat.
 func (m *TypingIndicatorManager) closeBubble(ctx context.Context, sessionID pgtype.UUID, pick func(copyPack) string, why string) {
 	if m.senders == nil || m.streams == nil || !sessionID.Valid {
 		return
@@ -445,10 +454,21 @@ func (m *TypingIndicatorManager) closeBubble(ctx context.Context, sessionID pgty
 	if !ok {
 		return
 	}
-	if err := m.senders.stream(ctx, h, pick(copyFor(h.Locale)), true); err != nil {
-		m.log.WarnContext(ctx, "wecom typing: closing frame failed",
-			"chat_session_id", util.UUIDToString(sessionID),
-			"reason", why, "unusable", streamUnusable(err), "error", err)
+	text := pick(copyFor(h.Locale))
+	err := m.senders.stream(ctx, h, text, true)
+	if err == nil {
+		return
+	}
+	m.log.WarnContext(ctx, "wecom typing: closing frame failed, saying it as a new message",
+		"chat_session_id", util.UUIDToString(sessionID),
+		"reason", why, "unusable", streamUnusable(err), "error", err)
+	if sendErr := m.senders.send(h.InstallationID, pendingSend{
+		ChatID:   h.ChatID,
+		ChatType: h.ChatType,
+		Content:  text,
+	}); sendErr != nil {
+		m.log.WarnContext(ctx, "wecom typing: the fallback message was unsendable too",
+			"chat_session_id", util.UUIDToString(sessionID), "reason", why, "error", sendErr)
 	}
 }
 

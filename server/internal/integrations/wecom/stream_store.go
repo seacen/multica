@@ -67,6 +67,9 @@ type streamHandle struct {
 	// opens another.
 	StreamID string
 
+	// InstallationID finds the live socket. ChatID and ChatType address the
+	// conversation for the fallback plain message a closing frame degrades to
+	// when the stream cannot take it (typing_indicator.go).
 	InstallationID pgtype.UUID
 	ChatID         string
 	ChatType       int

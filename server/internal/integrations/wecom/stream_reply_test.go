@@ -459,6 +459,51 @@ func TestGuardClosesTheBubbleBeforeTheWindowRunsOut(t *testing.T) {
 	}
 }
 
+// TestAFailedCloseStillTellsTheUser — StreamFailed is the only "that run did
+// not go through" WeCom ever sees; the replier speaks for needs_binding,
+// offline, archived and issue_created and for nothing else. A closing frame
+// that cannot go out — a lease flip, the Supervisor's backoff, the seconds
+// after a reconnect — used to take that notice with it and leave the bubble
+// spinning with no explanation ever coming.
+func TestAFailedCloseStillTellsTheUser(t *testing.T) {
+	rig := newStreamRig(t)
+	rig.ingest(t, "REQ-42")
+	rig.senders.clear(rig.inst.ID) // the reconnect window
+
+	rig.typing.OnSettled(context.Background(), rig.session)
+
+	if n := rig.senders.pending.depth(rig.inst.ID); n != 1 {
+		t.Fatalf("queue depth %d; the notice was not held for the next connection", n)
+	}
+	conn := &recordingConn{}
+	rig.senders.set(rig.inst.ID, newWSSender(conn, testLogger()))
+	rig.senders.flushPending(rig.inst.ID)
+
+	got := contentsOf(conn)
+	if len(got) != 1 || got[0] != copyPacks[LocaleZhHans].StreamNotStarted {
+		t.Fatalf("after the reconnect the user received %v, want the notice as a plain message", got)
+	}
+}
+
+// TestAFailedCloseAddressesTheChatThatAsked — the fallback has to reach the
+// same conversation the bubble was in, and by then the binding row may point
+// somewhere else. The addressing captured at ingest is what makes that safe.
+func TestAFailedCloseAddressesTheChatThatAsked(t *testing.T) {
+	rig := newStreamRig(t)
+	rig.ingest(t, "REQ-42")
+	rig.senders.clear(rig.inst.ID)
+
+	rig.typing.OnSettled(context.Background(), rig.session)
+
+	msg, ok := rig.senders.pending.pop(rig.inst.ID)
+	if !ok {
+		t.Fatal("nothing held for the next connection")
+	}
+	if msg.ChatID != "T-alex" || msg.ChatType != chatTypeSingleInt {
+		t.Fatalf("held message addresses %+v, want the chat the question came from", msg)
+	}
+}
+
 // TestStaleHandleIsTreatedAsGone — a handle past the protocol window would
 // swallow the answer rather than deliver it, so the store must disown it.
 func TestStaleHandleIsTreatedAsGone(t *testing.T) {
