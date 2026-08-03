@@ -1,13 +1,20 @@
 package wecom
 
 // outbound.go — the WeCom EventChatDone subscriber. After an agent finishes
-// producing a chat reply on the bus, this subscriber looks up the wecom
-// chat_session binding, resolves the live wsSender through the shared
-// registry, and pushes the reply back as aibot_send_msg. Mirrors
-// slack.Outbound; sessions with no wecom binding are ignored so it
-// coexists with Slack / Lark subscribers on the shared bus.
+// producing a chat reply on the bus, this subscriber delivers it to the chat
+// that asked. Mirrors slack.Outbound; sessions with no wecom binding are
+// ignored so it coexists with Slack / Lark subscribers on the shared bus.
 //
-// Kept lean: aibot has no threading, no per-bot outbound REST, and no
+// There are two ways out, and which one is used decides what the user sees.
+// If the typing indicator opened a streaming bubble for this turn
+// (stream_store.go), the answer replaces that bubble in place and the
+// conversation reads as one question and one answer. If it did not — no
+// indicator, a restart since, a run past the protocol's stream window — the
+// answer goes out as a fresh aibot_send_msg through the holding queue, exactly
+// as it did before. The fallback is not an error path: it is the same delivery
+// the adapter has always made, and it is what the streaming path degrades to.
+//
+// Kept lean otherwise: aibot has no threading, no per-bot outbound REST, and no
 // mrkdwn conversion — the reply text goes through sendMsgTextBody the
 // same way OutboundReplier's messages do (markdown msgtype, which
 // renders plaintext without escaping).
@@ -44,6 +51,7 @@ type outboundQueries interface {
 type Outbound struct {
 	q       outboundQueries
 	senders *sendersRegistry
+	streams *streamStore
 	logger  *slog.Logger
 }
 
@@ -52,11 +60,14 @@ type Outbound struct {
 // built with — reply delivery goes through the live wsSender for the
 // binding's installation, so a session whose Supervisor lost the lease
 // mid-flight silently drops rather than opening a second connection.
-func NewOutbound(q outboundQueries, senders *sendersRegistry, logger *slog.Logger) *Outbound {
+//
+// streams is the same store the typing indicator writes to; nil disables the
+// in-place reply and leaves every answer going out as a new message.
+func NewOutbound(q outboundQueries, senders *sendersRegistry, streams *streamStore, logger *slog.Logger) *Outbound {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Outbound{q: q, senders: senders, logger: logger}
+	return &Outbound{q: q, senders: senders, streams: streams, logger: logger}
 }
 
 // Register subscribes to the chat-done event on the bus.
@@ -85,6 +96,32 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 		// Issue / autopilot tasks carry no chat_session.
 		return nil
 	}
+
+	content := chatDoneContent(e.Payload)
+
+	// The bubble the question opened, if there is one. Taken up front and
+	// unconditionally: from here on this turn owns it, and a handle left in
+	// the store after the turn ends is a handle pointing at a sealed message.
+	if handle, streaming := o.takeStream(sessionID); streaming {
+		// A bubble on screen has to end in words. An empty completion is a
+		// legitimate outcome — the agent had nothing to add — but an endless
+		// spinner is not, so the copy stands in for the silence.
+		text := content
+		if !hasVisibleChar(text) {
+			text = copyFor(handle.Locale).StreamNoReply
+		}
+		if err := o.finishStream(ctx, handle, text); err == nil {
+			return nil
+		}
+		// The frame was refused. Say it as a new message instead — and never
+		// queue the stream frame itself, whose req_id will have expired long
+		// before a reconnect could replay it.
+		content = text
+	}
+	if content == "" {
+		return nil // nothing to say (empty completion, no bubble to close)
+	}
+
 	binding, err := o.q.GetChannelChatSessionBindingBySession(ctx, db.GetChannelChatSessionBindingBySessionParams{
 		ChatSessionID: sessionID,
 		ChannelType:   channelTypeWecom,
@@ -94,10 +131,6 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 			return nil // not a wecom session (Slack / Lark / web-only)
 		}
 		return fmt.Errorf("wecom: lookup chat binding: %w", err)
-	}
-	content := chatDoneContent(e.Payload)
-	if content == "" {
-		return nil // nothing to say (empty completion)
 	}
 	inst, err := o.q.GetChannelInstallation(ctx, db.GetChannelInstallationParams{
 		ID:          binding.InstallationID,
@@ -122,6 +155,30 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 		ChatType: chatType,
 		Content:  content,
 	})
+}
+
+// takeStream hands over the bubble open for this session, if the typing
+// indicator managed to open one and it is still inside the protocol's window.
+func (o *Outbound) takeStream(sessionID pgtype.UUID) (streamHandle, bool) {
+	if o.streams == nil || o.senders == nil {
+		return streamHandle{}, false
+	}
+	return o.streams.take(sessionID)
+}
+
+// finishStream writes the answer into the bubble and seals it. A failure here
+// is not fatal to the reply — it means the caller falls back to a new message —
+// so it is logged with the one detail that explains it: whether the stream is
+// beyond saving (past its window, bad req_id) or the socket simply blinked.
+func (o *Outbound) finishStream(ctx context.Context, h streamHandle, text string) error {
+	err := o.senders.stream(ctx, h, text, true)
+	if err == nil {
+		return nil
+	}
+	o.logger.WarnContext(ctx, "wecom outbound: in-place reply failed, sending a new message instead",
+		"installation_id", uuidStringPub(h.InstallationID),
+		"stream_unusable", streamUnusable(err), "error", err)
+	return err
 }
 
 // chatDoneContent extracts the reply text from an EventChatDone payload

@@ -97,12 +97,18 @@ var _ channel.Channel = (*wecomChannel)(nil)
 
 func (c *wecomChannel) Type() channel.Type { return TypeWecom }
 
-// Capabilities declares what the aibot adapter supports today. Text is the
-// only fully wired capability; attachments arrive as MsgTypeImage / File /
-// Audio / Video but we do not yet download the media (WeChat's aibot API
-// requires an additional aibot_upload_media_* dance to send back media).
+// Capabilities declares what the aibot adapter supports today. Attachments
+// arrive as MsgTypeImage / File / Audio / Video but we do not yet download the
+// media (WeChat's aibot API requires an additional aibot_upload_media_* dance
+// to send it back), so they stay undeclared.
+//
+// The typing-indicator and message-edit bits are one mechanism, not two: a
+// streaming reply's opening frame IS the indicator and its closing frame IS
+// the edit (see stream_store.go). Both are declared because a caller reading
+// the mask to decide "can this channel show progress" and one asking "can this
+// channel replace what it already said" both get a true answer.
 func (c *wecomChannel) Capabilities() channel.Capability {
-	return channel.CapText
+	return channel.CapText | channel.CapTypingIndicator | channel.CapMessageEdit
 }
 
 // Disconnect is a no-op: the WS connection's whole lifetime is scoped to
@@ -342,9 +348,15 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 		// Anonymous ack frames (empty cmd) for our writes. Most are
 		// errcode=0 no-ops, but aibot_send_msg / aibot_respond_msg /
 		// aibot_upload_media_* can reject with a non-zero errcode
-		// (e.g. wrong msgtype, rate limit, chat not writable). Log the
-		// error so a failed outbound is visible without having to
-		// packet-capture the socket.
+		// (e.g. wrong msgtype, rate limit, chat not writable).
+		//
+		// Hand every ack to the sender first: a streaming reply blocks on the
+		// verdict for its frame, because 846608 ("this stream is past its
+		// window") is the difference between putting the answer in the bubble
+		// and putting it in a new message. Frames nobody is waiting on fall
+		// through and are only logged, so a failed outbound stays visible
+		// without a packet capture.
+		sender.deliverAck(env.Headers.ReqID, env.ErrCode, env.ErrMsg)
 		if env.ErrCode != 0 {
 			log.Warn("wecom: server ack error",
 				"errcode", env.ErrCode,
@@ -562,4 +574,15 @@ func newReqID() string {
 		return fmt.Sprintf("wecom-%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(buf[:])
+}
+
+// newStreamID mints the developer-chosen id that names one streaming message.
+// Reusing an id replaces that message's body; a fresh one opens another
+// bubble, which is why this must never collide across concurrent turns.
+func newStreamID() string {
+	var buf [12]byte
+	if _, err := cryptorand.Read(buf[:]); err != nil {
+		return fmt.Sprintf("wecom-stream-%d", time.Now().UnixNano())
+	}
+	return "s" + hex.EncodeToString(buf[:])
 }

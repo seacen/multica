@@ -227,7 +227,7 @@ func TestAgentReplySurvivesAReconnect(t *testing.T) {
 		install: db.ChannelInstallation{ID: inst, Status: string(InstallationActive)},
 	}
 	reg := NewSendersRegistry()
-	o := NewOutbound(q, reg, testLogger())
+	o := NewOutbound(q, reg, nil, testLogger())
 
 	sessionStr := uuidText(session)
 	err := o.processEvent(context.Background(), events.Event{
@@ -257,7 +257,7 @@ func TestInboxPushSurvivesAReconnect(t *testing.T) {
 		install:    db.ChannelInstallation{ID: inst, Status: string(InstallationActive)},
 	}
 	reg := NewSendersRegistry()
-	o := NewOutbound(q, reg, testLogger())
+	o := NewOutbound(q, reg, nil, testLogger())
 
 	item := map[string]any{
 		"recipient_type": "member",
@@ -292,7 +292,7 @@ func TestInboxPushStopsAtARevokedInstallation(t *testing.T) {
 	reg := NewSendersRegistry()
 	conn := &recordingConn{}
 	reg.set(inst, newWSSender(conn, testLogger()))
-	o := NewOutbound(q, reg, testLogger())
+	o := NewOutbound(q, reg, nil, testLogger())
 
 	item := map[string]any{
 		"recipient_type": "member",

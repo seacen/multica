@@ -77,6 +77,23 @@ type copyPack struct {
 	InboxDetailLink   string
 	InboxTypeLabels   map[string]string
 	InboxTypeFallback string
+
+	// The four ways a streaming reply ends in something other than an answer.
+	// Each one closes the loading bubble the question opened, so each one has
+	// to carry visible text — WeCom ignores a closing frame it considers
+	// empty and the bubble spins on forever (see stream_store.go).
+	//
+	// StreamNoReply — the agent finished with nothing to say.
+	// StreamNotStarted — no run was triggered at all (agent offline or
+	//   archived, or the enqueue failed); the replier's own notice follows as
+	//   a separate message with the detail.
+	// StreamFailed — the run failed.
+	// StreamStillWorking — the run outlived the protocol's stream window, so
+	//   we close the bubble ourselves and answer separately later.
+	StreamNoReply      string
+	StreamNotStarted   string
+	StreamFailed       string
+	StreamStillWorking string
 }
 
 // label returns the display name for an inbox notification type.
@@ -129,7 +146,11 @@ var copyPacks = map[Locale]copyPack{
 			"due_date_changed":   "截止日期变更",
 			"start_date_changed": "开始日期变更",
 		},
-		InboxTypeFallback: "新消息",
+		InboxTypeFallback:  "新消息",
+		StreamNoReply:      "（这轮没有需要回复的内容）",
+		StreamNotStarted:   "已收到，但这条暂时没能开始处理。",
+		StreamFailed:       "⚠️ 这次没跑通，请稍后再试一次。",
+		StreamStillWorking: "还在处理，完成后我再单独回复你。",
 	},
 	LocaleEn: {
 		AgentOffline:        "⚠️ The agent is offline right now. Your message was received and will be handled once it's back.",
@@ -155,6 +176,10 @@ var copyPacks = map[Locale]copyPack{
 			"due_date_changed":   "Due date changed",
 			"start_date_changed": "Start date changed",
 		},
-		InboxTypeFallback: "Notification",
+		InboxTypeFallback:  "Notification",
+		StreamNoReply:      "(nothing to reply with this round)",
+		StreamNotStarted:   "Got it, but this one couldn't start processing.",
+		StreamFailed:       "⚠️ That run didn't go through. Please try again.",
+		StreamStillWorking: "Still working on it — I'll reply separately when it's done.",
 	},
 }

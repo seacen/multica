@@ -56,7 +56,7 @@ func wecomInbound(botID, chatID, senderID string, chatType channel.ChatType) cha
 // ---- the set itself ----
 
 func TestNewResolverSetIsComplete(t *testing.T) {
-	set := NewResolverSet(nil, nil, nil)
+	set := NewResolverSet(nil, nil, nil, nil)
 	if set.Installation == nil || set.Identity == nil || set.Dedup == nil || set.Session == nil || set.Audit == nil {
 		t.Fatal("all five required resolvers must be populated")
 	}
@@ -67,15 +67,18 @@ func TestNewResolverSetIsComplete(t *testing.T) {
 		t.Error("a nil replier must leave Replier nil, not a typed-nil interface the Router would call")
 	}
 	if set.Typing != nil {
-		t.Error("wecom has no typing indicator; Typing must stay nil")
+		t.Error("a nil typing manager must leave Typing nil, not a typed-nil interface the Router would call")
 	}
 	if set.Media != nil {
-		t.Error("wecom declares CapText only; Media must stay nil")
+		t.Error("wecom does not resolve inbound media; Media must stay nil")
 	}
 
-	set = NewResolverSet(nil, nil, NewOutboundReplier(OutboundReplierConfig{}))
+	set = NewResolverSet(nil, nil, NewOutboundReplier(OutboundReplierConfig{}), NewTypingIndicator(TypingIndicatorConfig{}))
 	if set.Replier == nil {
 		t.Error("a real replier must reach ResolverSet.Replier")
+	}
+	if set.Typing == nil {
+		t.Error("a real typing manager must reach ResolverSet.Typing")
 	}
 }
 

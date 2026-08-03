@@ -15,6 +15,7 @@ package wecom
 // without threading the Channel through the engine.
 
 import (
+	"context"
 	"log/slog"
 	"sync"
 
@@ -99,6 +100,21 @@ func (r *sendersRegistry) send(id pgtype.UUID, msg pendingSend) error {
 		return nil
 	}
 	return nil
+}
+
+// stream writes one frame of a streaming reply to the bubble h describes.
+//
+// Unlike send it never queues. A stream frame is only meaningful while the
+// req_id it echoes is still fresh, so a frame that cannot go out now is
+// worthless on the next connection — replaying it after a reconnect would
+// spend a write on a req_id the server has already forgotten. Callers that
+// need the words delivered regardless fall back to send(), which does queue.
+func (r *sendersRegistry) stream(ctx context.Context, h streamHandle, content string, finish bool) error {
+	sender := r.get(h.InstallationID)
+	if sender == nil {
+		return errNoLiveConnection
+	}
+	return sender.respondStream(ctx, h.ReqID, h.StreamID, content, finish)
 }
 
 // flushPending drains an installation's holding queue over the live

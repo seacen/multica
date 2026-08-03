@@ -520,8 +520,12 @@ func TestCapabilitiesAndTypeStayHonest(t *testing.T) {
 	if c.Type() != TypeWecom {
 		t.Errorf("Type = %q", c.Type())
 	}
-	if c.Capabilities() != channel.CapText {
-		t.Errorf("Capabilities = %v, want CapText only", c.Capabilities())
+	want := channel.CapText | channel.CapTypingIndicator | channel.CapMessageEdit
+	if c.Capabilities() != want {
+		t.Errorf("Capabilities = %v, want %v", c.Capabilities(), want)
+	}
+	if c.Capabilities().Has(channel.CapAttachment) {
+		t.Error("attachments are still not deliverable; declaring them would produce messages we cannot send")
 	}
 	if err := c.Disconnect(context.Background()); err != nil {
 		t.Errorf("Disconnect: %v", err)
