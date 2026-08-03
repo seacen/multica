@@ -281,6 +281,13 @@ func (s *wsSender) sendMedia(ctx context.Context, chatID string, chatType int, r
 	}
 	pushErr := func() error { _, err := s.request(ctx, cmdSendMsg, body); return err }()
 	if pushErr == nil {
+		// Which command a live bot accepts for media is not something the
+		// documentation settles, so say which one carried the file. Without
+		// this line a successful delivery leaves no trace at all and the only
+		// way to tell the two routes apart is to ask the person who received
+		// it.
+		s.log.Info("wecom: media delivered by push",
+			"route", "aibot_send_msg", "media_id", m.MediaID, "msgtype", string(m.Kind))
 		return nil
 	}
 	if reqID == "" {
@@ -296,6 +303,8 @@ func (s *wsSender) sendMedia(ctx context.Context, chatID string, chatType int, r
 	if _, err := s.requestWithID(ctx, reqID, cmdRespondMsg, passive); err != nil {
 		return fmt.Errorf("wecom: media push refused (%v) and the passive reply failed: %w", pushErr, err)
 	}
+	s.log.Info("wecom: media delivered by passive reply",
+		"route", "aibot_respond_msg", "media_id", m.MediaID, "msgtype", string(m.Kind))
 	return nil
 }
 
