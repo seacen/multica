@@ -5,11 +5,13 @@ package wecom
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/events"
@@ -353,6 +355,156 @@ func TestTheAnswerIsNeverThrottled(t *testing.T) {
 	last := frames[len(frames)-1]
 	if !last.Finish || last.Content != "答案是 42" {
 		t.Fatalf("last frame = %+v, want the sealed answer", last)
+	}
+}
+
+// ---- the answer is the last word ----
+
+// TestARefreshThatLostTheRaceNeverReachesTheBubble is the failure this fence
+// exists for. The subscriber reads the handle out of the store, renders, and
+// then writes; the answer can take that same handle in between. A frame landing
+// behind the closing one would paint "正在读取 x.go" over the answer and leave a
+// bubble nothing can close.
+func TestARefreshThatLostTheRaceNeverReachesTheBubble(t *testing.T) {
+	rig := newStreamRig(t)
+	rig.ingest(t, "REQ-42")
+
+	// What a refresh already in flight is holding when the answer arrives.
+	stale, ok := rig.streams.peek(rig.session)
+	if !ok {
+		t.Fatal("no bubble to race for")
+	}
+	newOutboundUnder(rig).handleEvent(chatDoneEvent(rig.session, "答案是 42"))
+
+	err := rig.senders.stream(context.Background(), stale, "<think>正在读取 x.go</think>", false)
+	if !errors.Is(err, errStreamSuperseded) {
+		t.Errorf("straggling refresh returned %v, want it refused as superseded", err)
+	}
+	frames := streamViews(t, &rig.conn.recordingConn)
+	if len(frames) != 2 {
+		t.Fatalf("want opening + answer, got %d frames: %+v", len(frames), frames)
+	}
+	if last := frames[1]; !last.Finish || last.Content != "答案是 42" {
+		t.Errorf("last frame = %+v, want the sealed answer and nothing after it", last)
+	}
+}
+
+// TestAVerdictBelongsToTheFrameThatEarnedIt — an ack carries the req_id and
+// nothing else, and a turn now writes a dozen frames under one. A refresh whose
+// caller gave up still has a verdict coming; handing that verdict to the
+// closing frame is how a refused answer reads as delivered and is never sent at
+// all.
+func TestAVerdictBelongsToTheFrameThatEarnedIt(t *testing.T) {
+	conn := &recordingConn{}
+	sender := newWSSender(conn, testLogger())
+
+	// A refresh whose caller stops waiting — the mid-run budget is short on
+	// purpose, and the server answers later anyway.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	if err := sender.respondStream(ctx, "REQ-42", "S-1", "<think>正在读取</think>", false); !errors.Is(err, errStreamAckTimeout) {
+		t.Fatalf("refresh returned %v, want the caller to have given up on it", err)
+	}
+	cancel()
+
+	answered := make(chan error, 1)
+	go func() {
+		answered <- sender.respondStream(context.Background(), "REQ-42", "S-1", "答案是 42", true)
+	}()
+	waitForStreamFrames(t, conn, 2)
+
+	// The refresh's verdict, arriving late and refusing the frame.
+	sender.deliverAck("REQ-42", errcodeStreamExpired, "stream expired")
+	select {
+	case err := <-answered:
+		t.Fatalf("the answer took the refresh's verdict: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	sender.deliverAck("REQ-42", 0, "")
+	if err := <-answered; err != nil {
+		t.Errorf("the answer's own verdict said ok, got %v", err)
+	}
+}
+
+// TestAVerdictThatNeverComesCostsOneFrame — counting acks is what attributes
+// them, so a verdict the server never sends would put the rest of the turn out
+// of step for good. The frame that waited it out writes the loss off.
+func TestAVerdictThatNeverComesCostsOneFrame(t *testing.T) {
+	conn := &recordingConn{}
+	sender := newWSSender(conn, testLogger())
+	sender.streams["REQ-42"] = &streamAcks{sent: 4, acked: 1, at: time.Now()}
+
+	w, _ := sender.awaitAck("REQ-42", false)
+	w.seq = 4
+	sender.forgetAck("REQ-42", w)
+
+	answered := make(chan error, 1)
+	go func() {
+		answered <- sender.respondStream(context.Background(), "REQ-42", "S-1", "答案是 42", true)
+	}()
+	waitForStreamFrames(t, conn, 1)
+
+	sender.deliverAck("REQ-42", 0, "")
+	select {
+	case err := <-answered:
+		if err != nil {
+			t.Errorf("the answer never got its verdict: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("one unanswered frame put every later one out of step")
+	}
+}
+
+// waitForStreamFrames blocks until the connection has recorded n
+// aibot_respond_msg frames, so a test can act on a frame written by another
+// goroutine without sleeping for a fixed time.
+func waitForStreamFrames(t *testing.T, c *recordingConn, n int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(framesOf(c, cmdRespondMsg)) >= n {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("only %d stream frames were written, want %d", len(framesOf(c, cmdRespondMsg)), n)
+}
+
+// TestABubbleTheServerDisownsIsLetGo — 846608 means this stream will never take
+// another frame. Holding the handle would buy a refusal every 1.5s for the rest
+// of the run and then spend the answer's own ack timeout learning the same
+// thing.
+func TestABubbleTheServerDisownsIsLetGo(t *testing.T) {
+	rig := newStreamRig(t)
+	rig.ingest(t, "REQ-42")
+	rig.conn.rejectWith(errcodeStreamExpired, "stream expired")
+
+	rig.typing.UpdateProgress(context.Background(), rig.session, "正在查日历")
+
+	if _, ok := rig.streams.peek(rig.session); ok {
+		t.Error("kept a handle the server has disowned")
+	}
+	out := NewOutbound(boundQueries(rig.inst.ID), rig.senders, rig.streams, testLogger())
+	out.handleEvent(chatDoneEvent(rig.session, "答案是 42"))
+	if got := len(framesOf(&rig.conn.recordingConn, cmdSendMsg)); got != 1 {
+		t.Errorf("sent %d plain messages; the answer had nowhere else to go", got)
+	}
+}
+
+// TestATaskThatIsGoneIsAskedAboutOnce — a run cancelled and deleted mid-flush
+// keeps publishing messages for a row that is not there. The absence is an
+// answer and has to be remembered like any other.
+func TestATaskThatIsGoneIsAskedAboutOnce(t *testing.T) {
+	rig, bus, tasks, clock := busRig(t)
+	tasks.err = pgx.ErrNoRows
+	rig.ingest(t, "REQ-42")
+
+	for i := 0; i < 4; i++ {
+		bus.Publish(taskMessageEvent(chatTaskID(), toolUse("Read", map[string]any{"file_path": "x.go"})))
+		clock.advance(progressMinInterval)
+	}
+	if tasks.count() != 1 {
+		t.Errorf("read the missing task row %d times", tasks.count())
 	}
 }
 

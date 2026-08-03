@@ -76,14 +76,63 @@ type wsSender struct {
 	// or in a new message, so that one write has to hear back. The read loop
 	// routes acks in through deliverAck.
 	ackMu   sync.Mutex
-	waiters map[string]chan ackResult
+	waiters map[string]*ackWaiter
+
+	// streams is the per-turn bookkeeping that makes a verdict trustworthy and
+	// a sealed bubble final. Guarded by ackMu; entries are created only by a
+	// stream frame, so the ordinary pushes that share this connection never
+	// touch it.
+	streams map[string]*streamAcks
 }
+
+// ackWaiter is one frame's standing request for a verdict. seq is where the
+// frame sits in its req_id's write order, stamped at the moment it goes on the
+// wire — see streamAcks for why a verdict has to be matched rather than simply
+// handed to whoever is waiting.
+type ackWaiter struct {
+	ch  chan ackResult
+	seq uint64 // 0 until the frame is written
+}
+
+// streamAcks counts one req_id's stream frames in and its verdicts out, and
+// remembers when the closing frame has gone.
+//
+// Both halves exist because a bubble is now written to many times per turn
+// rather than twice. The ack frame carries nothing but the req_id — no stream
+// id, no sequence — so a verdict is only identifiable by its position: acks
+// come back over one TCP connection in the order the frames went out. Without
+// the count, a progress frame whose ack is still on the wire when the answer
+// goes out hands ITS verdict to the closing frame, and a closing frame the
+// server actually refused reads as delivered — which loses the answer
+// entirely, since the caller then has no reason to fall back to a plain
+// message.
+//
+// sealed is the other half: a finished stream is immutable, so a progress
+// frame that lost the race to the answer must never reach the wire behind it.
+type streamAcks struct {
+	sent   uint64
+	acked  uint64
+	sealed bool
+	at     time.Time
+}
+
+// streamAcksMax bounds the per-turn bookkeeping on a long-lived connection.
+// Entries are retired by age and this is only the backstop, so it is set well
+// past any number of turns one bot can have inside the stream window — a sweep
+// that had to drop live entries would put their closing frames out of step, and
+// 2048 of these costs under a hundred kilobytes.
+const streamAcksMax = 2048
 
 func newWSSender(conn wsConn, log *slog.Logger) *wsSender {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &wsSender{conn: conn, log: log, waiters: make(map[string]chan ackResult)}
+	return &wsSender{
+		conn:    conn,
+		log:     log,
+		waiters: make(map[string]*ackWaiter),
+		streams: make(map[string]*streamAcks),
+	}
 }
 
 // ackTimeout caps the wait for a verdict. WeCom answers in a few hundred
@@ -107,7 +156,8 @@ var (
 	// against a possible silence rather than assuming failure.
 	errStreamAckTimeout = errors.New("wecom: stream frame ack timed out")
 
-	// errStreamSuperseded — a refresh was overtaken by the closing frame.
+	// errStreamSuperseded — a refresh was overtaken by the closing frame,
+	// either while waiting for its verdict or on the way to the wire.
 	errStreamSuperseded = errors.New("wecom: stream frame superseded by the closing frame")
 
 	// errNoLiveConnection — the installation has no socket right now.
@@ -120,32 +170,47 @@ type ackResult struct {
 	msg  string
 }
 
-// deliverAck hands a server ack to whoever is waiting on that req_id. The read
-// loop calls it for every anonymous ack frame; acks nobody is waiting on (the
-// heartbeat, an ordinary push) fall straight through.
+// deliverAck hands a server ack to the frame it belongs to. The read loop calls
+// it for every anonymous ack frame; acks for anything that is not a stream — the
+// heartbeat, an ordinary push — fall straight through.
+//
+// "The frame it belongs to" is the whole point, and it is not the same as
+// "whoever is waiting". A req_id carries a whole turn's frames and its acks say
+// nothing about which one they answer, so the count decides: the Nth verdict on
+// a req_id belongs to its Nth frame. A verdict for a frame whose caller has
+// already given up is dropped here rather than handed to the next one.
 func (s *wsSender) deliverAck(reqID string, code int, msg string) {
 	if reqID == "" {
 		return
 	}
 	s.ackMu.Lock()
-	ch, ok := s.waiters[reqID]
-	if ok {
+	st, tracked := s.streams[reqID]
+	if !tracked {
+		s.ackMu.Unlock()
+		return // not a stream frame's ack
+	}
+	st.acked++
+	w, ok := s.waiters[reqID]
+	if ok && w.seq == st.acked {
 		delete(s.waiters, reqID)
+	} else {
+		ok = false
 	}
 	s.ackMu.Unlock()
 	if !ok {
 		return
 	}
 	select {
-	case ch <- ackResult{code: code, msg: msg}:
+	case w.ch <- ackResult{code: code, msg: msg}:
 	default:
 	}
 }
 
-// awaitAck registers interest in the next ack for reqID. force is what makes a
-// closing frame able to jump an in-flight refresh: without it the answer would
-// be held hostage by a progress update whose ack is late.
-func (s *wsSender) awaitAck(reqID string, force bool) (chan ackResult, bool) {
+// awaitAck registers interest in the verdict for the frame about to be written.
+// force is what makes a closing frame able to jump an in-flight refresh:
+// without it the answer would be held hostage by a progress update whose ack is
+// late.
+func (s *wsSender) awaitAck(reqID string, force bool) (*ackWaiter, bool) {
 	s.ackMu.Lock()
 	defer s.ackMu.Unlock()
 	if prev, taken := s.waiters[reqID]; taken {
@@ -153,21 +218,100 @@ func (s *wsSender) awaitAck(reqID string, force bool) (chan ackResult, bool) {
 			return nil, false
 		}
 		select {
-		case prev <- ackResult{code: ackSuperseded}:
+		case prev.ch <- ackResult{code: ackSuperseded}:
 		default:
 		}
 	}
-	ch := make(chan ackResult, 1)
-	s.waiters[reqID] = ch
-	return ch, true
+	w := &ackWaiter{ch: make(chan ackResult, 1)}
+	s.waiters[reqID] = w
+	return w, true
 }
 
-// cancelAck retires a waiter that will never be answered.
-func (s *wsSender) cancelAck(reqID string, ch chan ackResult) {
+// cancelAck retires a waiter whose caller has stopped waiting. The verdict is
+// still expected — a mid-run refresh gives up after a second because the
+// daemon's request is not ours to hold, not because the server has gone quiet —
+// so the count is left alone and the late ack is discarded when it lands.
+func (s *wsSender) cancelAck(reqID string, w *ackWaiter) {
 	s.ackMu.Lock()
 	defer s.ackMu.Unlock()
-	if cur, ok := s.waiters[reqID]; ok && cur == ch {
+	if cur, ok := s.waiters[reqID]; ok && cur == w {
 		delete(s.waiters, reqID)
+	}
+}
+
+// forgetAck retires a waiter whose verdict never came at all, and writes off
+// everything it was waiting behind. Five seconds of silence on a live socket
+// means the ack is not coming; leaving the count short would put every later
+// frame of the turn permanently out of step, and the closing frame is the one
+// that would pay for it.
+func (s *wsSender) forgetAck(reqID string, w *ackWaiter) {
+	s.ackMu.Lock()
+	defer s.ackMu.Unlock()
+	if cur, ok := s.waiters[reqID]; ok && cur == w {
+		delete(s.waiters, reqID)
+	}
+	if st, ok := s.streams[reqID]; ok && st.acked < w.seq {
+		st.acked = w.seq
+	}
+}
+
+// beginStreamFrameLocked reserves the next place in a req_id's write order for
+// the frame that is about to go out, and refuses a non-final frame once the
+// closing frame has been written. Caller holds s.mu, which is what makes the
+// refusal airtight: the seal and the write it fences are decided inside the
+// same critical section, so a refresh can never slip between the two and land
+// on top of the answer.
+func (s *wsSender) beginStreamFrameLocked(reqID string, w *ackWaiter, finish bool) bool {
+	s.ackMu.Lock()
+	defer s.ackMu.Unlock()
+	st, ok := s.streams[reqID]
+	if !ok {
+		s.pruneStreamsLocked()
+		st = &streamAcks{at: time.Now()}
+		s.streams[reqID] = st
+	}
+	if st.sealed && !finish {
+		return false
+	}
+	st.sent++
+	if finish {
+		st.sealed = true
+	}
+	if w != nil {
+		w.seq = st.sent
+	}
+	return true
+}
+
+// abortStreamFrameLocked gives back the place reserved for a frame that never
+// reached the socket, so one failed write does not put every later verdict on
+// this req_id out of step. The seal is not given back: a turn whose closing
+// frame failed is over either way, and the caller has already fallen back to a
+// plain message. Caller holds s.mu.
+func (s *wsSender) abortStreamFrameLocked(reqID string) {
+	s.ackMu.Lock()
+	defer s.ackMu.Unlock()
+	if st, ok := s.streams[reqID]; ok && st.sent > 0 {
+		st.sent--
+	}
+}
+
+// pruneStreamsLocked retires turns the protocol has already forgotten. A sealed
+// entry has to outlive its last ack — it is what stops a straggling refresh
+// from reopening a bubble the answer already closed — so age is the only thing
+// that retires it. Caller holds s.ackMu.
+func (s *wsSender) pruneStreamsLocked() {
+	if len(s.streams) < streamAcksMax {
+		return
+	}
+	now := time.Now()
+	for k, st := range s.streams {
+		if now.Sub(st.at) > streamMaxAge {
+			delete(s.streams, k)
+		}
+	}
+	if len(s.streams) >= streamAcksMax {
+		clear(s.streams)
 	}
 }
 
@@ -187,23 +331,23 @@ func (s *wsSender) respondStream(ctx context.Context, reqID, streamID, content s
 		return err
 	}
 
-	ch, ok := s.awaitAck(reqID, finish)
+	w, ok := s.awaitAck(reqID, finish)
 	if !ok {
 		return errStreamBusy
 	}
-	if err := s.write(map[string]any{
+	if err := s.writeStreamFrame(reqID, w, finish, map[string]any{
 		"cmd":     cmdRespondMsg,
 		"headers": frameHeaders{ReqID: reqID},
 		"body":    body,
 	}); err != nil {
-		s.cancelAck(reqID, ch)
+		s.cancelAck(reqID, w)
 		return err
 	}
 
 	timer := time.NewTimer(ackTimeout)
 	defer timer.Stop()
 	select {
-	case res := <-ch:
+	case res := <-w.ch:
 		switch {
 		case res.code == ackSuperseded:
 			return errStreamSuperseded
@@ -212,10 +356,10 @@ func (s *wsSender) respondStream(ctx context.Context, reqID, streamID, content s
 		}
 		return nil
 	case <-timer.C:
-		s.cancelAck(reqID, ch)
+		s.forgetAck(reqID, w)
 		return errStreamAckTimeout
 	case <-ctx.Done():
-		s.cancelAck(reqID, ch)
+		s.cancelAck(reqID, w)
 		return errStreamAckTimeout
 	}
 }
@@ -230,6 +374,34 @@ func (s *wsSender) write(frame map[string]any) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.writeLocked(payload)
+}
+
+// writeStreamFrame is write() for a stream frame: the same serialized push,
+// with the turn's bookkeeping done inside the writer's own critical section so
+// a refresh and the answer cannot interleave. A refresh that arrives after the
+// closing frame is dropped here rather than sent — the bubble is sealed, and a
+// frame the server might still accept would paint "reading config.go" over the
+// answer.
+func (s *wsSender) writeStreamFrame(reqID string, w *ackWaiter, finish bool, frame map[string]any) error {
+	payload, err := json.Marshal(frame)
+	if err != nil {
+		return fmt.Errorf("wecom: marshal frame: %w", err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.beginStreamFrameLocked(reqID, w, finish) {
+		return errStreamSuperseded
+	}
+	if err := s.writeLocked(payload); err != nil {
+		s.abortStreamFrameLocked(reqID)
+		return err
+	}
+	return nil
+}
+
+// writeLocked pushes one already-marshalled frame. Caller holds s.mu.
+func (s *wsSender) writeLocked(payload []byte) error {
 	if err := s.conn.SetWriteDeadline(time.Now().Add(writeDeadline)); err != nil {
 		return err
 	}

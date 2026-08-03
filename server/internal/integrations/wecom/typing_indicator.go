@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/events"
@@ -38,21 +39,24 @@ import (
 // subscriber, neither of which has a caller's context to inherit.
 const streamCloseTimeout = 10 * time.Second
 
-// progressWriteTimeout bounds a mid-run refresh, and it is deliberately much
-// shorter than streamCloseTimeout.
+// progressWriteTimeout and taskLookupTimeout are the whole budget this
+// subscriber may spend on somebody else's goroutine, and they add up on
+// purpose.
 //
 // The bus is synchronous: a task:message subscriber runs on the goroutine that
 // published the event, which is the daemon's own POST
-// /api/daemon/tasks/{id}/messages handler — and that request has a five second
-// client-side deadline of its own. Waiting out the sender's full ack timeout
-// here would stall the transcript the whole workspace is reading in order to
-// paint a spinner in one chat. A refresh that has not been acked by now is not
-// worth another millisecond of somebody else's request.
-const progressWriteTimeout = 2 * time.Second
-
-// taskLookupTimeout bounds the one read that turns a task id into a chat
-// session, on the same borrowed goroutine.
-const taskLookupTimeout = 2 * time.Second
+// /api/daemon/tasks/{id}/messages handler — and the daemon gives that request
+// five seconds before it gives up. It does not retry: a batch that misses the
+// deadline is gone, and with it the transcript every other surface reads. So
+// the ceiling here is not "how long is a refresh worth waiting for" but "how
+// much of the daemon's five seconds may a spinner in one chat borrow". Both
+// numbers together are 1.8s, which leaves the request its own work with room
+// to spare, and a refresh that has not been acked inside a second is one the
+// user would not have seen anyway — the next tool call is 500ms behind it.
+const (
+	progressWriteTimeout = 1 * time.Second
+	taskLookupTimeout    = 800 * time.Millisecond
+)
 
 // taskLookup is the one query the progress refresh needs. task:progress
 // carries a task id and no chat session, so the session the bubble is keyed on
@@ -248,9 +252,16 @@ func (m *TypingIndicatorManager) UpdateProgress(ctx context.Context, sessionID p
 // says now. A refresh yields when the previous frame has not been acked (the
 // backpressure the official SDK calls replyStreamNonBlocking) because progress
 // is worth less than the answer behind it, and it yields again to the feed's
-// own minimum interval, which folds a burst of tool calls into one frame. And
-// nothing here can close the bubble: a refresh that fails leaves the spinner
-// exactly as it was, for the answer or the guard to finish properly.
+// own minimum interval, which folds a burst of tool calls into one frame. And a
+// refresh that merely fails leaves the spinner exactly as it was, for the
+// answer or the guard to finish properly.
+//
+// The one thing a refresh does end is a bubble the server has disowned. 846608
+// and 846605 mean this stream will never take another frame, so keeping the
+// handle would buy a refusal every 1.5s for the rest of the run and then spend
+// the answer's own ack timeout learning the same thing. Letting the handle go
+// costs nothing that was still available: the answer arrives as a plain
+// message, which is exactly where it was heading anyway.
 func (m *TypingIndicatorManager) recordStep(ctx context.Context, sessionID pgtype.UUID, step progressStep) {
 	if m.senders == nil || m.streams == nil || !sessionID.Valid {
 		return
@@ -266,10 +277,17 @@ func (m *TypingIndicatorManager) recordStep(ctx context.Context, sessionID pgtyp
 		// socket on frames nobody can read that fast.
 		return
 	}
-	if err := m.senders.stream(ctx, h, content, false); err != nil {
-		if errors.Is(err, errStreamBusy) {
-			return // the previous frame is still in flight; skipping is the design
-		}
+	err := m.senders.stream(ctx, h, content, false)
+	switch {
+	case err == nil:
+	case errors.Is(err, errStreamBusy), errors.Is(err, errStreamSuperseded):
+		// The previous frame is still in flight, or the answer got there
+		// first. Skipping is the design in both cases.
+	case streamUnusable(err):
+		m.streams.drop(sessionID)
+		m.log.DebugContext(ctx, "wecom typing: bubble disowned by the server, answering as a new message",
+			"chat_session_id", util.UUIDToString(sessionID), "error", err)
+	default:
 		m.log.DebugContext(ctx, "wecom typing: progress refresh failed",
 			"chat_session_id", util.UUIDToString(sessionID), "error", err)
 	}
@@ -335,8 +353,16 @@ func (m *TypingIndicatorManager) refreshFromTask(e events.Event, step progressSt
 			ctx, cancel := context.WithTimeout(context.Background(), taskLookupTimeout)
 			task, err := m.tasks.GetAgentTask(ctx, id)
 			cancel()
-			if err != nil {
-				return // a task that has since gone; not cached, it may come back
+			switch {
+			case errors.Is(err, pgx.ErrNoRows):
+				// A row that is not there has no chat session and never will —
+				// a run cancelled and deleted while its transcript was still
+				// flushing. Remembering that is what stops its remaining
+				// messages from putting a read behind every one.
+				m.taskSessions.put(taskID, pgtype.UUID{})
+				return
+			case err != nil:
+				return // a read that failed; not cached, the next one may work
 			}
 			sessionID = task.ChatSessionID
 			m.taskSessions.put(taskID, sessionID)
