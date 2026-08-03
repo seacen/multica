@@ -492,11 +492,13 @@ func waitForStreamFrames(t *testing.T, c *recordingConn, n int) {
 	t.Fatalf("only %d stream frames were written, want %d", len(framesOf(c, cmdRespondMsg)), n)
 }
 
-// TestABubbleTheServerDisownsIsLetGo — 846608 means this stream will never take
-// another frame. Holding the handle would buy a refusal every 1.5s for the rest
-// of the run and then spend the answer's own ack timeout learning the same
-// thing.
-func TestABubbleTheServerDisownsIsLetGo(t *testing.T) {
+// TestARefreshStopsAtABubbleTheServerDisowns — 846608 means this stream will
+// never take another frame. Trying anyway would buy a refusal every 1.5s for
+// the rest of the run and then spend the answer's own ack timeout learning the
+// same thing, so the refresh path stops seeing a bubble here — while the handle
+// itself stays, which is what the round's ending is addressed with
+// (stream_disown_test.go).
+func TestARefreshStopsAtABubbleTheServerDisowns(t *testing.T) {
 	rig := newStreamRig(t)
 	rig.ingest(t, "REQ-42")
 	rig.conn.rejectWith(errcodeStreamExpired, "stream expired")
@@ -504,12 +506,10 @@ func TestABubbleTheServerDisownsIsLetGo(t *testing.T) {
 	rig.typing.UpdateProgress(context.Background(), rig.session, "正在查日历")
 
 	if _, ok := rig.streams.peek(rig.session); ok {
-		t.Error("kept a handle the server has disowned")
+		t.Error("the refresh path still sees a bubble the server has disowned")
 	}
-	out := NewOutbound(boundQueries(rig.inst.ID), rig.senders, rig.streams, testLogger())
-	out.handleEvent(chatDoneEvent(rig.session, "答案是 42"))
-	if got := contentsOf(&rig.conn.recordingConn); len(got) != 2 || got[1] != "答案是 42" {
-		t.Errorf("plain messages = %v, want the notice and then the answer", got)
+	if depth := rig.streams.depth(); depth != 1 {
+		t.Errorf("store depth %d; the handle went with the bubble and the ending has no address", depth)
 	}
 }
 

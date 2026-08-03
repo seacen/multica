@@ -110,8 +110,14 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 		if !hasVisibleChar(text) {
 			text = copyFor(handle.Locale).StreamNoReply
 		}
-		if err := o.finishStream(ctx, handle, text); err == nil {
-			return nil
+		// A bubble the server disowned mid-run is not tried again: the typing
+		// indicator has already been told this stream takes no frame, and has
+		// already told the user the answer would arrive as a new message. This
+		// is that message.
+		if !handle.Unusable {
+			if err := o.finishStream(ctx, handle, text); err == nil {
+				return nil
+			}
 		}
 		// The frame was refused. Say it as a new message instead — and never
 		// queue the stream frame itself, whose req_id will have expired long

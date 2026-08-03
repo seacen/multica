@@ -84,6 +84,14 @@ type streamHandle struct {
 	// task id and nothing about a person.
 	Level progressLevel
 
+	// Unusable says the server has disowned this stream (846608 / 846605): the
+	// bubble it painted is on the user's screen and no frame will ever touch it
+	// again, so what is left of the handle is the addressing. A caller that
+	// gets one writes its words as a plain message instead of a frame. Set by
+	// the store on the way out of take; a caller of claim always leaves it
+	// false.
+	Unusable bool
+
 	CreatedAt time.Time
 }
 
@@ -107,6 +115,12 @@ type streamEntry struct {
 	// same session and would be painted into the new bubble as if they were
 	// what is happening now.
 	taskID string
+
+	// unusable is the server's verdict that this stream is finished with, kept
+	// rather than acted on by forgetting the entry. The bubble is over either
+	// way; the round is not, and the handle is the only address the round's
+	// ending has.
+	unusable bool
 }
 
 // streamStore maps chat_session_id to the open bubble for that session.
@@ -166,9 +180,14 @@ func (s *streamStore) arm(sessionID pgtype.UUID, streamID string, t *time.Timer)
 	s.mu.Unlock()
 }
 
-// take removes a session's handle and hands it over. A handle past maxAge is
-// dropped and reported as absent: the server would refuse the frame, and a
-// caller that believed it had a bubble would leave the user with nothing.
+// take removes a session's handle and hands it over — the ending of a round,
+// whichever ending it is. A handle past maxAge is dropped and reported as
+// absent: the server would refuse the frame, and a caller that believed it had
+// a bubble would leave the user with nothing.
+//
+// A disowned handle IS handed over, with Unusable set. Its bubble cannot be
+// sealed, but the round still has to end in words, and the addressing captured
+// at ingest is what puts them in the right chat.
 func (s *streamStore) take(sessionID pgtype.UUID) (streamHandle, bool) {
 	key := util.UUIDToString(sessionID)
 
@@ -185,12 +204,14 @@ func (s *streamStore) take(sessionID pgtype.UUID) (streamHandle, bool) {
 	if s.expiredLocked(entry.handle) {
 		return streamHandle{}, false
 	}
+	entry.handle.Unusable = entry.unusable
 	return entry.handle, true
 }
 
 // peek reads a session's handle without consuming it — the progress-refresh
 // path, which expects to write to the same bubble again. An expired handle is
-// evicted here too.
+// evicted here too, and a disowned one is reported as absent: the question peek
+// answers is "is there a bubble I can write to", and there is not.
 func (s *streamStore) peek(sessionID pgtype.UUID) (streamHandle, bool) {
 	key := util.UUIDToString(sessionID)
 
@@ -207,13 +228,16 @@ func (s *streamStore) peek(sessionID pgtype.UUID) (streamHandle, bool) {
 		}
 		return streamHandle{}, false
 	}
+	if entry.unusable {
+		return streamHandle{}, false
+	}
 	return entry.handle, true
 }
 
 // feedFor returns a session's open bubble and the list of steps shown inside
-// it, creating the list on first use. Like peek it leaves the handle in place
-// and disowns an expired one: a run whose window has closed gets no more
-// refreshes, and its list goes with it.
+// it, creating the list on first use. Like peek it leaves the handle in place,
+// evicts an expired one and refuses a disowned one: a run whose window has
+// closed gets no more refreshes, and its list goes with it.
 //
 // taskID says which run is asking. The first run to speak adopts the bubble and
 // every other one is refused, which is what keeps the previous turn's trailing
@@ -236,6 +260,9 @@ func (s *streamStore) feedFor(sessionID pgtype.UUID, taskID string) (streamHandl
 		}
 		return streamHandle{}, nil, false
 	}
+	if entry.unusable {
+		return streamHandle{}, nil, false
+	}
 	if taskID != "" && entry.taskID != "" && entry.taskID != taskID {
 		return streamHandle{}, nil, false
 	}
@@ -254,8 +281,35 @@ func (s *streamStore) feedFor(sessionID pgtype.UUID, taskID string) (streamHandl
 	return entry.handle, entry.feed, true
 }
 
+// markUnusable records the server's verdict that a session's stream will take
+// no further frame, and reports whether this call is the one that recorded it.
+// Only that caller says so to the user; a second refresh that raced into the
+// same refusal has nothing to add.
+//
+// What it deliberately does not do is forget the entry. The bubble is over —
+// peek and feedFor refuse it from here, so no later refresh buys another
+// refusal — but the round is not, and the entry is what the round's ending is
+// addressed with. Forgetting it, which is what this path used to do, also
+// stopped the guard, and left the run's failure with nowhere to be said: a dead
+// spinner, and a promise of a new message that never arrived.
+func (s *streamStore) markUnusable(sessionID pgtype.UUID) bool {
+	key := util.UUIDToString(sessionID)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.byKey[key]
+	if !ok || entry.unusable {
+		return false
+	}
+	entry.unusable = true
+	s.byKey[key] = entry
+	return true
+}
+
 // drop forgets a session's handle without sending anything — used when the
 // opening frame was refused and the bubble the handle describes never existed.
+// A bubble the user can see is never dropped: it is marked (markUnusable) so
+// whatever ends the round still knows where to say so.
 func (s *streamStore) drop(sessionID pgtype.UUID) {
 	key := util.UUIDToString(sessionID)
 

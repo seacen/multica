@@ -373,11 +373,11 @@ func (m *TypingIndicatorManager) UpdateProgress(ctx context.Context, sessionID p
 // answer or the guard to finish properly.
 //
 // The one thing a refresh does end is a bubble the server has disowned. 846608
-// and 846605 mean this stream will never take another frame, so keeping the
-// handle would buy a refusal every 1.5s for the rest of the run and then spend
-// the answer's own ack timeout learning the same thing. Letting the handle go
-// costs nothing that was still available: the answer arrives as a plain
-// message, which is exactly where it was heading anyway.
+// and 846605 mean this stream will never take another frame, so the bubble is
+// marked and no refresh attempts one again — otherwise it would buy a refusal
+// every 1.5s for the rest of the run and then spend the answer's own ack
+// timeout learning the same thing. The handle itself stays: the round is still
+// running, and the handle is the only address its ending has.
 func (m *TypingIndicatorManager) recordStep(ctx context.Context, sessionID pgtype.UUID, taskID string, step progressStep) {
 	if m.senders == nil || m.streams == nil || !sessionID.Valid {
 		return
@@ -410,15 +410,18 @@ func (m *TypingIndicatorManager) recordStep(ctx context.Context, sessionID pgtyp
 		// The previous frame is still in flight, or the answer got there
 		// first. Skipping is the design in both cases.
 	case streamUnusable(err):
-		m.streams.drop(sessionID)
+		if !m.streams.markUnusable(sessionID) {
+			// A refresh that raced into the same refusal got here first and has
+			// already said it.
+			return
+		}
 		m.log.WarnContext(ctx, "wecom typing: bubble disowned by the server, answering as a new message",
 			"chat_session_id", util.UUIDToString(sessionID),
 			"installation_id", util.UUIDToString(h.InstallationID), "error", err)
 		// Nothing can close this bubble now — the stream takes no further
-		// frame, and letting the handle go stops the guard that would have.
-		// So the spinner turns for good, and the user is owed a word about
-		// where the rest of the round is going to appear instead. Said once:
-		// the handle is gone, so no later step reaches this branch again.
+		// frame — so the spinner turns for good and the user is owed a word
+		// about where the rest of the round is going to appear instead. Said
+		// once: the mark is what makes this the only refresh that gets here.
 		if sendErr := m.senders.send(h.InstallationID, pendingSend{
 			ChatID:   h.ChatID,
 			ChatType: h.ChatType,
@@ -586,6 +589,10 @@ func (m *TypingIndicatorManager) armGuard(sessionID pgtype.UUID, h streamHandle)
 // the user with a spinner and no explanation that would ever arrive. The
 // addressing comes off the handle, captured at ingest, because by now the
 // binding row may point at a different chat.
+//
+// A handle the server has already disowned skips straight to that fallback.
+// There is no bubble left to seal, and the frame would cost a round trip to be
+// told so a second time.
 func (m *TypingIndicatorManager) closeBubble(ctx context.Context, sessionID pgtype.UUID, pick func(copyPack) string, why string) {
 	if m.senders == nil || m.streams == nil || !sessionID.Valid {
 		return
@@ -595,13 +602,18 @@ func (m *TypingIndicatorManager) closeBubble(ctx context.Context, sessionID pgty
 		return
 	}
 	text := pick(copyFor(h.Locale))
-	err := m.senders.stream(ctx, h, text, true)
-	if err == nil {
-		return
+	if h.Unusable {
+		m.log.DebugContext(ctx, "wecom typing: bubble already disowned, saying it as a new message",
+			"chat_session_id", util.UUIDToString(sessionID), "reason", why)
+	} else {
+		err := m.senders.stream(ctx, h, text, true)
+		if err == nil {
+			return
+		}
+		m.log.WarnContext(ctx, "wecom typing: closing frame failed, saying it as a new message",
+			"chat_session_id", util.UUIDToString(sessionID),
+			"reason", why, "unusable", streamUnusable(err), "error", err)
 	}
-	m.log.WarnContext(ctx, "wecom typing: closing frame failed, saying it as a new message",
-		"chat_session_id", util.UUIDToString(sessionID),
-		"reason", why, "unusable", streamUnusable(err), "error", err)
 	if sendErr := m.senders.send(h.InstallationID, pendingSend{
 		ChatID:   h.ChatID,
 		ChatType: h.ChatType,
