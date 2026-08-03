@@ -95,6 +95,13 @@ type copyPack struct {
 	StreamFailed       string
 	StreamStillWorking string
 
+	// StreamStuck is the odd one out: it does not close a bubble, it explains
+	// one that can no longer be closed. When the server disowns a stream
+	// mid-run (846608, 846605) the spinner is left turning on the user's screen
+	// with nothing able to touch it, so this says so and says where the rest of
+	// the round will turn up instead.
+	StreamStuck string
+
 	// StreamProgressPrefix heads the mid-run list of steps.
 	StreamProgressPrefix string
 
@@ -202,6 +209,7 @@ var copyPacks = map[Locale]copyPack{
 		StreamNotStarted:     "已收到，但这条暂时没能开始处理。",
 		StreamFailed:         "⚠️ 这次没跑通，请稍后再试一次。",
 		StreamStillWorking:   "还在处理，完成后我再单独回复你。",
+		StreamStuck:          "⚠️ 上面那条进度不会再更新了，这轮的结果我用新消息发你。",
 		StreamProgressPrefix: "正在处理：",
 		Progress: progressCopy{
 			Read:         "正在读取 %s",
@@ -250,6 +258,7 @@ var copyPacks = map[Locale]copyPack{
 		StreamNotStarted:     "Got it, but this one couldn't start processing.",
 		StreamFailed:         "⚠️ That run didn't go through. Please try again.",
 		StreamStillWorking:   "Still working on it — I'll reply separately when it's done.",
+		StreamStuck:          "⚠️ The status above won't update any further. I'll send this round's result as a new message.",
 		StreamProgressPrefix: "Working on it: ",
 		Progress: progressCopy{
 			Read:         "Reading %s",

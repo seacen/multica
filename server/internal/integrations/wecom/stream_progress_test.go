@@ -511,8 +511,41 @@ func TestABubbleTheServerDisownsIsLetGo(t *testing.T) {
 	}
 	out := NewOutbound(boundQueries(rig.inst.ID), rig.senders, rig.streams, testLogger())
 	out.handleEvent(chatDoneEvent(rig.session, "答案是 42"))
-	if got := len(framesOf(&rig.conn.recordingConn, cmdSendMsg)); got != 1 {
-		t.Errorf("sent %d plain messages; the answer had nowhere else to go", got)
+	if got := contentsOf(&rig.conn.recordingConn); len(got) != 2 || got[1] != "答案是 42" {
+		t.Errorf("plain messages = %v, want the notice and then the answer", got)
+	}
+}
+
+// TestADisownedBubbleIsExplained — 846608 leaves a spinner nothing can stop:
+// the stream will take no further frame, and letting the handle go stops the
+// guard that would otherwise have closed it. Silence on top of that is a
+// loading animation that runs forever with no account of itself anywhere.
+func TestADisownedBubbleIsExplained(t *testing.T) {
+	rig := newStreamRig(t)
+	rig.ingest(t, "REQ-42")
+	rig.conn.rejectWith(errcodeStreamExpired, "stream expired")
+
+	rig.typing.UpdateProgress(context.Background(), rig.session, "正在查日历")
+
+	got := contentsOf(&rig.conn.recordingConn)
+	if len(got) != 1 || got[0] != copyPacks[LocaleZhHans].StreamStuck {
+		t.Fatalf("the user was told %v about a spinner that will never stop", got)
+	}
+}
+
+// TestTheExplanationIsSaidOnce — the handle goes with it, so a run with fifty
+// tool calls left must not narrate the same bad news fifty times.
+func TestTheExplanationIsSaidOnce(t *testing.T) {
+	rig := newStreamRig(t)
+	rig.ingest(t, "REQ-42")
+	rig.conn.rejectWith(errcodeStreamExpired, "stream expired")
+
+	for i := 0; i < 5; i++ {
+		rig.typing.UpdateProgress(context.Background(), rig.session, "正在查日历")
+	}
+
+	if got := contentsOf(&rig.conn.recordingConn); len(got) != 1 {
+		t.Fatalf("said it %d times: %v", len(got), got)
 	}
 }
 

@@ -327,8 +327,22 @@ func (m *TypingIndicatorManager) recordStep(ctx context.Context, sessionID pgtyp
 		// first. Skipping is the design in both cases.
 	case streamUnusable(err):
 		m.streams.drop(sessionID)
-		m.log.DebugContext(ctx, "wecom typing: bubble disowned by the server, answering as a new message",
-			"chat_session_id", util.UUIDToString(sessionID), "error", err)
+		m.log.WarnContext(ctx, "wecom typing: bubble disowned by the server, answering as a new message",
+			"chat_session_id", util.UUIDToString(sessionID),
+			"installation_id", util.UUIDToString(h.InstallationID), "error", err)
+		// Nothing can close this bubble now — the stream takes no further
+		// frame, and letting the handle go stops the guard that would have.
+		// So the spinner turns for good, and the user is owed a word about
+		// where the rest of the round is going to appear instead. Said once:
+		// the handle is gone, so no later step reaches this branch again.
+		if sendErr := m.senders.send(h.InstallationID, pendingSend{
+			ChatID:   h.ChatID,
+			ChatType: h.ChatType,
+			Content:  copyFor(h.Locale).StreamStuck,
+		}); sendErr != nil {
+			m.log.WarnContext(ctx, "wecom typing: could not say the bubble is stuck",
+				"chat_session_id", util.UUIDToString(sessionID), "error", sendErr)
+		}
 	default:
 		m.log.DebugContext(ctx, "wecom typing: progress refresh failed",
 			"chat_session_id", util.UUIDToString(sessionID), "error", err)
