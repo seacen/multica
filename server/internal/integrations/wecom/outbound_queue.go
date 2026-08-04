@@ -61,6 +61,15 @@ type outboundQueue struct {
 	mu   sync.Mutex
 	byID map[string][]pendingSend
 
+	// draining counts the messages that have left the slice but have not yet
+	// reached the socket. The drain pops first and writes afterwards, and in
+	// between the message is in neither place — so a fresh reply arriving in
+	// that window saw an empty queue, went straight out, and landed AHEAD of
+	// the answer that had been waiting for the socket since before it existed.
+	// The conversation read backwards, which is the one thing the queue is
+	// there to prevent. Counting the in-flight message keeps depth honest.
+	draining map[string]int
+
 	max int
 	ttl time.Duration
 	now func() time.Time
@@ -72,11 +81,12 @@ func newOutboundQueue(log *slog.Logger) *outboundQueue {
 		log = slog.Default()
 	}
 	return &outboundQueue{
-		byID: make(map[string][]pendingSend),
-		max:  maxPendingPerInstallation,
-		ttl:  pendingTTL,
-		now:  time.Now,
-		log:  log,
+		byID:     make(map[string][]pendingSend),
+		draining: make(map[string]int),
+		max:      maxPendingPerInstallation,
+		ttl:      pendingTTL,
+		now:      time.Now,
+		log:      log,
 	}
 }
 
@@ -144,11 +154,32 @@ func (q *outboundQueue) pushFront(id pgtype.UUID, msg pendingSend) {
 	q.byID[key] = pending
 }
 
-// depth reports how many messages are held for an installation.
+// depth reports how many messages are ahead of a new one: those still in the
+// queue plus the one being written right now.
 func (q *outboundQueue) depth(id pgtype.UUID) int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return len(q.byID[util.UUIDToString(id)])
+	key := util.UUIDToString(id)
+	return len(q.byID[key]) + q.draining[key]
+}
+
+// beginDrain claims a popped message as in-flight; endDrain releases it once
+// it has reached the socket or been put back.
+func (q *outboundQueue) beginDrain(id pgtype.UUID) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.draining[util.UUIDToString(id)]++
+}
+
+func (q *outboundQueue) endDrain(id pgtype.UUID) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	key := util.UUIDToString(id)
+	if q.draining[key] > 1 {
+		q.draining[key]--
+		return
+	}
+	delete(q.draining, key)
 }
 
 // store writes back a slice, dropping the map entry when empty so an

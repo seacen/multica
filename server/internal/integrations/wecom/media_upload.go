@@ -290,6 +290,18 @@ func (s *wsSender) sendMedia(ctx context.Context, chatID string, chatType int, r
 			"route", "aibot_send_msg", "media_id", m.MediaID, "msgtype", string(m.Kind))
 		return nil
 	}
+	// A verdict that never came is not a refusal. The frame went out, and the
+	// read loop can simply have been busy — it dispatches inbound messages
+	// synchronously, and one of those can sit on the database for longer than
+	// this wait. Falling back on that would send the SAME media_id a second
+	// time, and the person sees the picture twice with nothing to undo. So a
+	// timeout is reported as-is: it may already have arrived, and a duplicate
+	// is worse than a "did it land?" in the log.
+	if errors.Is(pushErr, errUploadAckTimeout) {
+		s.log.Warn("wecom: media push not acknowledged in time; not resending",
+			"media_id", m.MediaID, "msgtype", string(m.Kind))
+		return pushErr
+	}
 	if reqID == "" {
 		return pushErr
 	}

@@ -240,9 +240,48 @@ type endedRound struct {
 	// oldest first, each holding its run id — empty when the guard fired
 	// before the run had a name. A round's own ending settles its own entry;
 	// another round's cannot.
-	owed   []string
-	taskID string
+	owed []string
+	// fenced lists every run whose own bubble is already over, so none of them
+	// may adopt a bubble opened later. A single slot could not do it: it held
+	// whichever run ended LAST, and a slow first question's trailing steps
+	// then walked straight past it into the third question's bubble — where
+	// they were painted as that question's progress, its own run was locked
+	// out of its own bubble, its answer arrived as a loose message, and five
+	// minutes later the bubble promised a reply that had already come.
+	fenced []string
 }
+
+// isFenced reports whether this run's own bubble is already over.
+func (e endedRound) isFenced(taskID string) bool {
+	if taskID == "" {
+		return false
+	}
+	for _, id := range e.fenced {
+		if id == taskID {
+			return true
+		}
+	}
+	return false
+}
+
+// fence adds a run to the list, keeping it bounded: a session that runs for
+// days should not accumulate ids forever, and a run old enough to have fallen
+// off cannot still be publishing.
+func (e endedRound) fence(taskID string) []string {
+	if taskID == "" || e.isFenced(taskID) {
+		return e.fenced
+	}
+	next := append(e.fenced, taskID)
+	if len(next) > maxFencedRuns {
+		next = next[len(next)-maxFencedRuns:]
+	}
+	return next
+}
+
+// maxFencedRuns bounds the fence list. Ten rounds back is far more than a run
+// can outlive — the platform stops accepting frames for a bubble after six
+// minutes, and rounds serialize per session.
+const maxFencedRuns = 10
 
 // isOwed reports whether anything is still promised.
 func (e endedRound) isOwed() bool { return len(e.owed) > 0 }
@@ -327,6 +366,11 @@ func newStreamStore() *streamStore {
 // the typing indicator (writer) and the chat-done subscriber (reader).
 func NewStreamStore() *streamStore { return newStreamStore() }
 
+// clock reads the store's own time source, so callers that need to stamp a
+// moment (a message's arrival, before any of the work that delays it) use the
+// same clock the store compares against — including the fake one tests drive.
+func (s *streamStore) clock() time.Time { return s.now() }
+
 // open registers a message against a session and says whether it starts a
 // bubble of its own. Inside the debounce window of the newest open round it
 // joins that round — the engine's batcher is about to fold the two messages
@@ -341,17 +385,22 @@ func (s *streamStore) open(sessionID pgtype.UUID, h streamHandle) openVerdict {
 	defer s.mu.Unlock()
 	s.sweepLocked()
 
+	// Both sides of this comparison are ARRIVAL times, not "when the code got
+	// here" times: the caller stamps CreatedAt before the lookups that delay
+	// it, so a slow database moves neither. Measuring with now() here is what
+	// let this disagree with the engine's debouncer, which has always judged
+	// the same gap from arrival.
+	if h.CreatedAt.IsZero() {
+		h.CreatedAt = s.now()
+	}
 	rounds := s.sessions[key]
 	if n := len(rounds); n > 0 {
 		newest := rounds[n-1]
-		if s.now().Sub(newest.lastIngest) < sameRoundWindow {
-			newest.lastIngest = s.now()
+		if h.CreatedAt.Sub(newest.lastIngest) < sameRoundWindow {
+			newest.lastIngest = h.CreatedAt
 			return roundJoined
 		}
 		h.QueuedBehind = true
-	}
-	if h.CreatedAt.IsZero() {
-		h.CreatedAt = s.now()
 	}
 	s.sessions[key] = append(rounds, &roundEntry{handle: h, lastIngest: h.CreatedAt})
 	return roundOpened
@@ -414,6 +463,10 @@ func (s *streamStore) takeTask(sessionID pgtype.UUID, taskID string, ending roun
 	key := util.UUIDToString(sessionID)
 	rounds := s.sessions[key]
 	if len(rounds) == 0 {
+		// Settle before leaving: a debt from a guard close that emptied the
+		// session is this run's, and left standing it is paid by the next
+		// question — which then loses its first step, or its answer.
+		s.settleUnadoptedDebtLocked(key, taskID)
 		return streamHandle{}, false
 	}
 	if taskID == "" {
@@ -433,7 +486,7 @@ func (s *streamStore) takeTask(sessionID pgtype.UUID, taskID string, ending roun
 		// serialization makes the first unseen run to end the dead round's.
 		// Either way the caller's plain-message path delivers the words to the
 		// right chat, and the queued round keeps its bubble for its own run.
-		if note, has := s.ended[key]; has && note.taskID != "" && note.taskID == taskID {
+		if note, has := s.ended[key]; has && note.isFenced(taskID) {
 			return streamHandle{}, false
 		}
 		if s.settleUnadoptedDebtLocked(key, taskID) {
@@ -462,8 +515,8 @@ func (s *streamStore) settleUnadoptedDebtLocked(key, taskID string) bool {
 	if s.unadoptedDebt[key] == 0 {
 		delete(s.unadoptedDebt, key)
 	}
-	if note, has := s.ended[key]; has && note.taskID == "" {
-		note.taskID = taskID
+	if note, has := s.ended[key]; has {
+		note.fenced = note.fence(taskID)
 		s.ended[key] = note
 	}
 	return true
@@ -550,14 +603,12 @@ func (s *streamStore) remember(sessionID pgtype.UUID, addr roundAddress, ending 
 // the old overwrite behaviour rather than contradict an answer the user is
 // already reading.
 func (s *streamStore) rememberLocked(key string, addr roundAddress, ending roundEnding, taskID string) {
-	next := endedRound{addr: addr, at: s.now(), taskID: taskID}
+	next := endedRound{addr: addr, at: s.now()}
 	if prev, ok := s.ended[key]; ok {
 		next.owed = prev.owed
-		if taskID == "" {
-			// An ending that names no run leaves the adoption fence alone:
-			// the run it was fencing off is still publishing.
-			next.taskID = prev.taskID
-		}
+		next.fenced = prev.fence(taskID)
+	} else if taskID != "" {
+		next.fenced = []string{taskID}
 	}
 	switch ending {
 	case roundContinues:
@@ -659,13 +710,18 @@ func (s *streamStore) feedFor(sessionID pgtype.UUID, taskID string) (streamHandl
 	defer s.mu.Unlock()
 	entry, ok := s.headLocked(key)
 	if !ok || entry.unusable {
+		// Settle first: a debt left by a guard close that emptied the session
+		// belongs to THIS run, and if it is not cleared here it is paid by
+		// whoever asks next — swallowing that question's first step, or its
+		// answer, and fencing its run out of its own bubble for good.
+		s.settleUnadoptedDebtLocked(key, taskID)
 		return streamHandle{}, nil, false
 	}
 	if taskID != "" && entry.taskID != "" && entry.taskID != taskID {
 		return streamHandle{}, nil, false
 	}
 	if taskID != "" && entry.taskID == "" {
-		if note, has := s.ended[key]; has && note.taskID != "" && note.taskID == taskID {
+		if note, has := s.ended[key]; has && note.isFenced(taskID) {
 			// This run's own bubble is already over; it may not have this one.
 			return streamHandle{}, nil, false
 		}

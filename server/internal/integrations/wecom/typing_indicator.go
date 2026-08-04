@@ -190,6 +190,15 @@ func (m *TypingIndicatorManager) OnIngested(ctx context.Context, inst engine.Res
 	if msg.SkipAgentRun {
 		return
 	}
+	// Stamp the arrival now, before the lookups below. Whether two messages
+	// belong to one round is a question about when they were SENT, and the
+	// engine's debouncer answers it from arrival. Reading the clock after
+	// three database round trips answers a different question — one that a
+	// loaded pool can move by seconds — so the two disagreed: a message the
+	// debouncer gave its own run could be folded into the previous round
+	// here, leaving it with no bubble and no receipt, or the reverse, leaving
+	// one run with two spinners.
+	arrivedAt := m.streams.clock()
 	wm, err := wecomMsgFromRaw(msg)
 	if err != nil {
 		m.log.WarnContext(ctx, "wecom typing: cannot read the inbound envelope",
@@ -218,6 +227,7 @@ func (m *TypingIndicatorManager) OnIngested(ctx context.Context, inst engine.Res
 		ChatType:       aibotChatTypeFromChannel(msg.Source.ChatType),
 		Locale:         localeFor(ctx, m.languages, inst.ID, aibotChatTypeFromChannel(msg.Source.ChatType), msg.Source.SenderID),
 		Level:          m.levelFor(ctx, inst, msg),
+		CreatedAt:      arrivedAt,
 	}
 	if m.streams.open(sessionID, h) == roundJoined {
 		// Inside the debounce window: the batcher is about to fold this

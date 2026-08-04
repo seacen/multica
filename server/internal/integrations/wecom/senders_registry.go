@@ -173,8 +173,16 @@ func (r *sendersRegistry) flushPending(id pgtype.UUID) {
 		if !ok {
 			return
 		}
-		if err := sender.sendText(msg.ChatID, msg.ChatType, msg.Content); err != nil {
+		// Held from the pop until the write is done, so a reply produced
+		// meanwhile still sees somebody ahead of it and joins the queue
+		// instead of overtaking.
+		r.pending.beginDrain(id)
+		err := sender.sendText(msg.ChatID, msg.ChatType, msg.Content)
+		if err != nil {
 			r.pending.pushFront(id, msg)
+		}
+		r.pending.endDrain(id)
+		if err != nil {
 			r.log.Warn("wecom outbound: resend failed, keeping the rest queued",
 				"installation_id", util.UUIDToString(id), "error", err,
 				"depth", r.pending.depth(id))

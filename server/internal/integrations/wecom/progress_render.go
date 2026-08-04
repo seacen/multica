@@ -776,8 +776,20 @@ func newProgressFeed(now func() time.Time) *progressFeed {
 // openedAt is when the user asked, which is what the elapsed clock counts
 // from — not when the first step happened.
 func (f *progressFeed) record(step progressStep, c copyPack, openedAt time.Time, level progressLevel) string {
-	text := strings.TrimSpace(step.line(c, level))
-	if text == "" {
+	// Reasoning keeps its own edges; everything else is trimmed. A reasoning
+	// increment is cut wherever the 500ms flush happened to fall, so its
+	// leading and trailing spaces are load-bearing: they are the spaces
+	// between words. Trimming each piece before joining them welds the last
+	// word of one to the first word of the next ("先看 handler" + "再看 router"
+	// becomes "先看 handler再看 router"), and eats the blank line a provider
+	// puts in front of a new reasoning block to keep it apart from the last
+	// one. safeThinking already says it does not trim, for exactly this
+	// reason; this is the caller that was undoing it.
+	text := step.line(c, level)
+	if step.kind != progressThinking {
+		text = strings.TrimSpace(text)
+	}
+	if strings.TrimSpace(text) == "" {
 		return ""
 	}
 
