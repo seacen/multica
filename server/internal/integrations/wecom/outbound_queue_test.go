@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/events"
@@ -241,6 +242,16 @@ func (f *fakeOutboundQueries) FindChannelBindingForMember(context.Context, db.Fi
 
 func (f *fakeOutboundQueries) GetWorkspace(context.Context, pgtype.UUID) (db.Workspace, error) {
 	return f.workspace, f.workspaceEr
+}
+
+// The two language.go reads. The zero values mean "no binding, no profile",
+// which resolves to DefaultLocale — the language tests use their own fakes.
+func (f *fakeOutboundQueries) GetChannelUserBindingByUserID(context.Context, db.GetChannelUserBindingByUserIDParams) (db.ChannelUserBinding, error) {
+	return db.ChannelUserBinding{}, pgx.ErrNoRows
+}
+
+func (f *fakeOutboundQueries) GetUser(context.Context, pgtype.UUID) (db.User, error) {
+	return db.User{}, pgx.ErrNoRows
 }
 
 func (f *fakeOutboundQueries) ListAttachmentsByChatMessage(context.Context, db.ListAttachmentsByChatMessageParams) ([]db.Attachment, error) {

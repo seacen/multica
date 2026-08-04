@@ -155,14 +155,14 @@ func mediaInstallation() engine.ResolvedInstallation {
 		WorkspaceID: uuidOf(2),
 		AgentID:     uuidOf(3),
 		Active:      true,
-		Platform:    Installation{ID: uuidOf(1), BotID: "wb-1", Locale: "en"},
+		Platform:    Installation{ID: uuidOf(1), BotID: "wb-1"},
 	}
 }
 
 // ---- HasMedia ----
 
 func TestHasMediaLooksOnlyAtWhatIsAlreadyInHand(t *testing.T) {
-	r := NewMediaResolver(&fakeMediaStorage{}, newFakeMediaLedger(nil), nil, testLogger())
+	r := NewMediaResolver(&fakeMediaStorage{}, newFakeMediaLedger(nil), nil, nil, testLogger())
 	cases := []struct {
 		name    string
 		msgType string
@@ -192,7 +192,7 @@ func TestHasMediaLooksOnlyAtWhatIsAlreadyInHand(t *testing.T) {
 }
 
 func TestHasMediaSaysNoWhenThereIsNoUrlToFetch(t *testing.T) {
-	r := NewMediaResolver(&fakeMediaStorage{}, newFakeMediaLedger(nil), nil, testLogger())
+	r := NewMediaResolver(&fakeMediaStorage{}, newFakeMediaLedger(nil), nil, nil, testLogger())
 	// A body with an aeskey and no url is not something we can download; it
 	// must not buy the message a media deadline and a deferred agent run.
 	mc := aibotMsgCallback{MsgType: "image"}
@@ -214,7 +214,7 @@ func TestResolveMediaStoresTheDecryptedFile(t *testing.T) {
 
 	storage := &fakeMediaStorage{}
 	ledger := newFakeMediaLedger(storage)
-	r := NewMediaResolver(storage, ledger, nil, testLogger())
+	r := NewMediaResolver(storage, ledger, nil, nil, testLogger())
 
 	msg := mediaMessage(t, "image", map[string]any{
 		"image": map[string]any{"url": srv.URL, "aeskey": testAESKey},
@@ -261,7 +261,7 @@ func TestResolveMediaRecordsIntentBeforeUploading(t *testing.T) {
 
 	storage := &fakeMediaStorage{}
 	ledger := newFakeMediaLedger(storage)
-	r := NewMediaResolver(storage, ledger, nil, testLogger())
+	r := NewMediaResolver(storage, ledger, nil, nil, testLogger())
 
 	msg := mediaMessage(t, "file", map[string]any{
 		"file": map[string]any{"url": srv.URL, "aeskey": testAESKey},
@@ -295,7 +295,7 @@ func TestResolveMediaSkipsAKeyTheReconcilerOwns(t *testing.T) {
 	storage := &fakeMediaStorage{}
 	ledger := newFakeMediaLedger(storage)
 	ledger.ok = false
-	r := NewMediaResolver(storage, ledger, nil, testLogger())
+	r := NewMediaResolver(storage, ledger, nil, nil, testLogger())
 
 	msg := mediaMessage(t, "image", map[string]any{
 		"image": map[string]any{"url": srv.URL, "aeskey": testAESKey},
@@ -321,7 +321,7 @@ func TestResolveMediaKeepsGoingWhenOneAttachmentFails(t *testing.T) {
 
 	storage := &fakeMediaStorage{}
 	notifier := &fakeMediaNotifier{}
-	r := &wecomMediaResolver{storage: storage, ledger: newFakeMediaLedger(storage), http: &http.Client{}, notify: notifier, logger: testLogger()}
+	r := &wecomMediaResolver{storage: storage, ledger: newFakeMediaLedger(storage), http: &http.Client{}, notify: notifier, languages: fakeLanguages{senderID: "T-alex", userID: uuidOf(9), language: "en"}, logger: testLogger()}
 
 	msg := mediaMessage(t, "mixed", map[string]any{"mixed": map[string]any{"msg_item": []any{
 		map[string]any{"msgtype": "text", "text": map[string]any{"content": "these two"}},
@@ -358,7 +358,7 @@ func TestResolveMediaTellsTheSenderWhatWentWrong(t *testing.T) {
 	t.Run("one notice names the size limit", func(t *testing.T) {
 		notifier := &fakeMediaNotifier{}
 		storage := &fakeMediaStorage{}
-		r := &wecomMediaResolver{storage: storage, ledger: newFakeMediaLedger(storage), http: &http.Client{}, notify: notifier, logger: testLogger()}
+		r := &wecomMediaResolver{storage: storage, ledger: newFakeMediaLedger(storage), http: &http.Client{}, notify: notifier, languages: fakeLanguages{senderID: "T-alex", userID: uuidOf(9), language: "en"}, logger: testLogger()}
 		msg := mediaMessage(t, "file", map[string]any{
 			"file": map[string]any{"url": oversize.URL, "aeskey": testAESKey},
 		})
@@ -382,7 +382,7 @@ func TestResolveMediaTellsTheSenderWhatWentWrong(t *testing.T) {
 	t.Run("two failures of one kind are one notice", func(t *testing.T) {
 		notifier := &fakeMediaNotifier{}
 		storage := &fakeMediaStorage{}
-		r := &wecomMediaResolver{storage: storage, ledger: newFakeMediaLedger(storage), http: &http.Client{}, notify: notifier, logger: testLogger()}
+		r := &wecomMediaResolver{storage: storage, ledger: newFakeMediaLedger(storage), http: &http.Client{}, notify: notifier, languages: fakeLanguages{senderID: "T-alex", userID: uuidOf(9), language: "en"}, logger: testLogger()}
 		msg := mediaMessage(t, "mixed", map[string]any{"mixed": map[string]any{"msg_item": []any{
 			map[string]any{"msgtype": "image", "image": map[string]any{"url": expired.URL, "aeskey": testAESKey}},
 			map[string]any{"msgtype": "image", "image": map[string]any{"url": expired.URL, "aeskey": testAESKey}},
@@ -403,7 +403,7 @@ func TestResolveMediaTellsTheSenderWhatWentWrong(t *testing.T) {
 		defer srv.Close()
 		notifier := &fakeMediaNotifier{}
 		storage := &fakeMediaStorage{}
-		r := &wecomMediaResolver{storage: storage, ledger: newFakeMediaLedger(storage), http: &http.Client{}, notify: notifier, logger: testLogger()}
+		r := &wecomMediaResolver{storage: storage, ledger: newFakeMediaLedger(storage), http: &http.Client{}, notify: notifier, languages: fakeLanguages{senderID: "T-alex", userID: uuidOf(9), language: "en"}, logger: testLogger()}
 		msg := mediaMessage(t, "image", map[string]any{
 			"image": map[string]any{"url": srv.URL, "aeskey": testAESKey},
 		})
@@ -509,7 +509,7 @@ func TestResolveMediaKeepsTheKeyPerChatMessage(t *testing.T) {
 // TestResolveMediaWithoutStorageLeavesThePlaceholder: a deployment with no
 // object store must degrade to the text, not to a panic or a broken ref.
 func TestResolveMediaWithoutStorageLeavesThePlaceholder(t *testing.T) {
-	r := NewMediaResolver(nil, nil, nil, testLogger())
+	r := NewMediaResolver(nil, nil, nil, nil, testLogger())
 	msg := mediaMessage(t, "image", map[string]any{
 		"image": map[string]any{"url": "https://cos.invalid/a", "aeskey": testAESKey},
 	})

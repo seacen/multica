@@ -678,8 +678,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				wecomReplier := wecom.NewOutboundReplier(wecom.OutboundReplierConfig{
 					Binding: wecomBinding,
 					Senders: wecomSenders,
-					AppURL:  appURLFromEnv(),
-					Logger:  slog.Default(),
+					// Notices speak the reader's own profile language; an
+					// unbound sender gets the default (wecom/language.go).
+					Languages: queries,
+					AppURL:    appURLFromEnv(),
+					Logger:    slog.Default(),
 				})
 
 				// Wecom shares the engine.ChatSession (channel_type-keyed) so
@@ -699,8 +702,12 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					// instead of dropping them, and needs the shared dedup
 					// table so a redelivered frame does not draw a second
 					// reply. Same surface the ResolverSet below uses.
-					Dedup:  wecom.NewInboundDeduper(wecomStore),
-					Logger: slog.Default(),
+					Dedup: wecom.NewInboundDeduper(wecomStore),
+					// The read loop writes the media placeholders and quote
+					// prefix into the stored message body, in the sender's
+					// own profile language.
+					Languages: queries,
+					Logger:    slog.Default(),
 				})
 				// Streaming replies: the typing indicator opens a WeCom
 				// stream the moment a message is ingested (the user sees a
@@ -727,7 +734,10 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					// mid-run — still owes the user the news, and the binding
 					// row is where the chat is found when no handle is left.
 					Bindings: queries,
-					Logger:   slog.Default(),
+					// The bubble's closers speak the asker's own profile
+					// language (wecom/language.go).
+					Languages: queries,
+					Logger:    slog.Default(),
 				})
 				// Subscribes task:failed — a failed run publishes no
 				// chat:done, so this is the sole path that stops the bubble
@@ -747,7 +757,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				var wecomMedia engine.MediaResolver
 				if store != nil {
 					wecomMedia = wecom.NewMediaResolver(
-						store, engine.NewDBMediaIntentLedger(queries), wecomSenders, slog.Default())
+						store, engine.NewDBMediaIntentLedger(queries), wecomSenders, queries, slog.Default())
 				} else {
 					slog.Warn("wecom: no storage backend; inbound photos and files stay placeholders")
 				}

@@ -167,7 +167,7 @@ func (r *mediaRig) openBubble(t *testing.T, reqID string) {
 	r.typing.OnIngested(context.Background(), engine.ResolvedInstallation{
 		ID:              r.inst,
 		InstallerUserID: uuidOf(33),
-		Platform:        Installation{Locale: string(LocaleZhHans)},
+		Platform:        Installation{},
 	}, msg, r.session)
 }
 

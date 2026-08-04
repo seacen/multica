@@ -44,6 +44,7 @@ type outboundQueries interface {
 	FindChannelBindingForMember(ctx context.Context, arg db.FindChannelBindingForMemberParams) (db.ChannelUserBinding, error)
 	GetWorkspace(ctx context.Context, id pgtype.UUID) (db.Workspace, error)
 	ListAttachmentsByChatMessage(ctx context.Context, arg db.ListAttachmentsByChatMessageParams) ([]db.Attachment, error)
+	languageLookup
 }
 
 // Outbound delivers an agent's chat reply back to WeCom over the same
@@ -124,16 +125,23 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 
 	content := chatDoneContent(e.Payload)
 
-	// The bubble the question opened, if there is one. Taken up front and
+	// The bubble this run's round opened, if there is one. Taken up front and
 	// unconditionally: from here on this turn owns it, and a handle left in
 	// the store after the turn ends is a handle pointing at a sealed message.
-	if handle, streaming := o.takeStream(sessionID); streaming {
+	handle, streaming := o.takeStream(sessionID, e)
+	if streaming {
 		// A bubble on screen has to end in words. An empty completion is a
 		// legitimate outcome — the agent had nothing to add — but an endless
-		// spinner is not, so the copy stands in for the silence.
+		// spinner is not, so the copy stands in for the silence. For a round
+		// that waited in line behind another, the silence has a better
+		// explanation: the reply ahead of it already covered this message.
 		text := content
 		if !hasVisibleChar(text) {
-			text = copyFor(handle.Locale).StreamNoReply
+			if handle.QueuedBehind {
+				text = copyFor(handle.Locale).StreamMerged
+			} else {
+				text = copyFor(handle.Locale).StreamNoReply
+			}
 		}
 		// A bubble the server disowned mid-run is not tried again: the typing
 		// indicator has already been told this stream takes no frame, and has
@@ -188,11 +196,12 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 	// ago) means the reply waits for the next one rather than disappearing —
 	// see outbound_queue.go. The user asked a question; an answer a minute
 	// late still answers it.
+	chatType := aibotChatTypeFromChannel(channel.ChatType(binding.ChatType))
 	addr := roundAddress{
 		InstallationID: inst.ID,
 		ChatID:         binding.ChannelChatID,
-		ChatType:       aibotChatTypeFromChannel(channel.ChatType(binding.ChatType)),
-		Locale:         localeOfRow(inst),
+		ChatType:       chatType,
+		Locale:         localeForChat(ctx, o.q, inst.ID, chatType, binding.ChannelChatID),
 	}
 	if content != "" {
 		if err := o.senders.send(inst.ID, pendingSend{
@@ -203,13 +212,16 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 			return err
 		}
 		// An answer is the round's ending whether it went into the bubble or
-		// underneath it, and this is the branch where no handle was consumed to
-		// record that. Without the note, a task:failed arriving behind a
-		// delivered answer — an auto-retry's first attempt, a sweeper that ran
-		// late — reaches the typing indicator with nothing to tell it the round
-		// is over, and contradicts the answer the user is already reading.
-		if o.streams != nil {
-			o.streams.remember(sessionID, addr, roundOver)
+		// underneath it. When a handle WAS consumed, takeAtLocked already
+		// filed the note with the round's adopted task id — writing again
+		// here with a weaker id would erase the adoption fence. Only the
+		// no-bubble branch has no record yet: without the note, a task:failed
+		// arriving behind a delivered answer — an auto-retry's first attempt,
+		// a sweeper that ran late — reaches the typing indicator with nothing
+		// to tell it the round is over, and contradicts the answer the user
+		// is already reading.
+		if o.streams != nil && !streaming {
+			o.streams.remember(sessionID, addr, roundOver, taskIDFromEvent(e))
 		}
 	}
 	// No req_id to fall back on here: either no bubble was ever opened for this
@@ -225,13 +237,16 @@ func (o *Outbound) mayCarryAttachments(e events.Event) bool {
 	return o.objects != nil && e.WorkspaceID != "" && chatDoneMessageID(e.Payload) != ""
 }
 
-// takeStream hands over the bubble open for this session, if the typing
-// indicator managed to open one and it is still inside the protocol's window.
-func (o *Outbound) takeStream(sessionID pgtype.UUID) (streamHandle, bool) {
+// takeStream hands over the bubble belonging to the run that just finished,
+// if the typing indicator managed to open one and it is still inside the
+// protocol's window. The event's task id picks the right round when several
+// bubbles are open; an event that names no task gets the head — the oldest
+// open round, which per-session task serialization makes the running one.
+func (o *Outbound) takeStream(sessionID pgtype.UUID, e events.Event) (streamHandle, bool) {
 	if o.streams == nil || o.senders == nil {
 		return streamHandle{}, false
 	}
-	return o.streams.take(sessionID, roundOver)
+	return o.streams.takeTask(sessionID, taskIDFromEvent(e), roundOver)
 }
 
 // finishStream writes the answer into the bubble and seals it. A failure here
@@ -321,13 +336,11 @@ func (o *Outbound) tryDeliverInbox(ctx context.Context, item map[string]any, rec
 		return false
 	}
 
-	// One row answers two questions: whether the bot is still installed, and
-	// which language its copy speaks. A revoked installation stops here — the
-	// binding row outlives the revoke, so the member still looks reachable.
-	// A lookup failure is not fatal for the locale — the default copy still
-	// says something useful, and dropping a notification over a language
-	// choice would be worse than sending it in the wrong one.
-	cp := copyFor(DefaultLocale)
+	// The installation row says whether the bot is still installed. A revoked
+	// installation stops here — the binding row outlives the revoke, so the
+	// member still looks reachable. A lookup failure is not fatal: dropping a
+	// notification over a status read would be worse than pushing one to a
+	// just-revoked bot, whose send simply fails.
 	if inst, err := o.q.GetChannelInstallation(ctx, db.GetChannelInstallationParams{
 		ID:          binding.InstallationID,
 		ChannelType: channelTypeWecom,
@@ -338,11 +351,14 @@ func (o *Outbound) tryDeliverInbox(ctx context.Context, item map[string]any, rec
 				"status", inst.Status, "recipient_id", recipientIDStr)
 			return false
 		}
-		cp = copyFor(localeOfRow(inst))
 	} else {
-		o.logger.WarnContext(ctx, "wecom outbound: installation lookup for inbox locale failed",
+		o.logger.WarnContext(ctx, "wecom outbound: installation lookup for inbox push failed",
 			"error", err, "installation_id", uuidStringPub(binding.InstallationID))
 	}
+	// The card is a 1:1 push to a known Multica member, so their own profile
+	// language decides what it says — the one surface where the reader is
+	// always resolvable by construction.
+	cp := copyFor(localeForUser(ctx, o.q, recipientID))
 
 	// Resolve slug for the link. Best-effort — a missing slug just falls
 	// back to the workspace UUID in the URL.

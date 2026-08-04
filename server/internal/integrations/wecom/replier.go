@@ -22,16 +22,6 @@ import (
 	"github.com/multica-ai/multica/server/internal/util"
 )
 
-// localeOf reads the copy language off the installation the Router resolved.
-// installationResolver stashes the hydrated wecom Installation in Platform;
-// anything else (a fake in a test, a future resolver) gets the default.
-func localeOf(inst engine.ResolvedInstallation) Locale {
-	if p, ok := inst.Platform.(Installation); ok {
-		return resolveLocale(p.Locale)
-	}
-	return DefaultLocale
-}
-
 // bindingMinter is the binding-token surface the replier needs.
 // *BindingTokenService satisfies it.
 type bindingMinter interface {
@@ -42,6 +32,7 @@ type bindingMinter interface {
 type OutboundReplier struct {
 	binding     bindingMinter
 	senders     *sendersRegistry
+	languages   languageLookup
 	appURL      string
 	bindingPath string
 	logger      *slog.Logger
@@ -56,6 +47,12 @@ type OutboundReplierConfig struct {
 	// Senders is the same sendersRegistry the wecom ChannelDeps was built
 	// with. The replier looks up the live wsSender by installation id.
 	Senders *sendersRegistry
+
+	// Languages resolves the sender to their Multica profile language, which
+	// is what the notices are written in (language.go). Nil — and every
+	// unbound sender, which notably includes everyone the binding prompt is
+	// FOR — gets DefaultLocale.
+	Languages languageLookup
 
 	// AppURL is the Multica web app host the user clicks into to redeem
 	// the binding token (e.g. https://multica.example). It comes from
@@ -86,6 +83,7 @@ func NewOutboundReplier(cfg OutboundReplierConfig) *OutboundReplier {
 	return &OutboundReplier{
 		binding:     cfg.Binding,
 		senders:     cfg.Senders,
+		languages:   cfg.Languages,
 		appURL:      strings.TrimRight(cfg.AppURL, "/"),
 		bindingPath: bindingPath,
 		logger:      logger,
@@ -96,7 +94,7 @@ func NewOutboundReplier(cfg OutboundReplierConfig) *OutboundReplier {
 // logged, not propagated: the replier runs detached from the inbound ACK
 // path (the engine.Router owns that goroutine).
 func (r *OutboundReplier) Reply(ctx context.Context, inst engine.ResolvedInstallation, msg channel.InboundMessage, res engine.Result) {
-	c := copyFor(localeOf(inst))
+	c := copyFor(localeForSender(ctx, r.languages, inst.ID, msg.Source.SenderID))
 	switch res.Outcome {
 	case engine.OutcomeNeedsBinding:
 		if err := r.sendBindingPrompt(ctx, inst, msg, res, c); err != nil {

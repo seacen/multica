@@ -175,7 +175,7 @@ func newStreamRig(t *testing.T) *streamRig {
 		inst: engine.ResolvedInstallation{
 			ID:              instID,
 			InstallerUserID: principal,
-			Platform:        Installation{Locale: string(LocaleZhHans)},
+			Platform:        Installation{},
 		},
 		session:         uuidOf(21),
 		principalSender: principalSender,
@@ -627,7 +627,7 @@ func TestStaleHandleIsTreatedAsGone(t *testing.T) {
 	store := newStreamStore()
 	base := time.Now()
 	store.now = func() time.Time { return base }
-	if !store.claim(uuidOf(3), streamHandle{ReqID: "R", StreamID: "S"}) {
+	if store.open(uuidOf(3), streamHandle{ReqID: "R", StreamID: "S"}) != roundOpened {
 		t.Fatal("claim refused on an empty store")
 	}
 	store.now = func() time.Time { return base.Add(streamMaxAge + time.Second) }
@@ -635,10 +635,10 @@ func TestStaleHandleIsTreatedAsGone(t *testing.T) {
 	if _, ok := store.peek(uuidOf(3)); ok {
 		t.Error("peek returned a handle the server would refuse")
 	}
-	if _, ok := store.take(uuidOf(3), roundOver); ok {
+	if _, ok := store.takeHead(uuidOf(3), roundOver); ok {
 		t.Error("take returned a handle the server would refuse")
 	}
-	if !store.claim(uuidOf(3), streamHandle{ReqID: "R2", StreamID: "S2"}) {
+	if store.open(uuidOf(3), streamHandle{ReqID: "R2", StreamID: "S2"}) != roundOpened {
 		t.Error("an expired handle must not block a fresh one")
 	}
 }

@@ -202,17 +202,17 @@ func TestNoHandleOutlivesADisownedRound(t *testing.T) {
 func TestTheMarkIsWhatEachCallerReads(t *testing.T) {
 	store := newStreamStore()
 	session := uuidOf(3)
-	if store.markUnusable(session) {
+	if store.markUnusable(session, "S") {
 		t.Error("marked a session with no bubble open")
 	}
-	if !store.claim(session, streamHandle{ReqID: "R", StreamID: "S"}) {
-		t.Fatal("claim refused on an empty store")
+	if store.open(session, streamHandle{ReqID: "R", StreamID: "S"}) != roundOpened {
+		t.Fatal("open refused on an empty store")
 	}
 
-	if !store.markUnusable(session) {
+	if !store.markUnusable(session, "S") {
 		t.Fatal("the store would not record the server's verdict")
 	}
-	if store.markUnusable(session) {
+	if store.markUnusable(session, "S") {
 		t.Error("a second refusal claimed the mark too, and would say so to the user again")
 	}
 	if _, ok := store.peek(session); ok {
@@ -225,7 +225,7 @@ func TestTheMarkIsWhatEachCallerReads(t *testing.T) {
 		t.Error("the handle was forgotten; the round's ending has no address left")
 	}
 
-	h, ok := store.take(session, roundOver)
+	h, ok := store.takeHead(session, roundOver)
 	if !ok || !h.Unusable {
 		t.Fatalf("take returned (%+v, %v), want the addressing carrying the server's verdict", h, ok)
 	}
@@ -242,13 +242,13 @@ func TestADisownedHandleStillAgesOut(t *testing.T) {
 	base := time.Now()
 	store.now = func() time.Time { return base }
 	session := uuidOf(3)
-	store.claim(session, streamHandle{ReqID: "R", StreamID: "S"})
-	store.markUnusable(session)
+	store.open(session, streamHandle{ReqID: "R", StreamID: "S"})
+	store.markUnusable(session, "S")
 
 	store.now = func() time.Time { return base.Add(streamMaxAge + time.Second) }
-	store.claim(uuidOf(4), streamHandle{ReqID: "R2", StreamID: "S2"})
+	store.open(uuidOf(4), streamHandle{ReqID: "R2", StreamID: "S2"})
 
-	if _, ok := store.take(session, roundOver); ok {
+	if _, ok := store.takeHead(session, roundOver); ok {
 		t.Error("take returned a handle from a round the store should have swept")
 	}
 	if depth := store.depth(); depth != 1 {

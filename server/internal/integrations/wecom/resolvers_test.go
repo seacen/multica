@@ -75,7 +75,7 @@ func TestNewResolverSetIsComplete(t *testing.T) {
 	}
 
 	set = NewResolverSet(nil, nil, NewOutboundReplier(OutboundReplierConfig{}), NewTypingIndicator(TypingIndicatorConfig{}),
-		NewMediaResolver(nil, nil, nil, testLogger()))
+		NewMediaResolver(nil, nil, nil, nil, testLogger()))
 	if set.Replier == nil {
 		t.Error("a real replier must reach ResolverSet.Replier")
 	}
@@ -110,8 +110,7 @@ func TestResolveInstallationRoutesOnTheBotID(t *testing.T) {
 		InstallerUserID: uuidOf(4),
 		Status:          InstallationActive,
 		BotID:           "wb-1",
-		Locale:          "en",
-	}}
+		}}
 	r := &installationResolver{store: store}
 
 	got, err := r.ResolveInstallation(context.Background(), wecomInbound("wb-1", "T-alex", "T-alex", channel.ChatTypeP2P))
@@ -127,12 +126,8 @@ func TestResolveInstallationRoutesOnTheBotID(t *testing.T) {
 	if !got.Active {
 		t.Error("an active installation must resolve Active")
 	}
-	inst, ok := got.Platform.(Installation)
-	if !ok {
-		t.Fatalf("Platform = %T, want the wecom Installation (the replier reads the locale off it)", got.Platform)
-	}
-	if inst.Locale != "en" {
-		t.Errorf("Platform.Locale = %q", inst.Locale)
+	if _, ok := got.Platform.(Installation); !ok {
+		t.Fatalf("Platform = %T, want the wecom Installation (principalOf reads it)", got.Platform)
 	}
 }
 

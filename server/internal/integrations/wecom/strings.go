@@ -1,7 +1,7 @@
 package wecom
 
 // strings.go — every string a WeCom user reads, in one place, selected per
-// installation.
+// READER.
 //
 // The copy used to sit inline wherever it was sent: the offline and archived
 // notices in replier.go, the binding prompt built by hand a few lines below
@@ -10,12 +10,18 @@ package wecom
 // the bot — and impossible to find, because "what does this bot say" was
 // spread across three files.
 //
+// Which pack a given message uses is decided by who is going to read it, not
+// by the installation: a bound user gets their own Multica profile language
+// (language.go), and a reader nobody can name — an unbound colleague, a group
+// room as a whole — gets DefaultLocale. An installation-wide language setting
+// existed briefly and was removed: nothing could write it, and a workspace
+// speaks more than one language the moment a second person binds.
+//
 // Slack's adapter hardcodes English and Lark's hardcodes Chinese, so there is
 // no house i18n mechanism to join. This is deliberately not one either: a
-// struct of strings per locale, chosen by a config field, defaulting to
-// Chinese. No catalogue files, no message ids, no plural rules. If wecom ever
-// needs a third language with real formatting rules, that is the moment to
-// reach for a framework — not now.
+// struct of strings per locale. No catalogue files, no message ids, no plural
+// rules. If wecom ever needs a third language with real formatting rules,
+// that is the moment to reach for a framework — not now.
 
 import (
 	"strings"
@@ -30,24 +36,25 @@ const (
 	LocaleZhHans Locale = "zh-Hans"
 	LocaleEn     Locale = "en"
 
-	// DefaultLocale is Chinese: WeChat Work is a Chinese platform and every
-	// installation that predates this field is a Chinese-speaking one.
+	// DefaultLocale is Chinese: WeChat Work is a Chinese platform, and it is
+	// what a reader with no profile to consult gets.
 	DefaultLocale = LocaleZhHans
 )
 
-// resolveLocale maps a config value onto a supported Locale. Unknown or empty
-// values fall back to DefaultLocale rather than failing — a typo in an
-// installation's config should not stop the bot from talking.
+// resolveLocale maps a user's profile language onto a supported Locale. The
+// profile validates to en / zh-Hans / ko / ja (handler/auth.go), and there are
+// two packs: Chinese for zh*, English for everyone who chose anything else —
+// a ko or ja user deliberately picked "not Chinese", and English is the
+// lingua-franca pack we have for them. Only an EMPTY value falls back to
+// DefaultLocale: absence is not a choice.
 func resolveLocale(s string) Locale {
 	switch v := strings.ToLower(strings.TrimSpace(s)); {
 	case v == "":
 		return DefaultLocale
-	case strings.HasPrefix(v, "en"):
-		return LocaleEn
 	case strings.HasPrefix(v, "zh"):
 		return LocaleZhHans
 	default:
-		return DefaultLocale
+		return LocaleEn
 	}
 }
 
@@ -128,11 +135,11 @@ type copyPack struct {
 	StreamFailed       string
 	StreamStillWorking string
 
-	// StreamQueued closes nothing either. It answers a message that arrived
-	// while the previous round was still running: that round owns the only
-	// bubble, this message starts one of its own, and it waits. Without it the
-	// wait is silent for as long as the first run takes.
-	StreamQueued string
+	// StreamMerged closes a QUEUED round's bubble whose run finished with
+	// nothing of its own to say — the reply ahead of it already covered this
+	// message. A first round's empty finish keeps StreamNoReply; this one has
+	// an earlier answer to point at.
+	StreamMerged string
 
 	// StreamStuck is the odd one out: it does not close a bubble, it explains
 	// one that can no longer be closed. When the server disowns a stream
@@ -290,7 +297,7 @@ var copyPacks = map[Locale]copyPack{
 		StreamNotStarted:     "已收到，但这条暂时没能开始处理。",
 		StreamFailed:         "⚠️ 这次没跑通，请稍后再试一次。",
 		StreamStillWorking:   "还在处理，完成后我再单独回复你。",
-		StreamQueued:         "已收到，前一条还在处理中，稍后一起回复你。",
+		StreamMerged:         "✅ 这条已并入上一条回复一起处理了。",
 		StreamStuck:          "⚠️ 上面那条进度不会再更新了，这轮的结果我用新消息发你。",
 		StreamProgressPrefix: "正在处理：",
 		Progress: progressCopy{
@@ -357,7 +364,7 @@ var copyPacks = map[Locale]copyPack{
 		StreamNotStarted:     "Got it, but this one couldn't start processing.",
 		StreamFailed:         "⚠️ That run didn't go through. Please try again.",
 		StreamStillWorking:   "Still working on it — I'll reply separately when it's done.",
-		StreamQueued:         "Got it. I'm still working on your last message, and I'll reply to both once it's done.",
+		StreamMerged:         "✅ Handled together with my previous reply.",
 		StreamStuck:          "⚠️ The status above won't update any further. I'll send this round's result as a new message.",
 		StreamProgressPrefix: "Working on it: ",
 		Progress: progressCopy{

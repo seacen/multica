@@ -259,7 +259,7 @@ func TestTheConfiguredPrincipalSurvivesARoundTrip(t *testing.T) {
 // user sees: the installer stops seeing the detail, the named user starts.
 func TestTheConfiguredPrincipalDecidesTheTier(t *testing.T) {
 	installer := levelRig(t)
-	installer.inst.Platform = Installation{Locale: string(LocaleZhHans), PrincipalUserID: uuidText(uuidOf(31))}
+	installer.inst.Platform = Installation{PrincipalUserID: uuidText(uuidOf(31))}
 	installer.identities.bind("T-dana", uuidOf(31))
 	installer.ingest(t, "REQ-42")
 	feedToolCall(installer, "Read", map[string]any{"file_path": "/srv/app/handler.go"})
@@ -268,7 +268,7 @@ func TestTheConfiguredPrincipalDecidesTheTier(t *testing.T) {
 	}
 
 	named := levelRig(t)
-	named.inst.Platform = Installation{Locale: string(LocaleZhHans), PrincipalUserID: uuidText(uuidOf(31))}
+	named.inst.Platform = Installation{PrincipalUserID: uuidText(uuidOf(31))}
 	named.identities.bind("T-dana", uuidOf(31))
 	named.ingestMessage(t, streamInbound("REQ-43", "T-dana"))
 	feedToolCall(named, "Read", map[string]any{"file_path": "/srv/app/handler.go"})

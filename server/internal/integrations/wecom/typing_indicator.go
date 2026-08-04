@@ -81,13 +81,14 @@ type chatBindingLookup interface {
 	GetChannelInstallation(ctx context.Context, arg db.GetChannelInstallationParams) (db.ChannelInstallation, error)
 }
 
-// TypingIndicatorManager opens the streaming bubble when a message is ingested
-// and owns it until something closes it.
+// TypingIndicatorManager opens a streaming bubble per round when messages are
+// ingested and owns each one until something closes it.
 type TypingIndicatorManager struct {
 	senders    *sendersRegistry
 	streams    *streamStore
 	tasks      taskLookup
 	identities identityLookup
+	languages  languageLookup
 	bindings   chatBindingLookup
 	log        *slog.Logger
 
@@ -127,6 +128,10 @@ type TypingIndicatorConfig struct {
 	// the Router already gives OnIngested, so it is nowhere near the ACK.
 	Identities identityLookup
 
+	// Languages resolves the asker to their Multica profile language, which is
+	// what the bubble's closers speak (language.go). Nil means DefaultLocale.
+	Languages languageLookup
+
 	// Bindings finds the chat behind a session when nothing else can — a run
 	// that failed after this process was restarted, or after a bubble that was
 	// never painted. Nil keeps the failure notice to the rounds this process
@@ -154,6 +159,7 @@ func NewTypingIndicator(cfg TypingIndicatorConfig) *TypingIndicatorManager {
 		streams:      cfg.Streams,
 		tasks:        cfg.Tasks,
 		identities:   cfg.Identities,
+		languages:    cfg.Languages,
 		bindings:     cfg.Bindings,
 		taskSessions: newTaskSessionCache(),
 		log:          logger,
@@ -161,11 +167,19 @@ func NewTypingIndicator(cfg TypingIndicatorConfig) *TypingIndicatorManager {
 	}
 }
 
-// OnIngested paints the "working on it" bubble and records what it takes to
-// come back and fill it in. The Router calls this on a detached goroutine with
-// its own deadline, so nothing here needs to be quick for the ACK's sake — but
-// everything here is best-effort: a bubble that fails to open costs the user a
-// few seconds of uncertainty, and the answer still arrives as a plain message.
+// OnIngested paints a "working on it" bubble for the round this message
+// starts and records what it takes to come back and fill it in. A message
+// inside the debounce window joins the round already on screen; a message
+// past it — one that will wait behind the run in flight — opens a bubble of
+// its own immediately, because a wait with nothing on screen reads as a
+// message that was lost. The bubble carries no words while it waits: the
+// client's own loading affordance is the receipt, and words would need a
+// language before there is anything to say.
+//
+// The Router calls this on a detached goroutine with its own deadline, so
+// nothing here needs to be quick for the ACK's sake — but everything here is
+// best-effort: a bubble that fails to open costs the user a few seconds of
+// uncertainty, and the answer still arrives as a plain message.
 func (m *TypingIndicatorManager) OnIngested(ctx context.Context, inst engine.ResolvedInstallation, msg channel.InboundMessage, sessionID pgtype.UUID) {
 	if m.senders == nil || m.streams == nil || !sessionID.Valid {
 		return
@@ -202,13 +216,13 @@ func (m *TypingIndicatorManager) OnIngested(ctx context.Context, inst engine.Res
 		InstallationID: inst.ID,
 		ChatID:         chatID,
 		ChatType:       aibotChatTypeFromChannel(msg.Source.ChatType),
-		Locale:         localeOf(inst),
+		Locale:         localeForSender(ctx, m.languages, inst.ID, msg.Source.SenderID),
 		Level:          m.levelFor(ctx, inst, msg),
 	}
-	if !m.streams.claim(sessionID, h) {
-		// A bubble is already open for this session, which is two different
-		// situations wearing the same face. The store tells them apart.
-		m.sayTheMessageIsQueued(ctx, sessionID, h)
+	if m.streams.open(sessionID, h) == roundJoined {
+		// Inside the debounce window: the batcher is about to fold this
+		// message into the round whose bubble is already on screen, and that
+		// bubble is this message's receipt too.
 		return
 	}
 
@@ -238,49 +252,13 @@ func (m *TypingIndicatorManager) OnIngested(ctx context.Context, inst engine.Res
 			m.log.DebugContext(ctx, "wecom typing: opening frame did not land, keeping the handle",
 				"chat_session_id", util.UUIDToString(sessionID), "error", err)
 		default:
-			m.streams.drop(sessionID)
+			m.streams.drop(sessionID, h.StreamID)
 			m.log.WarnContext(ctx, "wecom typing: opening frame refused",
 				"chat_session_id", util.UUIDToString(sessionID), "error", err)
 			return
 		}
 	}
 	m.armGuard(sessionID, h)
-}
-
-// sayTheMessageIsQueued answers a message that found a bubble already open.
-//
-// Two messages inside one debounce window are one run and one bubble, and the
-// spinner already on screen is the receipt for both — a second word there would
-// be the bot interrupting itself. Past the window the run behind the bubble is
-// under way and this message starts a round that waits for it, which is the
-// case this exists for: the wait is as long as the first run, minutes of it,
-// and it used to pass without a bubble, a receipt, or anything else to show the
-// message had been read.
-//
-// The receipt is a plain message rather than a line in the bubble, for two
-// reasons. The bubble belongs to the run in flight and its body is that run's
-// progress; a receipt written into it would read as a step the agent took, and
-// the eight-line window would scroll it away a few tool calls later. And a
-// plain message goes through the holding queue, so one written during a
-// reconnect is delivered late rather than lost — a stream frame in the same
-// moment is simply gone (senders_registry.go).
-//
-// progressLevel does not gate it. That rule decides who may watch a run work,
-// and this carries no part of the run, only that the message arrived. A group
-// room getting nothing back is the same silence the receipt is here to end.
-func (m *TypingIndicatorManager) sayTheMessageIsQueued(ctx context.Context, sessionID pgtype.UUID, h streamHandle) {
-	if m.streams.followUp(sessionID) != followUpQueued {
-		return
-	}
-	if err := m.senders.send(h.InstallationID, pendingSend{
-		ChatID:   h.ChatID,
-		ChatType: h.ChatType,
-		Content:  copyFor(h.Locale).StreamQueued,
-	}); err != nil {
-		m.log.WarnContext(ctx, "wecom typing: could not say the message is queued",
-			"chat_session_id", util.UUIDToString(sessionID),
-			"installation_id", util.UUIDToString(h.InstallationID), "error", err)
-	}
 }
 
 // levelFor decides how much of the run this bubble may show, once, while the
@@ -344,19 +322,25 @@ func principalOf(inst engine.ResolvedInstallation) pgtype.UUID {
 	return inst.InstallerUserID
 }
 
-// OnSettled closes a bubble whose message never became a run — agent offline
-// or archived, or an enqueue that failed. This is the only chance to stop the
-// spinner: with no task there is no task lifecycle event, so neither the
-// chat-done subscriber nor the failure subscriber will ever fire. The copy is
-// deliberately thin because the replier's own notice follows as a separate
+// OnSettled closes the bubble of a round that never became a run — agent
+// offline or archived, or an enqueue that failed. This is the only chance to
+// stop that spinner: with no task there is no task lifecycle event, so neither
+// the chat-done subscriber nor the failure subscriber will ever fire. The copy
+// is deliberately thin because the replier's own notice follows as a separate
 // message with the reason.
+//
+// The TAIL is the right bubble: OnSettled answers the flush that just
+// settled, which is the newest round — the ones ahead of it belong to runs
+// that are already real and end through their own events.
 //
 // With no bubble to close this says nothing, and deliberately: there is no
 // spinner to stop, and the replier's notice is already on its way with the part
 // the user actually needs. That is the one difference from handleTaskFailed,
 // whose copy is the only account of a failure there is.
 func (m *TypingIndicatorManager) OnSettled(ctx context.Context, sessionID pgtype.UUID) {
-	m.closeBubble(ctx, sessionID, func(c copyPack) string { return c.StreamNotStarted }, "settled", roundOver)
+	m.closeBubble(ctx, sessionID,
+		func(s *streamStore) (streamHandle, bool) { return s.takeTail(sessionID, roundOver) },
+		func(c copyPack) string { return c.StreamNotStarted }, "settled")
 }
 
 // Register subscribes the manager to the run failure event, and — when a task
@@ -417,10 +401,13 @@ func (m *TypingIndicatorManager) handleTaskFailed(e events.Event) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), streamCloseTimeout)
 	defer cancel()
-	if m.closeBubble(ctx, sessionID, func(c copyPack) string { return c.StreamFailed }, "task failed", roundOver) {
+	taskID := taskIDFromEvent(e)
+	if m.closeBubble(ctx, sessionID,
+		func(s *streamStore) (streamHandle, bool) { return s.takeTask(sessionID, taskID, roundOver) },
+		func(c copyPack) string { return c.StreamFailed }, "task failed") {
 		return
 	}
-	m.sayTheRunFailed(ctx, sessionID)
+	m.sayTheRunFailed(ctx, sessionID, taskID)
 }
 
 // sayTheRunFailed delivers the failure to a round whose bubble is already gone.
@@ -435,7 +422,7 @@ func (m *TypingIndicatorManager) handleTaskFailed(e events.Event) {
 // the not-twice rule: the answer took the handle the same way the guard does,
 // and a task:failed arriving behind a delivered answer — an auto-retry's first
 // attempt, a sweeper that ran late — must not contradict it.
-func (m *TypingIndicatorManager) sayTheRunFailed(ctx context.Context, sessionID pgtype.UUID) {
+func (m *TypingIndicatorManager) sayTheRunFailed(ctx context.Context, sessionID pgtype.UUID, taskID string) {
 	if m.senders == nil {
 		return
 	}
@@ -452,7 +439,7 @@ func (m *TypingIndicatorManager) sayTheRunFailed(ctx context.Context, sessionID 
 		// No handle was consumed and no note was claimed on this path, so
 		// filing one is the only thing that stops the next publisher of the
 		// same news from repeating it.
-		m.streams.remember(sessionID, addr, roundOver)
+		m.streams.remember(sessionID, addr, roundOver, taskID)
 	}
 	if err := m.senders.send(addr.InstallationID, pendingSend{
 		ChatID:   addr.ChatID,
@@ -484,9 +471,9 @@ func (m *TypingIndicatorManager) addressFromBinding(ctx context.Context, session
 		}
 		return roundAddress{}, false
 	}
-	// One row answers two questions: whether the bot is still installed, and
-	// which language to say it in. The binding row outlives a revoke, so a
-	// session keeps looking reachable after the bot has been removed.
+	// The installation row answers whether the bot is still installed. The
+	// binding row outlives a revoke, so a session keeps looking reachable
+	// after the bot has been removed.
 	inst, err := m.bindings.GetChannelInstallation(ctx, db.GetChannelInstallationParams{
 		ID:          binding.InstallationID,
 		ChannelType: channelTypeWecom,
@@ -499,11 +486,12 @@ func (m *TypingIndicatorManager) addressFromBinding(ctx context.Context, session
 	if inst.Status != string(InstallationActive) {
 		return roundAddress{}, false
 	}
+	chatType := aibotChatTypeFromChannel(channel.ChatType(binding.ChatType))
 	return roundAddress{
 		InstallationID: binding.InstallationID,
 		ChatID:         binding.ChannelChatID,
-		ChatType:       aibotChatTypeFromChannel(channel.ChatType(binding.ChatType)),
-		Locale:         localeOfRow(inst),
+		ChatType:       chatType,
+		Locale:         localeForChat(ctx, m.languages, binding.InstallationID, chatType, binding.ChannelChatID),
 	}, true
 }
 
@@ -572,7 +560,7 @@ func (m *TypingIndicatorManager) recordStep(ctx context.Context, sessionID pgtyp
 		// The previous frame is still in flight, or the answer got there
 		// first. Skipping is the design in both cases.
 	case streamUnusable(err):
-		if !m.streams.markUnusable(sessionID) {
+		if !m.streams.markUnusable(sessionID, h.StreamID) {
 			// A refresh that raced into the same refusal got here first and has
 			// already said it.
 			return
@@ -707,12 +695,17 @@ func progressSummary(payload any) string {
 }
 
 // taskIDFromEvent prefers the envelope's routing hint and falls back to the
-// payload.
+// payload. ChatDonePayload matters most: broadcastChatDone sets no TaskID on
+// the envelope, and on the in-process bus the payload stays typed — miss it
+// and every answer takes the HEAD round unconditionally, which is the wrong
+// bubble whenever a guard has already closed the running round's.
 func taskIDFromEvent(e events.Event) string {
 	if e.TaskID != "" {
 		return e.TaskID
 	}
 	switch p := e.Payload.(type) {
+	case protocol.ChatDonePayload:
+		return p.TaskID
 	case protocol.TaskProgressPayload:
 		return p.TaskID
 	case protocol.TaskMessagePayload:
@@ -725,8 +718,12 @@ func taskIDFromEvent(e events.Event) string {
 }
 
 // armGuard schedules the close that happens when nothing else does. WeCom
-// stops accepting frames for a stream past streamMaxAge, so a run that outlives
-// the window would otherwise leave a spinner we can no longer touch.
+// stops accepting frames for a stream past streamMaxAge, so a bubble that
+// outlives the window — a long run, or a round stuck in the queue behind one —
+// would otherwise become a spinner we can no longer touch. The guard closes
+// exactly the bubble it was armed for, by stream id: with several bubbles open
+// in one session, a timer that took the head could seal a newer round's bubble
+// with an older round's promise.
 //
 // This is the one closer that does not end the round. Its copy says the reply
 // is coming separately, and the run is still going — so the handle it consumes
@@ -738,18 +735,20 @@ func (m *TypingIndicatorManager) armGuard(sessionID pgtype.UUID, h streamHandle)
 	t := time.AfterFunc(m.guardAfter, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), streamCloseTimeout)
 		defer cancel()
-		m.closeBubble(ctx, sessionID, func(c copyPack) string { return c.StreamStillWorking }, "window expiring", roundContinues)
+		m.closeBubble(ctx, sessionID,
+			func(s *streamStore) (streamHandle, bool) { return s.takeStream(sessionID, h.StreamID, roundContinues) },
+			func(c copyPack) string { return c.StreamStillWorking }, "window expiring")
 	})
 	m.streams.arm(sessionID, h.StreamID, t)
 }
 
-// closeBubble seals a session's bubble with the copy pick chooses, if there is
-// still a bubble to seal, and reports whether there was one. Taking the handle
-// first makes this idempotent: two closers racing produce one closing frame.
-//
-// ending is what the caller's words amount to for the round, not for the
-// bubble. Every closer here ends both except the guard, whose copy promises a
-// separate reply while the run goes on — see take.
+// closeBubble seals one bubble with the copy pick chooses, if take finds one
+// to seal, and reports whether it did. take names WHICH bubble — the failed
+// task's, the settled flush's (tail), the guard's own (by stream id) — and
+// consuming the handle inside the store makes this idempotent: two closers
+// racing produce one closing frame. The ending each take carries is what the
+// caller's words amount to for the round; every closer ends it except the
+// guard, whose copy promises a separate reply while the run goes on.
 //
 // A closing frame that cannot go out falls back to a plain message, the same
 // way the answer does in outbound.go. The words matter more here than there:
@@ -763,11 +762,11 @@ func (m *TypingIndicatorManager) armGuard(sessionID pgtype.UUID, h streamHandle)
 // A handle the server has already disowned skips straight to that fallback.
 // There is no bubble left to seal, and the frame would cost a round trip to be
 // told so a second time.
-func (m *TypingIndicatorManager) closeBubble(ctx context.Context, sessionID pgtype.UUID, pick func(copyPack) string, why string, ending roundEnding) bool {
+func (m *TypingIndicatorManager) closeBubble(ctx context.Context, sessionID pgtype.UUID, take func(*streamStore) (streamHandle, bool), pick func(copyPack) string, why string) bool {
 	if m.senders == nil || m.streams == nil || !sessionID.Valid {
 		return false
 	}
-	h, ok := m.streams.take(sessionID, ending)
+	h, ok := take(m.streams)
 	if !ok {
 		return false
 	}

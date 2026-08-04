@@ -88,9 +88,11 @@ type wecomChannel struct {
 	// from drawing a second receipt. nil disables the receipt.
 	dedup engine.Deduper
 
-	// locale selects the copy this installation's users see (strings.go).
-	// The zero value resolves to DefaultLocale.
-	locale Locale
+	// languages resolves a sender to their profile language for the copy the
+	// read loop itself writes: the media placeholders and quote prefix that
+	// become the stored message body, and the unsupported-type receipt. Nil
+	// means DefaultLocale for everyone (language.go).
+	languages languageLookup
 }
 
 var _ channel.Channel = (*wecomChannel)(nil)
@@ -306,14 +308,14 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 			log.Warn("wecom: bad aibot_msg_callback body", "error", err)
 			return nil
 		}
-		pack := copyFor(c.locale)
+		pack := c.packFor(ctx, mc)
 		text, ok := mc.routableText(pack)
 		if !ok {
 			// Nothing in this message can be read: a kind the adapter does
 			// not know, or a known kind that arrived without the one field
 			// that makes it usable. Silence reads as a broken bot, so answer
 			// instead of dropping.
-			c.replyUnsupportedMsgType(ctx, mc, sender, log)
+			c.replyUnsupportedMsgType(ctx, mc, pack, sender, log)
 			return nil
 		}
 		msg := channelMessageFromCallback(c.botID, mc, pack, text, env.Headers.ReqID)
@@ -379,6 +381,18 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 	}
 }
 
+// packFor resolves the copy pack for the person a callback came from. The
+// lookup costs two indexed reads, so it is paid only when the message will
+// actually use a string from the pack: a media placeholder, a quote prefix,
+// or the unsupported-type receipt. Plain text and voice pass through without
+// touching the pack at all and get the default without a lookup.
+func (c *wecomChannel) packFor(ctx context.Context, mc aibotMsgCallback) copyPack {
+	if !mc.needsCopy() {
+		return copyFor(DefaultLocale)
+	}
+	return copyFor(localeForSender(ctx, c.languages, c.installationID, mc.From.UserID))
+}
+
 // replyUnsupportedMsgType answers a callback the adapter cannot ingest with
 // a short "text only, please" notice. Three things it deliberately does NOT
 // do: escalate to the read loop (a bot that cannot answer is not a reason to
@@ -390,7 +404,7 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 // WeChat redelivers frames on its own schedule and a reconnect replays the
 // window, so an in-memory guard would not survive the case it exists for.
 // A failed write releases the claim, leaving the redelivery free to retry.
-func (c *wecomChannel) replyUnsupportedMsgType(ctx context.Context, mc aibotMsgCallback, sender *wsSender, log *slog.Logger) {
+func (c *wecomChannel) replyUnsupportedMsgType(ctx context.Context, mc aibotMsgCallback, pack copyPack, sender *wsSender, log *slog.Logger) {
 	chatID := mc.ChatID
 	if chatID == "" {
 		chatID = mc.From.UserID
@@ -419,7 +433,7 @@ func (c *wecomChannel) replyUnsupportedMsgType(ctx context.Context, mc aibotMsgC
 		}
 		return
 	}
-	if err := sender.sendText(chatID, chatType, copyFor(c.locale).UnsupportedMsgType); err != nil {
+	if err := sender.sendText(chatID, chatType, pack.UnsupportedMsgType); err != nil {
 		if relErr := c.dedup.Release(ctx, c.installationID, mc.MsgID, claim); relErr != nil {
 			log.Warn("wecom: release dedup claim failed", "error", relErr, "msg_id", mc.MsgID)
 		}
@@ -519,6 +533,11 @@ type ChannelDeps struct {
 	// drop).
 	Dedup engine.Deduper
 
+	// Languages resolves a sender to their Multica profile language for the
+	// strings the read loop writes (placeholders, quote prefix, the
+	// unsupported-type receipt). Nil means DefaultLocale for everyone.
+	Languages languageLookup
+
 	// Dialer overrides the default gorilla dialer. Tests point it at an
 	// httptest server; production leaves this nil.
 	Dialer Dialer
@@ -569,7 +588,7 @@ func newWecomFactory(deps ChannelDeps) channel.Factory {
 			logger:         logger,
 			senders:        deps.Senders,
 			dedup:          deps.Dedup,
-			locale:         resolveLocale(ic.Locale),
+			languages:      deps.Languages,
 		}, nil
 	}
 }

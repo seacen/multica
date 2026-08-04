@@ -69,11 +69,6 @@ type Installation struct {
 	// (which we do not use). Rotated via re-install.
 	SecretEncrypted []byte
 
-	// Locale selects the language this installation's users are answered in
-	// (see strings.go). Empty means DefaultLocale — every installation that
-	// predates the field keeps the Chinese copy it already had.
-	Locale string
-
 	// PrincipalUserID overrides who this bot belongs to for the purpose of
 	// showing a run's steps (progress_render.go). Empty — which is every row
 	// that predates the field — means the installer. Set it when the person
@@ -98,14 +93,15 @@ type installConfig struct {
 	BotID           string `json:"bot_id"`
 	SecretEncrypted []byte `json:"secret_encrypted"`
 
-	// Locale is optional: absent on every existing row, and absent means the
-	// default (Chinese). Stored per installation rather than per user because
-	// the bot speaks one language to a whole workspace's chats.
-	Locale string `json:"locale,omitempty"`
-
 	// PrincipalUserID is optional and absent on every existing row; absent
-	// means the installer. Same shape as Locale — an installation-level
-	// setting with a sensible default, not a new table.
+	// means the installer. An installation-level setting with a sensible
+	// default, not a new table.
+	//
+	// There is deliberately NO locale key beside it any more. The copy
+	// language follows each reader's own Multica profile (language.go); an
+	// installation-wide language was a field nothing could write and the wrong
+	// scope besides — a workspace speaks more than one language the moment a
+	// second person binds.
 	PrincipalUserID string `json:"principal_user_id,omitempty"`
 }
 
@@ -119,7 +115,6 @@ func encodeInstallConfig(inst Installation) ([]byte, error) {
 		AppID:           inst.BotID,
 		BotID:           inst.BotID,
 		SecretEncrypted: inst.SecretEncrypted,
-		Locale:          inst.Locale,
 		PrincipalUserID: inst.PrincipalUserID,
 	})
 }
@@ -142,19 +137,6 @@ func installationFromRow(row db.ChannelInstallation) (Installation, error) {
 		Status:          InstallationStatus(row.Status),
 		BotID:           cfg.BotID,
 		SecretEncrypted: cfg.SecretEncrypted,
-		Locale:          cfg.Locale,
 		PrincipalUserID: cfg.PrincipalUserID,
 	}, nil
-}
-
-// localeOfRow reads an installation row's copy language without hydrating the
-// whole Installation. Used on the outbound paths, which hold a raw row.
-func localeOfRow(row db.ChannelInstallation) Locale {
-	var cfg installConfig
-	if len(row.Config) > 0 {
-		if err := json.Unmarshal(row.Config, &cfg); err != nil {
-			return DefaultLocale
-		}
-	}
-	return resolveLocale(cfg.Locale)
 }

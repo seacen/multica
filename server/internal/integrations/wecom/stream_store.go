@@ -1,6 +1,6 @@
 package wecom
 
-// stream_store.go — the handle that lets an answer land in the bubble the
+// stream_store.go — the handles that let each answer land in the bubble its
 // question opened.
 //
 // WeCom's aibot API has no typing indicator, no reaction, no read receipt, and
@@ -10,6 +10,17 @@ package wecom
 // stream.id replaces that bubble's body in place — finish=true seals it and
 // nothing can touch it again
 // (https://developer.work.weixin.qq.com/document/path/101463).
+//
+// A session holds a LIST of open bubbles, not one. Messages inside one
+// debounce window share a run and share a bubble; a message past the window
+// starts a round of its own, queued behind the run in flight — and it gets its
+// own bubble immediately, because a message that produces nothing on screen
+// reads as a message that was lost. The rounds are FIFO: the engine serializes
+// chat tasks per session (ClaimAgentTask), so the oldest open round is the one
+// running and everything behind it is waiting. That ordering is what lets an
+// ending find its bubble without carrying a task id everywhere: the answer
+// seals the head, a flush that produced no task seals the tail, and a task id,
+// when there is one, overrides both.
 //
 // The catch is req_id. Every frame of one stream has to echo the req_id of the
 // aibot_msg_callback that started the turn, and that value is only ever seen
@@ -46,6 +57,9 @@ import (
 // implementation we can read — Tencent's own OpenClaw plugin — treats errcode
 // 846608 as a 6-minute ceiling. The two do not agree, so we take the shorter
 // number: being early costs a fallback message, being late costs the answer.
+//
+// The window applies to a queued round's bubble the same as a running one's:
+// the clock starts at the opening frame, and waiting in line does not stop it.
 const streamMaxAge = 6 * time.Minute
 
 // streamGuardAfter is when we close a bubble ourselves rather than let it run
@@ -54,12 +68,12 @@ const streamMaxAge = 6 * time.Minute
 // replace.
 const streamGuardAfter = 5 * time.Minute
 
-// roundMemory is how long a session keeps the note the handle left behind. It
-// has to outlast the bubble by a lot: the guard closes at five minutes and the
-// run it made a promise about carries on for as long as the agent needs, so the
-// window between the promise and the failure it accounts for is the length of a
-// long run, not the length of a stream. An hour covers those and still bounds
-// the map to the sessions answered in the last hour.
+// roundMemory is how long a session keeps the note the last handle left
+// behind. It has to outlast the bubble by a lot: the guard closes at five
+// minutes and the run it made a promise about carries on for as long as the
+// agent needs, so the window between the promise and the failure it accounts
+// for is the length of a long run, not the length of a stream. An hour covers
+// those and still bounds the map to the sessions answered in the last hour.
 const roundMemory = time.Hour
 
 // sameRoundWindow is how close two messages have to be to be one agent run.
@@ -72,10 +86,19 @@ const roundMemory = time.Hour
 // its own. A local constant here would be a second copy of that rule, free to
 // drift from the one that decides.
 //
-// The gap is measured from the PREVIOUS message, not from when the bubble
-// opened, for the same reason: the timer re-arms, so a message every two
-// seconds is one run no matter how long the burst goes on, and the bubble's age
-// says nothing about which run the next message belongs to.
+// The gap is measured from the PREVIOUS message on the NEWEST round, not from
+// any bubble's opening: the timer re-arms, so a message every two seconds is
+// one run no matter how long the burst goes on, and a bubble's age says
+// nothing about which run the next message belongs to.
+//
+// Known divergence: this re-measures with its own clock what the batcher
+// already decided with its. OnIngested runs on a detached goroutine, so the
+// two measurements of one gap can differ by scheduling jitter, and a gap
+// within jitter of the window can be classified differently on the two sides
+// — a bubble for a round the batcher merged, or one bubble for two runs.
+// Removing it means threading the batcher's own verdict through the engine's
+// TypingNotifier seam (an upstream API change); until then the window is 3s
+// and the jitter is milliseconds.
 const sameRoundWindow = engine.DefaultChatRunBatchWindow
 
 // roundEnding says whether the words a closer is writing are the last this
@@ -96,12 +119,26 @@ const (
 	// that never opened a bubble at all. The caller has to find the chat some
 	// other way.
 	roundForgotten roundVerdict = iota
-	// roundOwesAnEnding — the bubble was closed early and the run went on, so
-	// its real ending has never been said. Addressing follows.
+	// roundOwesAnEnding — a bubble was closed early and its run went on, so
+	// the real ending has never been said. Addressing follows.
 	roundOwesAnEnding
 	// roundToldAlready — the answer landed, or another publisher's failure got
 	// here first. Nothing to add.
 	roundToldAlready
+)
+
+// openVerdict is the store's answer to "a message just arrived — does it get a
+// bubble of its own".
+type openVerdict int
+
+const (
+	// roundOpened — a new round. The caller paints the opening frame and arms
+	// the guard; from here on the round owns the handle it registered.
+	roundOpened openVerdict = iota
+	// roundJoined — inside the debounce window of the newest open round. The
+	// engine's batcher folds this message into that round's run, so the bubble
+	// already on screen is this message's receipt too and nothing is painted.
+	roundJoined
 )
 
 // streamHandle is everything needed to keep writing to one open bubble. The
@@ -111,11 +148,13 @@ const (
 type streamHandle struct {
 	// ReqID is the aibot_msg_callback's req_id. WeCom refuses a stream frame
 	// carrying any other value, including a req_id from an event callback
-	// (errcode 846605).
+	// (errcode 846605). Each round's bubble runs on the req_id of the message
+	// that opened it.
 	ReqID string
 
 	// StreamID is ours to choose. Reusing it updates the message; a new one
-	// opens another.
+	// opens another — which is exactly how a session comes to hold several
+	// bubbles at once.
 	StreamID string
 
 	// InstallationID finds the live socket. ChatID and ChatType address the
@@ -125,8 +164,9 @@ type streamHandle struct {
 	ChatID         string
 	ChatType       int
 
-	// Locale is the installation's copy language, captured here so the closing
-	// frame does not need a second installation read to know what to say.
+	// Locale is the copy language for whatever ends this bubble, captured at
+	// ingest from the sender's own profile (language.go) so the closing frame
+	// does not need another lookup to know what to say.
 	Locale Locale
 
 	// Level is how much of the run this bubble may show. It is settled at
@@ -135,12 +175,19 @@ type streamHandle struct {
 	// task id and nothing about a person.
 	Level progressLevel
 
+	// QueuedBehind records that this round was opened while another round was
+	// still open — it spent its life waiting in line. An empty answer for such
+	// a round means "handled together with the previous reply", which is worth
+	// saying differently from a first round's plain silence (StreamMerged vs
+	// StreamNoReply). Set by the store at open; callers registering a handle
+	// leave it false.
+	QueuedBehind bool
+
 	// Unusable says the server has disowned this stream (846608 / 846605): the
 	// bubble it painted is on the user's screen and no frame will ever touch it
 	// again, so what is left of the handle is the addressing. A caller that
 	// gets one writes its words as a plain message instead of a frame. Set by
-	// the store on the way out of take; a caller of claim always leaves it
-	// false.
+	// the store on the way out of take.
 	Unusable bool
 
 	CreatedAt time.Time
@@ -166,31 +213,40 @@ func (h streamHandle) address() roundAddress {
 	}
 }
 
-// endedRound is what a session keeps once its handle is gone: where the round
-// was speaking, and whether anything is still owed to it.
+// endedRound is what a session keeps once a handle is gone: where the round
+// was speaking, whether anything is still owed to it, and which run it was.
 //
-// The second field is the whole of it. A handle is taken by whichever ending
-// gets there first, and the five-minute guard is allowed to be that one — it
-// writes "still working, I'll reply separately" while the run carries on. The
-// failure that arrives afterwards finds no handle, and without this note it
-// used to return without a word: a promise, and then nothing.
+// owed is the heart of it. A handle is taken by whichever ending gets there
+// first, and the five-minute guard is allowed to be that one — it writes
+// "still working, I'll reply separately" while the run carries on. The failure
+// that arrives afterwards finds no handle, and without this note it used to
+// return without a word: a promise, and then nothing.
+//
+// taskID is the adoption fence. Once the guard has consumed a round's handle,
+// the round's run is still publishing progress, and the next open bubble in
+// line — a QUEUED message's — must not adopt it and start painting the
+// previous run's tool calls as its own (feedFor checks this).
+//
+// One note per session, not per round. Two guard-closed rounds both still owed
+// their endings is a corner within a corner — a session would need two runs
+// each longer than five minutes stacked up — and the last writer's address is
+// as good as the first's: both name the same chat.
 type endedRound struct {
-	addr roundAddress
-	owed bool
-	at   time.Time
+	addr   roundAddress
+	owed   bool
+	at     time.Time
+	taskID string
 }
 
-// streamEntry pairs a handle with the timer that closes it if nothing else
-// does. The timer is stored next to the handle so whoever consumes the handle
-// also disarms the guard, in one lock.
-type streamEntry struct {
+// roundEntry pairs one bubble's handle with everything scoped to its life: the
+// guard timer that closes it if nothing else does, the list of steps shown
+// inside it, and the run it adopted. Whoever takes or drops the round disposes
+// of all of it in one lock.
+type roundEntry struct {
 	handle streamHandle
 	guard  *time.Timer
 
 	// feed is the bubble's running list of steps, created on the first one.
-	// It lives here rather than beside the subscriber so its lifetime is the
-	// bubble's: whoever takes or drops the handle also disposes of the list,
-	// and nothing has to be swept separately.
 	feed *progressFeed
 
 	// taskID is the run this bubble belongs to, adopted from the first step
@@ -202,60 +258,41 @@ type streamEntry struct {
 	taskID string
 
 	// unusable is the server's verdict that this stream is finished with, kept
-	// rather than acted on by forgetting the entry. The bubble is over either
+	// rather than acted on by forgetting the round. The bubble is over either
 	// way; the round is not, and the handle is the only address the round's
 	// ending has.
 	unusable bool
 
-	// lastIngest is when this session last took a message — the bubble's own
-	// opening for the first one, and every follow-up after that. It is what
-	// separates a burst from a queue; see sameRoundWindow.
+	// lastIngest is when this round last took a message — the bubble's own
+	// opening for the first one, and every joined follow-up after that. On the
+	// newest round it is what separates a burst from a queue (sameRoundWindow).
 	lastIngest time.Time
-
-	// queuedTold says the user has been told that a later message is waiting
-	// behind the run this bubble belongs to. Said once per bubble: the news is
-	// the same for the second message and the fifth, and a receipt per message
-	// is the bot talking over itself.
-	queuedTold bool
 }
 
-// followUpVerdict is the store's answer to "another message just landed on a
-// session that already has a bubble — does the user need to hear about it".
-type followUpVerdict int
-
-const (
-	// followUpNoBubble — nothing open. The round ended between the claim that
-	// failed and this call, so there is no bubble and nothing to say about one.
-	followUpNoBubble followUpVerdict = iota
-	// followUpSameRound — inside the debounce window. The run trigger has not
-	// fired yet, so this message joins the run the bubble already stands for
-	// and the bubble is its receipt too.
-	followUpSameRound
-	// followUpQueued — past the window, so the run behind the bubble is under
-	// way and this message starts a round that waits for it. Nobody has said so
-	// yet and this caller is the one that may.
-	followUpQueued
-	// followUpToldAlready — as above, except the user already knows.
-	followUpToldAlready
-)
-
-// streamStore maps chat_session_id to the open bubble for that session, and —
-// for a while after the bubble is gone — to what the round it belonged to still
-// owes.
+// streamStore maps chat_session_id to that session's open bubbles, oldest
+// first, and — for a while after the last bubble is gone — to what the round
+// it belonged to still owes.
 type streamStore struct {
-	mu     sync.Mutex
-	byKey  map[string]streamEntry
-	ended  map[string]endedRound
+	mu       sync.Mutex
+	sessions map[string][]*roundEntry
+	ended    map[string]endedRound
+
+	// unadoptedDebt counts, per session, the rounds the guard closed before
+	// any run adopted them. Their runs are still coming and have no id on
+	// file to be fenced by; see settleUnadoptedDebtLocked.
+	unadoptedDebt map[string]int
+
 	maxAge time.Duration
 	now    func() time.Time
 }
 
 func newStreamStore() *streamStore {
 	return &streamStore{
-		byKey:  make(map[string]streamEntry),
-		ended:  make(map[string]endedRound),
-		maxAge: streamMaxAge,
-		now:    time.Now,
+		sessions:      make(map[string][]*roundEntry),
+		ended:         make(map[string]endedRound),
+		unadoptedDebt: make(map[string]int),
+		maxAge:        streamMaxAge,
+		now:           time.Now,
 	}
 }
 
@@ -263,91 +300,166 @@ func newStreamStore() *streamStore {
 // the typing indicator (writer) and the chat-done subscriber (reader).
 func NewStreamStore() *streamStore { return newStreamStore() }
 
-// claim registers a handle for a session and reports whether it took. A live
-// handle already on file wins: two messages inside one debounce window share a
-// single agent run, so a second bubble would be one nobody ever closes.
-func (s *streamStore) claim(sessionID pgtype.UUID, h streamHandle) bool {
+// open registers a message against a session and says whether it starts a
+// bubble of its own. Inside the debounce window of the newest open round it
+// joins that round — the engine's batcher is about to fold the two messages
+// into one run, and two bubbles for one answer is one bubble nobody ever
+// closes. Past the window it is a round of its own, opened immediately: it
+// will wait for as long as the run ahead of it needs, and that wait must not
+// look like silence.
+func (s *streamStore) open(sessionID pgtype.UUID, h streamHandle) openVerdict {
 	key := util.UUIDToString(sessionID)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sweepLocked()
-	if _, taken := s.byKey[key]; taken {
-		return false
+
+	rounds := s.sessions[key]
+	if n := len(rounds); n > 0 {
+		newest := rounds[n-1]
+		if s.now().Sub(newest.lastIngest) < sameRoundWindow {
+			newest.lastIngest = s.now()
+			return roundJoined
+		}
+		h.QueuedBehind = true
 	}
 	if h.CreatedAt.IsZero() {
 		h.CreatedAt = s.now()
 	}
-	s.byKey[key] = streamEntry{handle: h, lastIngest: h.CreatedAt}
+	s.sessions[key] = append(rounds, &roundEntry{handle: h, lastIngest: h.CreatedAt})
+	return roundOpened
+}
+
+// arm attaches the expiry guard to the round holding streamID. A round that
+// ended between the open and this call has already left the list, so there is
+// nothing to guard and the timer is stopped instead of leaked.
+func (s *streamStore) arm(sessionID pgtype.UUID, streamID string, t *time.Timer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.sessions[util.UUIDToString(sessionID)] {
+		if r.handle.StreamID == streamID {
+			r.guard = t
+			return
+		}
+	}
+	t.Stop()
+}
+
+// takeHead removes and returns the oldest open round — the one whose run is in
+// flight. The answer's closer when the event carries no task id.
+func (s *streamStore) takeHead(sessionID pgtype.UUID, ending roundEnding) (streamHandle, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := util.UUIDToString(sessionID)
+	rounds := s.sessions[key]
+	if len(rounds) == 0 {
+		return streamHandle{}, false
+	}
+	return s.takeAtLocked(key, 0, ending)
+}
+
+// takeTail removes and returns the newest open round — the one whose flush
+// just settled without producing a task (OnSettled). The rounds ahead of it
+// belong to runs that are still real.
+func (s *streamStore) takeTail(sessionID pgtype.UUID, ending roundEnding) (streamHandle, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := util.UUIDToString(sessionID)
+	rounds := s.sessions[key]
+	if len(rounds) == 0 {
+		return streamHandle{}, false
+	}
+	return s.takeAtLocked(key, len(rounds)-1, ending)
+}
+
+// takeTask removes and returns the round belonging to taskID.
+//
+// An exact adoption match anywhere in the list wins. Failing that, the head is
+// taken if it has not adopted a run yet — the tasks serialize per session, so
+// an unadopted head IS the running round, just one whose progress events never
+// arrived. A head that has adopted a DIFFERENT run is refused: taking it would
+// seal the wrong bubble, and the caller has the ended-notes path for a run
+// whose bubble is already gone. An empty taskID is a caller whose event named
+// no run at all, and gets the head unconditionally.
+func (s *streamStore) takeTask(sessionID pgtype.UUID, taskID string, ending roundEnding) (streamHandle, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := util.UUIDToString(sessionID)
+	rounds := s.sessions[key]
+	if len(rounds) == 0 {
+		return streamHandle{}, false
+	}
+	if taskID == "" {
+		return s.takeAtLocked(key, 0, ending)
+	}
+	for i, r := range rounds {
+		if r.taskID == taskID {
+			return s.takeAtLocked(key, i, ending)
+		}
+	}
+	if rounds[0].taskID == "" {
+		// The same two fences feedFor applies to adoption, because taking IS
+		// adopting: a run whose own bubble the guard already closed may not
+		// seize the queued round's bubble as its ending. The note names the
+		// run when its progress had reached the bubble before the guard fired;
+		// the debt covers the one that died wordless — per-session
+		// serialization makes the first unseen run to end the dead round's.
+		// Either way the caller's plain-message path delivers the words to the
+		// right chat, and the queued round keeps its bubble for its own run.
+		if note, has := s.ended[key]; has && note.taskID != "" && note.taskID == taskID {
+			return streamHandle{}, false
+		}
+		if s.settleUnadoptedDebtLocked(key, taskID) {
+			return streamHandle{}, false
+		}
+		// Taking is adopting: record whose ending this was, so the note the
+		// take files carries the run's real id rather than an empty one.
+		rounds[0].taskID = taskID
+		return s.takeAtLocked(key, 0, ending)
+	}
+	return streamHandle{}, false
+}
+
+// settleUnadoptedDebtLocked answers "does this run belong to a round whose
+// bubble the guard closed before the run ever spoke". Such a round had no task
+// id to leave a fence under, so the store counts them instead: tasks serialize
+// per session, so the first never-seen run to speak (or end) after such a
+// close is that round's. Settling the debt stamps the session's note with the
+// run's id, which restores the exact-id fence for the rest of that run's
+// events. Caller holds s.mu.
+func (s *streamStore) settleUnadoptedDebtLocked(key, taskID string) bool {
+	if s.unadoptedDebt[key] <= 0 {
+		return false
+	}
+	s.unadoptedDebt[key]--
+	if s.unadoptedDebt[key] == 0 {
+		delete(s.unadoptedDebt, key)
+	}
+	if note, has := s.ended[key]; has && note.taskID == "" {
+		note.taskID = taskID
+		s.ended[key] = note
+	}
 	return true
 }
 
-// followUp records another message arriving in a session whose bubble is
-// already open, and says whether the user is owed a word about it.
-//
-// The claim that just failed proves only that a bubble exists, which covers two
-// situations the user experiences completely differently. Inside the debounce
-// window the message is part of the run the bubble already stands for, and the
-// spinner on screen is the receipt for it as well. Past the window the run
-// trigger has already fired, the first run is under way — for as long as the
-// agent needs, which is what makes this visible at all — and this message
-// begins a round that sits in agent_task_queue until that one finishes.
-//
-// So the gap decides, and the timestamp it is measured from is the previous
-// message rather than the bubble's opening: the debouncer re-arms on every
-// message, so a slow burst is still one run and only the gaps within it say so
-// (sameRoundWindow).
-//
-// The latch is the other half. A queued round is queued once; three messages
-// piling onto it are three copies of the same news.
-func (s *streamStore) followUp(sessionID pgtype.UUID) followUpVerdict {
-	key := util.UUIDToString(sessionID)
-
+// takeStream removes and returns the round holding streamID — the guard's own
+// closer, which must end exactly the bubble whose timer fired and no other.
+func (s *streamStore) takeStream(sessionID pgtype.UUID, streamID string, ending roundEnding) (streamHandle, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	entry, ok := s.byKey[key]
-	if !ok {
-		return followUpNoBubble
-	}
-	now := s.now()
-	gap := now.Sub(entry.lastIngest)
-	entry.lastIngest = now
-
-	verdict := followUpQueued
-	switch {
-	case gap < sameRoundWindow:
-		verdict = followUpSameRound
-	case entry.queuedTold:
-		verdict = followUpToldAlready
-	default:
-		entry.queuedTold = true
-	}
-	s.byKey[key] = entry
-	return verdict
-}
-
-// arm attaches the expiry guard to a claimed handle. A run that finished
-// between the claim and this call has already taken the entry, so there is
-// nothing left to guard and the timer is stopped instead of leaked.
-func (s *streamStore) arm(sessionID pgtype.UUID, streamID string, t *time.Timer) {
 	key := util.UUIDToString(sessionID)
-
-	s.mu.Lock()
-	entry, ok := s.byKey[key]
-	if !ok || entry.handle.StreamID != streamID {
-		s.mu.Unlock()
-		t.Stop()
-		return
+	for i, r := range s.sessions[key] {
+		if r.handle.StreamID == streamID {
+			return s.takeAtLocked(key, i, ending)
+		}
 	}
-	entry.guard = t
-	s.byKey[key] = entry
-	s.mu.Unlock()
+	return streamHandle{}, false
 }
 
-// take removes a session's handle and hands it over — the ending of a round,
-// whichever ending it is. A handle past maxAge is dropped and reported as
-// absent: the server would refuse the frame, and a caller that believed it had
-// a bubble would leave the user with nothing.
+// takeAtLocked removes rounds[i] and hands its handle over — the ending of a
+// round, whichever ending it is. A handle past maxAge is dropped and reported
+// as absent: the server would refuse the frame, and a caller that believed it
+// had a bubble would leave the user with nothing.
 //
 // A disowned handle IS handed over, with Unusable set. Its bubble cannot be
 // sealed, but the round still has to end in words, and the addressing captured
@@ -357,24 +469,30 @@ func (s *streamStore) arm(sessionID pgtype.UUID, streamID string, t *time.Timer)
 // the guard ends the round; the guard's copy promises a separate reply, and the
 // note left behind is what makes that promise keepable — the failure that
 // arrives ten minutes later has no handle and needs both the address and the
-// knowledge that nobody has spoken yet.
-func (s *streamStore) take(sessionID pgtype.UUID, ending roundEnding) (streamHandle, bool) {
-	key := util.UUIDToString(sessionID)
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	entry, ok := s.byKey[key]
-	if !ok {
-		return streamHandle{}, false
+// knowledge that nobody has spoken yet. Caller holds s.mu.
+func (s *streamStore) takeAtLocked(key string, i int, ending roundEnding) (streamHandle, bool) {
+	rounds := s.sessions[key]
+	entry := rounds[i]
+	rounds = append(rounds[:i], rounds[i+1:]...)
+	if len(rounds) == 0 {
+		delete(s.sessions, key)
+	} else {
+		s.sessions[key] = rounds
 	}
-	delete(s.byKey, key)
 	if entry.guard != nil {
 		entry.guard.Stop()
 	}
 	if s.expiredLocked(entry.handle) {
 		return streamHandle{}, false
 	}
-	s.rememberLocked(key, entry.handle.address(), ending)
+	if ending == roundContinues && entry.taskID == "" {
+		// The guard closed a round no run had spoken for yet. Its run is
+		// still coming, with an id nobody knows — count it, so the first
+		// unseen run to speak is recognised as this round's rather than
+		// adopted by the next bubble in line.
+		s.unadoptedDebt[key]++
+	}
+	s.rememberLocked(key, entry.handle.address(), ending, entry.taskID)
 	entry.handle.Unusable = entry.unusable
 	return entry.handle, true
 }
@@ -384,16 +502,32 @@ func (s *streamStore) take(sessionID pgtype.UUID, ending roundEnding) (streamHan
 // gone, and the failure notice that had to find its chat in the binding row.
 // Both are endings, and both have to be on file or the next publisher of the
 // same news repeats it.
-func (s *streamStore) remember(sessionID pgtype.UUID, addr roundAddress, ending roundEnding) {
+func (s *streamStore) remember(sessionID pgtype.UUID, addr roundAddress, ending roundEnding, taskID string) {
 	key := util.UUIDToString(sessionID)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.rememberLocked(key, addr, ending)
+	s.rememberLocked(key, addr, ending, taskID)
 }
 
-func (s *streamStore) rememberLocked(key string, addr roundAddress, ending roundEnding) {
-	s.ended[key] = endedRound{addr: addr, owed: ending == roundContinues, at: s.now()}
+// rememberLocked files a round's ending, with one refusal: a finished ending
+// for one round must not erase a still-OWED note left by ANOTHER round's
+// guard. The owed note is a promise ("I'll reply separately") whose keeping
+// depends on this record existing when the failure arrives; dedup of the
+// finished round's own ending is what gets sacrificed, and that costs at most
+// a repeated notice where losing the note costs a broken promise.
+//
+// The refusal needs both ids to be known: the promised round's OWN ending —
+// the separate reply the guard promised — settles the note by matching, and
+// an ending whose run nobody named cannot be told apart from it, so it keeps
+// the old overwrite behaviour rather than contradict an answer the user is
+// already reading.
+func (s *streamStore) rememberLocked(key string, addr roundAddress, ending roundEnding, taskID string) {
+	if prev, ok := s.ended[key]; ok && prev.owed && ending == roundOver &&
+		prev.taskID != "" && taskID != "" && taskID != prev.taskID {
+		return
+	}
+	s.ended[key] = endedRound{addr: addr, owed: ending == roundContinues, at: s.now(), taskID: taskID}
 }
 
 // claimEnding asks whether a round with no bubble left is still owed an ending,
@@ -433,145 +567,173 @@ func (s *streamStore) remembered() int {
 	return len(s.ended)
 }
 
-// peek reads a session's handle without consuming it — the progress-refresh
-// path, which expects to write to the same bubble again. An expired handle is
-// evicted here too, and a disowned one is reported as absent: the question peek
-// answers is "is there a bubble I can write to", and there is not.
+// peek reads the head round's handle without consuming it — the running
+// round, the one whose answer is expected next. An expired head is evicted,
+// and a disowned one is reported as absent: the question peek answers is "is
+// there a bubble I can write to", and there is not.
 func (s *streamStore) peek(sessionID pgtype.UUID) (streamHandle, bool) {
-	key := util.UUIDToString(sessionID)
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	entry, ok := s.byKey[key]
-	if !ok {
-		return streamHandle{}, false
-	}
-	if s.expiredLocked(entry.handle) {
-		delete(s.byKey, key)
-		if entry.guard != nil {
-			entry.guard.Stop()
-		}
-		return streamHandle{}, false
-	}
-	if entry.unusable {
+	entry, ok := s.headLocked(util.UUIDToString(sessionID))
+	if !ok || entry.unusable {
 		return streamHandle{}, false
 	}
 	return entry.handle, true
 }
 
-// feedFor returns a session's open bubble and the list of steps shown inside
-// it, creating the list on first use. Like peek it leaves the handle in place,
-// evicts an expired one and refuses a disowned one: a run whose window has
-// closed gets no more refreshes, and its list goes with it.
+// headLocked returns the oldest live round, evicting expired ones from the
+// front of the list on the way. Caller holds s.mu.
+func (s *streamStore) headLocked(key string) (*roundEntry, bool) {
+	rounds := s.sessions[key]
+	for len(rounds) > 0 && s.expiredLocked(rounds[0].handle) {
+		if rounds[0].guard != nil {
+			rounds[0].guard.Stop()
+		}
+		rounds = rounds[1:]
+	}
+	if len(rounds) == 0 {
+		delete(s.sessions, key)
+		return nil, false
+	}
+	s.sessions[key] = rounds
+	return rounds[0], true
+}
+
+// feedFor returns the running round's handle and the list of steps shown in
+// its bubble, creating the list on first use. Like peek it leaves the round in
+// place, evicts an expired one and refuses a disowned one: a run whose window
+// has closed gets no more refreshes, and its list goes with it.
 //
-// taskID says which run is asking. The first run to speak adopts the bubble and
+// Only the head takes progress. The rounds behind it are queued — their runs
+// have not started, so nothing arriving now can be theirs.
+//
+// taskID says which run is asking. The first run to speak adopts the head and
 // every other one is refused, which is what keeps the previous turn's trailing
-// transcript out of the bubble this turn opened. An empty taskID is a caller
-// that already knows the session — UpdateProgress — and is trusted rather than
-// matched.
+// transcript out of the bubble this turn opened. The session's ended note is
+// the other half of that fence: a run whose own bubble was already closed —
+// the five-minute guard, mid-run — keeps publishing, and the queued bubble
+// next in line must not adopt it. An empty taskID is a caller that already
+// knows the session — UpdateProgress — and is trusted rather than matched.
 func (s *streamStore) feedFor(sessionID pgtype.UUID, taskID string) (streamHandle, *progressFeed, bool) {
 	key := util.UUIDToString(sessionID)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	entry, ok := s.byKey[key]
-	if !ok {
-		return streamHandle{}, nil, false
-	}
-	if s.expiredLocked(entry.handle) {
-		delete(s.byKey, key)
-		if entry.guard != nil {
-			entry.guard.Stop()
-		}
-		return streamHandle{}, nil, false
-	}
-	if entry.unusable {
+	entry, ok := s.headLocked(key)
+	if !ok || entry.unusable {
 		return streamHandle{}, nil, false
 	}
 	if taskID != "" && entry.taskID != "" && entry.taskID != taskID {
 		return streamHandle{}, nil, false
 	}
-	dirty := false
 	if taskID != "" && entry.taskID == "" {
+		if note, has := s.ended[key]; has && note.taskID != "" && note.taskID == taskID {
+			// This run's own bubble is already over; it may not have this one.
+			return streamHandle{}, nil, false
+		}
+		if s.settleUnadoptedDebtLocked(key, taskID) {
+			// First unseen run after a wordless guard close: this is the dead
+			// round's run, not the head's. Settling stamped the note with its
+			// id, so the rest of its events hit the exact-id fence above.
+			return streamHandle{}, nil, false
+		}
 		entry.taskID = taskID
-		dirty = true
 	}
 	if entry.feed == nil {
 		entry.feed = newProgressFeed(s.now)
-		dirty = true
-	}
-	if dirty {
-		s.byKey[key] = entry
 	}
 	return entry.handle, entry.feed, true
 }
 
-// markUnusable records the server's verdict that a session's stream will take
+// markUnusable records the server's verdict that a round's stream will take
 // no further frame, and reports whether this call is the one that recorded it.
 // Only that caller says so to the user; a second refresh that raced into the
 // same refusal has nothing to add.
 //
-// What it deliberately does not do is forget the entry. The bubble is over —
+// What it deliberately does not do is forget the round. The bubble is over —
 // peek and feedFor refuse it from here, so no later refresh buys another
 // refusal — but the round is not, and the entry is what the round's ending is
-// addressed with. Forgetting it, which is what this path used to do, also
-// stopped the guard, and left the run's failure with nowhere to be said: a dead
-// spinner, and a promise of a new message that never arrived.
-func (s *streamStore) markUnusable(sessionID pgtype.UUID) bool {
-	key := util.UUIDToString(sessionID)
-
+// addressed with.
+func (s *streamStore) markUnusable(sessionID pgtype.UUID, streamID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	entry, ok := s.byKey[key]
-	if !ok || entry.unusable {
-		return false
-	}
-	entry.unusable = true
-	s.byKey[key] = entry
-	return true
-}
-
-// drop forgets a session's handle without sending anything — used when the
-// opening frame was refused and the bubble the handle describes never existed.
-// A bubble the user can see is never dropped: it is marked (markUnusable) so
-// whatever ends the round still knows where to say so.
-func (s *streamStore) drop(sessionID pgtype.UUID) {
-	key := util.UUIDToString(sessionID)
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if entry, ok := s.byKey[key]; ok {
-		if entry.guard != nil {
-			entry.guard.Stop()
+	for _, r := range s.sessions[util.UUIDToString(sessionID)] {
+		if r.handle.StreamID == streamID {
+			if r.unusable {
+				return false
+			}
+			r.unusable = true
+			return true
 		}
-		delete(s.byKey, key)
+	}
+	return false
+}
+
+// drop forgets the round holding streamID without sending anything — used when
+// the opening frame was refused and the bubble the handle describes never
+// existed. A bubble the user can see is never dropped: it is marked
+// (markUnusable) so whatever ends the round still knows where to say so.
+func (s *streamStore) drop(sessionID pgtype.UUID, streamID string) {
+	key := util.UUIDToString(sessionID)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rounds := s.sessions[key]
+	for i, r := range rounds {
+		if r.handle.StreamID != streamID {
+			continue
+		}
+		if r.guard != nil {
+			r.guard.Stop()
+		}
+		rounds = append(rounds[:i], rounds[i+1:]...)
+		if len(rounds) == 0 {
+			delete(s.sessions, key)
+		} else {
+			s.sessions[key] = rounds
+		}
+		return
 	}
 }
 
-// depth reports how many bubbles are open. Diagnostics and tests only.
+// depth reports how many bubbles are open across all sessions. Diagnostics,
+// tests, and the cheap rejection at the head of the bus subscribers.
 func (s *streamStore) depth() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.byKey)
+	n := 0
+	for _, rounds := range s.sessions {
+		n += len(rounds)
+	}
+	return n
 }
 
 func (s *streamStore) expiredLocked(h streamHandle) bool {
 	return s.now().Sub(h.CreatedAt) > s.maxAge
 }
 
-// sweepLocked evicts handles the server would no longer accept, and the notes
+// sweepLocked evicts rounds the server would no longer accept, and the notes
 // left by rounds too old to still be running. The guard timer normally retires
-// an entry long before this fires; the sweep is what keeps a process whose
-// timers were beaten by a clock jump from accumulating keys forever, and it is
-// the only thing that bounds the notes, which no timer touches. Caller holds
-// s.mu.
+// a round long before this fires; the sweep is what keeps a process whose
+// timers were beaten by a clock jump from accumulating entries forever, and it
+// is the only thing that bounds the notes, which no timer touches. Caller
+// holds s.mu.
 func (s *streamStore) sweepLocked() {
-	for key, entry := range s.byKey {
-		if s.expiredLocked(entry.handle) {
-			if entry.guard != nil {
-				entry.guard.Stop()
+	for key, rounds := range s.sessions {
+		live := rounds[:0]
+		for _, r := range rounds {
+			if s.expiredLocked(r.handle) {
+				if r.guard != nil {
+					r.guard.Stop()
+				}
+				continue
 			}
-			delete(s.byKey, key)
+			live = append(live, r)
+		}
+		if len(live) == 0 {
+			delete(s.sessions, key)
+		} else {
+			s.sessions[key] = live
 		}
 	}
 	now := s.now()
@@ -579,5 +741,16 @@ func (s *streamStore) sweepLocked() {
 		if now.Sub(round.at) > roundMemory {
 			delete(s.ended, key)
 		}
+	}
+	// A debt is only meaningful while the session is still live enough to
+	// have a note or a bubble; past both, the run it waited for is long gone.
+	for key := range s.unadoptedDebt {
+		if _, hasRounds := s.sessions[key]; hasRounds {
+			continue
+		}
+		if _, hasNote := s.ended[key]; hasNote {
+			continue
+		}
+		delete(s.unadoptedDebt, key)
 	}
 }

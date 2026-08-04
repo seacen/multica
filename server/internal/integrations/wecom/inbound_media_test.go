@@ -224,7 +224,7 @@ func TestAPhotoTravelsFromTheSocketToTheChatMessage(t *testing.T) {
 		Dedup:      &deduper{q: &fakeDedupQueries{claimToken: uuidOf(9)}},
 		Session:    &sessionBinder{session: binder},
 		Audit:      &auditor{q: &fakeAuditQueries{}},
-		Media:      NewMediaResolver(storage, ledger, nil, testLogger()),
+		Media:      NewMediaResolver(storage, ledger, nil, nil, testLogger()),
 		OriginType: originWecomChat,
 	})
 	defer router.Drain(context.Background())
@@ -292,7 +292,7 @@ func TestATextMessagePaysNothingForTheMediaPath(t *testing.T) {
 		Dedup:      &deduper{q: &fakeDedupQueries{claimToken: uuidOf(9)}},
 		Session:    &sessionBinder{session: binder},
 		Audit:      &auditor{q: &fakeAuditQueries{}},
-		Media:      NewMediaResolver(&fakeMediaStorage{}, newFakeMediaLedger(nil), nil, testLogger()),
+		Media:      NewMediaResolver(&fakeMediaStorage{}, newFakeMediaLedger(nil), nil, nil, testLogger()),
 		OriginType: originWecomChat,
 	})
 	defer router.Drain(context.Background())

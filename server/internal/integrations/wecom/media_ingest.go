@@ -52,27 +52,30 @@ type mediaNotifier interface {
 }
 
 type wecomMediaResolver struct {
-	storage mediaStorage
-	ledger  engine.MediaIntentLedger
-	http    *http.Client
-	notify  mediaNotifier
-	logger  *slog.Logger
+	storage   mediaStorage
+	ledger    engine.MediaIntentLedger
+	http      *http.Client
+	notify    mediaNotifier
+	languages languageLookup
+	logger    *slog.Logger
 }
 
 // NewMediaResolver builds the wecom MediaResolver. storage and ledger are
 // required — without either there is nothing durable to point an attachment
 // at, and the resolver degrades to leaving the placeholder in place. senders
 // is optional and is taken as the concrete type so a nil argument leaves the
-// field nil rather than a typed-nil interface.
-func NewMediaResolver(storage mediaStorage, ledger engine.MediaIntentLedger, senders *sendersRegistry, logger *slog.Logger) engine.MediaResolver {
+// field nil rather than a typed-nil interface. languages picks the failure
+// notice's language off the sender's profile; nil means DefaultLocale.
+func NewMediaResolver(storage mediaStorage, ledger engine.MediaIntentLedger, senders *sendersRegistry, languages languageLookup, logger *slog.Logger) engine.MediaResolver {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	r := &wecomMediaResolver{
-		storage: storage,
-		ledger:  ledger,
-		http:    &http.Client{},
-		logger:  logger,
+		storage:   storage,
+		ledger:    ledger,
+		http:      &http.Client{},
+		languages: languages,
+		logger:    logger,
 	}
 	if senders != nil {
 		r.notify = senders
@@ -336,7 +339,9 @@ func (r *wecomMediaResolver) tellTheSender(inst engine.ResolvedInstallation, wm 
 	if chatID == "" {
 		return
 	}
-	c := copyFor(installationLocale(inst))
+	noticeCtx, cancel := context.WithTimeout(context.Background(), taskLookupTimeout)
+	c := copyFor(localeForSender(noticeCtx, r.languages, inst.ID, wm.SenderUserID))
+	cancel()
 	lines := make([]string, 0, len(failures))
 	for _, f := range failures {
 		switch f {
@@ -360,11 +365,3 @@ func (r *wecomMediaResolver) tellTheSender(inst engine.ResolvedInstallation, wm 
 	}
 }
 
-// installationLocale reads the copy language off the resolved installation,
-// falling back to the default when the platform payload is not a wecom one.
-func installationLocale(inst engine.ResolvedInstallation) Locale {
-	if wi, ok := inst.Platform.(Installation); ok {
-		return resolveLocale(wi.Locale)
-	}
-	return DefaultLocale
-}

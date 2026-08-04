@@ -207,6 +207,27 @@ func (mc aibotMsgCallback) attachments() []InboundMedia {
 	return out
 }
 
+// needsCopy reports whether routing this callback will read anything off the
+// copy pack — a media placeholder, the quote prefix, or (for a kind we cannot
+// read) the unsupported-type receipt. Plain text and voice with no quote do
+// not, which is what lets the read loop skip the per-sender language lookup
+// for the overwhelmingly common case.
+func (mc aibotMsgCallback) needsCopy() bool {
+	switch strings.ToLower(mc.MsgType) {
+	case "text":
+		return mc.Quote.render(copyFor(DefaultLocale)) != ""
+	case "voice":
+		// An empty transcript takes the unsupported-type receipt path, which
+		// reads the pack; a real transcript passes through untouched.
+		if strings.TrimSpace(mc.Voice.Content) == "" {
+			return true
+		}
+		return mc.Quote.render(copyFor(DefaultLocale)) != ""
+	default:
+		return true
+	}
+}
+
 // routableText returns the text this callback is stored and read as, and
 // whether there is any. It is the message's own body with any quoted message
 // rendered above it — see ownText for the body and quotedMessage.render for

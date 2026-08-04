@@ -365,8 +365,8 @@ func TestTheStoreRemembersWhereARoundWasSpeaking(t *testing.T) {
 		t.Errorf("verdict %v for a session the store never saw, want roundForgotten", verdict)
 	}
 
-	store.claim(session, streamHandle{ReqID: "R", StreamID: "S", ChatID: "T-alex", ChatType: chatTypeSingleInt})
-	if _, ok := store.take(session, roundContinues); !ok {
+	store.open(session, streamHandle{ReqID: "R", StreamID: "S", ChatID: "T-alex", ChatType: chatTypeSingleInt})
+	if _, ok := store.takeHead(session, roundContinues); !ok {
 		t.Fatal("take refused a handle just claimed")
 	}
 
@@ -387,8 +387,8 @@ func TestTheStoreRemembersWhereARoundWasSpeaking(t *testing.T) {
 func TestARoundThatEndedProperlyOwesNothing(t *testing.T) {
 	store := newStreamStore()
 	session := uuidOf(3)
-	store.claim(session, streamHandle{ReqID: "R", StreamID: "S", ChatID: "T-alex"})
-	store.take(session, roundOver)
+	store.open(session, streamHandle{ReqID: "R", StreamID: "S", ChatID: "T-alex"})
+	store.takeHead(session, roundOver)
 
 	if _, verdict := store.claimEnding(session); verdict != roundToldAlready {
 		t.Errorf("verdict %v after the round ended, want it accounted for", verdict)
@@ -403,11 +403,11 @@ func TestTheStoreForgetsARoundEventually(t *testing.T) {
 	base := time.Now()
 	store.now = func() time.Time { return base }
 	session := uuidOf(3)
-	store.claim(session, streamHandle{ReqID: "R", StreamID: "S", ChatID: "T-alex"})
-	store.take(session, roundContinues)
+	store.open(session, streamHandle{ReqID: "R", StreamID: "S", ChatID: "T-alex"})
+	store.takeHead(session, roundContinues)
 
 	store.now = func() time.Time { return base.Add(roundMemory + time.Second) }
-	store.claim(uuidOf(4), streamHandle{ReqID: "R2", StreamID: "S2"})
+	store.open(uuidOf(4), streamHandle{ReqID: "R2", StreamID: "S2"})
 
 	if _, verdict := store.claimEnding(session); verdict != roundForgotten {
 		t.Errorf("verdict %v for a round swept long ago, want roundForgotten", verdict)
