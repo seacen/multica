@@ -484,3 +484,51 @@ type stubWecomCredentials struct{}
 func (stubWecomCredentials) Credentials(wecom.Installation) (wecom.InstallationCredentials, error) {
 	return wecom.InstallationCredentials{}, errors.New("stub")
 }
+
+// TestWecomInstallSameBotOnASecondAgentConflicts pins the failure an admin is
+// most likely to hit second: the bot is already connected, and they try it on
+// another agent because that is the obvious way to give a second agent a WeCom
+// presence.
+//
+// UpsertChannelInstallation conflicts on (workspace_id, agent_id, channel_type),
+// so this request misses ON CONFLICT and trips
+// idx_channel_installation_type_appid — UNIQUE on (channel_type, app_id) —
+// instead. The handler used to return err.Error() verbatim as a 400, so what
+// reached the toast was `duplicate key value violates unique constraint
+// "idx_channel_installation_type_appid"`. It has to be a 409 that says where
+// the bot is.
+func TestWecomInstallSameBotOnASecondAgentConflicts(t *testing.T) {
+	h := wecomTestHandler(t)
+	firstAgent := createHandlerTestAgent(t, "WeCom Bot Holder", []byte(`{}`))
+	secondAgent := createHandlerTestAgent(t, "WeCom Bot Claimant", []byte(`{}`))
+	botID := "wb-conflict-" + firstAgent[:8]
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(),
+			`DELETE FROM channel_installation WHERE channel_type = 'wecom' AND agent_id = ANY($1)`,
+			[]string{firstAgent, secondAgent})
+	})
+
+	rec := httptest.NewRecorder()
+	req := newWecomInstallRequest(botID, "s3cret-plaintext")
+	req.URL.RawQuery = "agent_id=" + firstAgent
+	h.RegisterWecomBYO(rec, withURLParam(req, "id", testWorkspaceID))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first install status = %d, body %s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	req = newWecomInstallRequest(botID, "s3cret-plaintext")
+	req.URL.RawQuery = "agent_id=" + secondAgent
+	h.RegisterWecomBYO(rec, withURLParam(req, "id", testWorkspaceID))
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("second install status = %d, want 409; body %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "duplicate key") || strings.Contains(body, "idx_channel_installation") {
+		t.Fatalf("the raw Postgres error reached the caller: %s", body)
+	}
+	if !strings.Contains(body, "another agent in this workspace") {
+		t.Fatalf("the message does not say where the bot is: %s", body)
+	}
+}
