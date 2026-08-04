@@ -101,10 +101,18 @@ type copyPack struct {
 
 	// BindingPromptPrefix / BindingPromptSuffix wrap the bind URL.
 	// BindingPending replaces the whole thing when the mint was throttled and
-	// there is no URL to print.
+	// there is no URL to print. Both go to the sender alone, never to a room
+	// (replier.go) — the URL carries a bearer token.
 	BindingPromptPrefix string
 	BindingPromptSuffix string
 	BindingPending      string
+
+	// BindingSentPrivately is what the ROOM sees when an unbound member
+	// triggers the bot in a group: the prompt itself went to that member's
+	// 1:1 chat, and without this line the group would read the bot as broken.
+	// It names no one and carries no token, so it is safe in front of an
+	// audience of unknown size.
+	BindingSentPrivately string
 
 	// IssueCreatedPrefix leads the /issue confirmation; IssueTitleSeparator
 	// joins the identifier to the title when there is one.
@@ -262,22 +270,23 @@ func copyFor(l Locale) copyPack {
 
 var copyPacks = map[Locale]copyPack{
 	LocaleZhHans: {
-		AgentOffline:        "⚠️ 智能体当前不在线，你的消息已收到，等它上线后会处理。",
-		AgentArchived:       "⚠️ 该智能体已归档，无法回复。请联系工作区管理员。",
-		UnsupportedMsgType:  "我暂时读不了这种消息，麻烦用文字、图片或文件再发一次。",
-		MediaImage:          "[图片]",
-		MediaFile:           "[文件]",
-		MediaVideo:          "[视频]",
-		QuotePrefix:         "引用：",
-		MediaTooLarge:       "⚠️ 有附件超过 100MB，我读不了，麻烦压缩一下或换个方式发给我。",
-		MediaUnreadable:     "⚠️ 有附件我没能读取（链接可能已过期），麻烦重新发一次。",
-		MediaSendFailed:     "⚠️ 有文件没能发出来，我这边保留着，需要的话我再试一次。",
-		BindingPromptPrefix: "👋 请先绑定你的 Multica 账号，才能与我对话：\n",
-		BindingPromptSuffix: "\n（链接 15 分钟内有效）",
-		BindingPending:      "👋 绑定链接刚才已经发给你了，请点上一条消息里的链接完成绑定。",
-		IssueCreatedPrefix:  "✅ 已创建 ",
-		IssueTitleSeparator: " — ",
-		InboxDetailLink:     "查看详情",
+		AgentOffline:         "⚠️ 智能体当前不在线，你的消息已收到，等它上线后会处理。",
+		AgentArchived:        "⚠️ 该智能体已归档，无法回复。请联系工作区管理员。",
+		UnsupportedMsgType:   "我暂时读不了这种消息，麻烦用文字、图片或文件再发一次。",
+		MediaImage:           "[图片]",
+		MediaFile:            "[文件]",
+		MediaVideo:           "[视频]",
+		QuotePrefix:          "引用：",
+		MediaTooLarge:        "⚠️ 有附件超过 100MB，我读不了，麻烦压缩一下或换个方式发给我。",
+		MediaUnreadable:      "⚠️ 有附件我没能读取（链接可能已过期），麻烦重新发一次。",
+		MediaSendFailed:      "⚠️ 有文件没能发出来，我这边保留着，需要的话我再试一次。",
+		BindingPromptPrefix:  "👋 请先绑定你的 Multica 账号，才能与我对话：\n",
+		BindingPromptSuffix:  "\n（链接 15 分钟内有效）",
+		BindingPending:       "👋 绑定链接刚才已经发给你了，请点上一条消息里的链接完成绑定。",
+		BindingSentPrivately: "👋 绑定链接已私发给你，请在与我的单聊里完成绑定。",
+		IssueCreatedPrefix:   "✅ 已创建 ",
+		IssueTitleSeparator:  " — ",
+		InboxDetailLink:      "查看详情",
 		InboxTypeLabels: map[string]string{
 			"issue_assigned":     "任务指派",
 			"mentioned":          "提及你",
@@ -329,22 +338,23 @@ var copyPacks = map[Locale]copyPack{
 		},
 	},
 	LocaleEn: {
-		AgentOffline:        "⚠️ The agent is offline right now. Your message was received and will be handled once it's back.",
-		AgentArchived:       "⚠️ This agent has been archived and can't reply. Please contact your workspace admin.",
-		UnsupportedMsgType:  "I can't read that kind of message yet — please send text, an image or a file.",
-		MediaImage:          "[Image]",
-		MediaFile:           "[File]",
-		MediaVideo:          "[Video]",
-		QuotePrefix:         "Quoted: ",
-		MediaTooLarge:       "⚠️ One of those attachments is over 100MB, which I can't read. Please compress it or send it another way.",
-		MediaUnreadable:     "⚠️ I couldn't read one of those attachments — the link may have expired. Please send it again.",
-		MediaSendFailed:     "⚠️ I couldn't send one of the files. It is still here — say the word and I'll try again.",
-		BindingPromptPrefix: "👋 Link your Multica account before we can talk:\n",
-		BindingPromptSuffix: "\n(the link is good for 15 minutes)",
-		BindingPending:      "👋 I already sent you a link — tap the one in the message above to finish linking.",
-		IssueCreatedPrefix:  "✅ Created ",
-		IssueTitleSeparator: " — ",
-		InboxDetailLink:     "View details",
+		AgentOffline:         "⚠️ The agent is offline right now. Your message was received and will be handled once it's back.",
+		AgentArchived:        "⚠️ This agent has been archived and can't reply. Please contact your workspace admin.",
+		UnsupportedMsgType:   "I can't read that kind of message yet — please send text, an image or a file.",
+		MediaImage:           "[Image]",
+		MediaFile:            "[File]",
+		MediaVideo:           "[Video]",
+		QuotePrefix:          "Quoted: ",
+		MediaTooLarge:        "⚠️ One of those attachments is over 100MB, which I can't read. Please compress it or send it another way.",
+		MediaUnreadable:      "⚠️ I couldn't read one of those attachments — the link may have expired. Please send it again.",
+		MediaSendFailed:      "⚠️ I couldn't send one of the files. It is still here — say the word and I'll try again.",
+		BindingPromptPrefix:  "👋 Link your Multica account before we can talk:\n",
+		BindingPromptSuffix:  "\n(the link is good for 15 minutes)",
+		BindingPending:       "👋 I already sent you a link — tap the one in the message above to finish linking.",
+		BindingSentPrivately: "👋 I've sent the link to your direct chat with me — finish linking there.",
+		IssueCreatedPrefix:   "✅ Created ",
+		IssueTitleSeparator:  " — ",
+		InboxDetailLink:      "View details",
 		InboxTypeLabels: map[string]string{
 			"issue_assigned":     "Assigned",
 			"mentioned":          "Mentioned",

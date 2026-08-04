@@ -142,14 +142,55 @@ func (r *OutboundReplier) sendBindingPrompt(ctx context.Context, inst engine.Res
 	if err != nil {
 		return fmt.Errorf("wecom: mint binding token: %w", err)
 	}
-	// The throttle suppressed the mint: a live link is already in this chat.
+	// The throttle suppressed the mint: a live link is already with this user.
 	// Only its hash was ever stored, so there is no URL to rebuild — point
-	// the user at the message they already have.
+	// them at the message they already have.
 	if token.Reused {
-		return r.post(ctx, inst, msg, c.BindingPending)
+		return r.tellSenderPrivately(ctx, inst, msg, sender, c.BindingPending, c)
 	}
 	bindURL := r.appURL + r.bindingPath + "?token=" + url.QueryEscape(token.Raw)
-	return r.post(ctx, inst, msg, c.BindingPromptPrefix+bindURL+c.BindingPromptSuffix)
+	return r.tellSenderPrivately(ctx, inst, msg, sender, c.BindingPromptPrefix+bindURL+c.BindingPromptSuffix, c)
+}
+
+// tellSenderPrivately delivers a binding message to the one person it is
+// about, whatever room triggered it.
+//
+// A binding token is a bearer credential. binding.Redeem only checks that the
+// redeemer belongs to the token's workspace, and the bind page redeems on load
+// as whoever is signed in — so the first colleague to click owns the link.
+// Sending to msg.Source.ChatID, which in a group IS the group, puts that
+// credential in front of everyone in the room: any of them can bind the
+// sender's WeCom userid to their own Multica account, after which the sender's
+// messages — /issue included — resolve through identityResolver to the
+// hijacker. The sender only ever sees "already bound".
+//
+// So the prompt goes to the sender's own userid with chat_type=1. That is the
+// same address outbound.go pushes inbox cards to, and Lark's
+// SendBindingPromptCard targets the sender's OpenID for the same reason. The
+// room gets a separate line carrying no token, because a bot that answers a
+// group message with silence reads as broken.
+func (r *OutboundReplier) tellSenderPrivately(ctx context.Context, inst engine.ResolvedInstallation, msg channel.InboundMessage, sender, text string, c copyPack) error {
+	if r.senders == nil {
+		return errors.New("wecom: sender registry not configured")
+	}
+	if !inst.ID.Valid {
+		return errors.New("wecom: installation id is zero")
+	}
+	if err := r.senders.send(inst.ID, pendingSend{
+		ChatID:   sender,
+		ChatType: chatTypeSingleInt,
+		Content:  text,
+	}); err != nil {
+		return err
+	}
+	// A 1:1 trigger was already answered in the only room there is. Only a
+	// group is still waiting for a reply — and only after the private send
+	// has been accepted, so the room is never pointed at a message that the
+	// wire refused.
+	if aibotChatTypeFromChannel(msg.Source.ChatType) != chatTypeGroupInt {
+		return nil
+	}
+	return r.post(ctx, inst, msg, c.BindingSentPrivately)
 }
 
 // post hands the text to the registry's outbound queue, which writes it to
