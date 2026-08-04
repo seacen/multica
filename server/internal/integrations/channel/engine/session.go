@@ -272,6 +272,12 @@ type AppendInput struct {
 	ThreadID            string
 	ClaimToken          pgtype.UUID
 	MediaPendingSeconds float64
+
+	// MessageKind stamps chat_message.message_kind. Empty keeps the column's
+	// own default ('message'), which is what every ordinary turn wants. The
+	// Router sets protocol.ChatMessageKindCommand for a message it answered
+	// itself, which is how that row stays out of the next run's input batch.
+	MessageKind string
 }
 
 // BindMediaInput links already-uploaded media to either an /issue target or a
@@ -331,6 +337,7 @@ func (s *ChatSession) AppendUserMessage(ctx context.Context, in AppendInput) (Ap
 		MessageKind:             textOrNullIf(cmd != nil, channelCommandMessageKind),
 		ChannelMediaPendingSecs: pgtype.Float8{Float64: in.MediaPendingSeconds, Valid: in.MediaPendingSeconds > 0},
 		ChannelIngested:         pgtype.Bool{Bool: true, Valid: true},
+		MessageKind:             pgtype.Text{String: in.MessageKind, Valid: in.MessageKind != ""},
 	})
 	if err != nil {
 		return AppendResult{}, fmt.Errorf("create chat message: %w", err)

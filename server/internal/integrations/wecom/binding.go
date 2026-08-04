@@ -37,14 +37,30 @@ const BindingTokenTTL = 15 * time.Minute
 
 // BindingTokenMintInterval is how often one platform user can be issued a new
 // binding link. Every message from an unbound user reaches the needs_binding
-// outcome, so without a floor here a user who types six lines writes six
-// token rows and receives six links, only the last of which they will click.
+// outcome, so without a floor here a user who types six lines writes six token
+// rows and receives six links, only the last of which they will click.
 //
-// It has to stay comfortably inside BindingTokenTTL: at 10 minutes against a
-// 15-minute token, the link a throttled user is pointed back at still has at
-// least five minutes on it, and once the window passes they get a fresh one.
-// A throttle at or past the TTL would strand them with no valid link.
-const BindingTokenMintInterval = 10 * time.Minute
+// A BURST window, not a session-long one, and that distinction is the whole
+// point. Suppressing a mint asserts that the link already sent is in the
+// user's hands, and nothing anywhere checks: the send returns as soon as the
+// transport accepts the message, the socket acks asynchronously and a refusal
+// is only logged, and the holding queue can drop a message it already
+// accepted — over its cap, or past its shelf life. When the first prompt is
+// lost that way, a long window turns a lost message into a dead end: every
+// message the user sends is answered with "tap the link I sent you", pointing
+// at something that was never delivered, and they cannot link an account at
+// all until the window passes.
+//
+// Sixty seconds does the job the throttle was written for — six lines typed in
+// one breath still write one row — and costs at most one row a minute for a
+// user who keeps writing, against rows that expire in fifteen. The price of
+// being wrong is now one more message, not ten minutes of a bot insisting it
+// already answered.
+//
+// It must stay comfortably inside BindingTokenTTL so a link a throttled user
+// is pointed back at still has real time left on it. At a minute against a
+// fifteen-minute token there is no contest.
+const BindingTokenMintInterval = time.Minute
 
 var (
 	// ErrBindingTokenInvalid: token unknown / already consumed / expired.

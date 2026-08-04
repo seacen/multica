@@ -26,6 +26,7 @@ import (
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
 // chatTranscript stands in for the database on both sides of the question
@@ -50,6 +51,9 @@ type transcriptRow struct {
 	// taskID is chat_message.task_id: 0 stands for NULL, i.e. no run owns
 	// this row yet and the next seal will take it.
 	taskID int
+	// kind is chat_message.message_kind. protocol.ChatMessageKindCommand marks
+	// a message the engine answered itself; the seal skips those.
+	kind string
 }
 
 // ---- the append side (engineSessionBinder) ----
@@ -61,7 +65,12 @@ func (tr *chatTranscript) EnsureSession(context.Context, engine.EnsureSessionInp
 func (tr *chatTranscript) AppendUserMessage(_ context.Context, in engine.AppendInput) (engine.AppendResult, error) {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
-	tr.rows = append(tr.rows, &transcriptRow{body: in.Body})
+	// The real binder stamps chat_message.message_kind from in.MessageKind and
+	// LinkUnownedChannelChatMessagesToTask refuses 'command' rows, so a row the
+	// engine answered itself is never anybody's input. Mirrored here because
+	// the assertion is about the bodies the agent receives, not about how a row
+	// is kept out of them.
+	tr.rows = append(tr.rows, &transcriptRow{body: in.Body, kind: in.MessageKind})
 	// Same parse, off the same source, as the real binder: the stored body is
 	// the agent-readable text, the command is read off the user's own line.
 	source := in.CommandText
@@ -82,7 +91,7 @@ func (tr *chatTranscript) EnqueueChatTask(context.Context, db.ChatSession, pgtyp
 	taskID := len(tr.batches) + 1
 	batch := []string{}
 	for _, row := range tr.rows {
-		if row.taskID != 0 {
+		if row.taskID != 0 || row.kind == protocol.ChatMessageKindCommand {
 			continue
 		}
 		row.taskID = taskID

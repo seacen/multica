@@ -44,6 +44,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
@@ -556,12 +557,32 @@ func skillFragment(input map[string]any) string {
 // seen. Both are exactly the cases where the parameters are the only thing
 // that says what is happening.
 //
-// Three things are excluded. A content block, by key (progressBodyKeys). A
-// nested object or array, because it is either a body or a structure that
-// would not fit on a line either way. And an empty value, which says nothing.
-// Keys are sorted so the same call reads the same way twice — the input is a
-// map and Go's iteration order is not stable, and a step that reshuffles
-// itself between frames looks like a different step.
+// A content block is excluded twice over, by name and by shape, because the
+// name alone cannot do it. progressBodyKeys lists the 24 keys tools were
+// observed to put a body under, and a list only knows what somebody already
+// wrote down: the next provider spells it `code`, or `file_contents`, or
+// renames `new_string` to `new_text`, and a denylist hands the file straight
+// to the chat. That is not a hypothetical — it leaks whatever is on the first
+// line of the file, which for an .env is the secret, into a WeCom message
+// nobody can unsend.
+//
+// So the value decides too, and it fails closed: anything spanning more than
+// one line is a body, and so is anything longer than an argument could
+// usefully be on a phone. What survives is what argsFragment is for — a path,
+// a command, a query, an id, a flag.
+//
+// Being honest about the limit: a SHORT, single-line value under an unknown
+// key is indistinguishable from an argument, and this shows it. The claim this
+// enforces is therefore "no body reaches the bubble", not "nothing the tool
+// was given reaches the bubble" — the latter is what the two-tier gate is for,
+// and it is why this whole line is confined to the principal's own 1:1 and
+// never appears in a group.
+//
+// Also excluded: a nested object or array, because it is either a body or a
+// structure that would not fit on a line either way, and an empty value, which
+// says nothing. Keys are sorted so the same call reads the same way twice —
+// the input is a map, Go's iteration order is not stable, and a step that
+// reshuffles itself between frames looks like a different step.
 func argsFragment(input map[string]any) string {
 	if len(input) == 0 {
 		return ""
@@ -595,6 +616,9 @@ func argsFragment(input map[string]any) string {
 		if strings.TrimSpace(val) == "" {
 			continue
 		}
+		if looksLikeBody(val) {
+			continue
+		}
 		parts = append(parts, k+"="+val)
 		// The join is capped anyway; stopping early keeps a tool with fifty
 		// parameters from building a string only to throw it away.
@@ -603,6 +627,30 @@ func argsFragment(input map[string]any) string {
 		}
 	}
 	return safeFragment(strings.Join(parts, ", "))
+}
+
+// argMaxRunes is the longest a value can be and still be identifying WORK
+// rather than being the work. A path, a shell command with its flags, a search
+// query and a URL all fit; a file, a captured stdout and a page of markdown do
+// not. Set above the longest argument seen in practice rather than tight, so
+// the newline test below carries the weight and this only catches a body that
+// happens to be minified onto one line.
+const argMaxRunes = 128
+
+// looksLikeBody reports whether a value is content rather than an argument,
+// from its shape alone — which is the only signal available when the key is
+// one nobody has seen before.
+//
+// More than one line is the load-bearing test: a file, a diff, a captured
+// output and a markdown page all span lines, and an argument does not. Length
+// is the backstop for the one-line blob. Both are deliberately crude; the
+// question they answer is not "what is this" but "could a person read this on
+// one line of a chat bubble and learn what the agent is doing".
+func looksLikeBody(val string) bool {
+	if strings.ContainsAny(val, "\n\r") {
+		return true
+	}
+	return utf8.RuneCountInString(val) > argMaxRunes
 }
 
 // mcpToolParts splits an MCP tool name — `mcp__<server>__<tool>` — into the
@@ -801,11 +849,22 @@ func (f *progressFeed) renderLocked(c copyPack, elapsed time.Duration) string {
 // rendered rather than as each increment arrives — the increments are cut
 // wherever the batching fell, so a blank line can be split across two of them
 // and only the whole is worth looking at.
+// It also defuses the accumulated buffer one last time, which is the only
+// place that can. safeThinking neutralises a `</think>` on the way in, but it
+// sees one flush at a time: reasoning arriving as `</th` and then `ink>` has
+// each half pass untouched and becomes a live closing tag once record() joins
+// them. The bubble is one string wrapped in `<think>…</think>`, so a closing
+// tag in the middle folds the panel early and drops the rest of the reasoning
+// into the chat as the bot's answer.
+//
+// Here rather than in record() because the buffer is rune-capped as it is
+// appended: defusing before the cap risks the zero-width space being exactly
+// what gets sliced off, which would put the tag back together again.
 func tidyThinking(s string) string {
 	for strings.Contains(s, "\n\n\n") {
 		s = strings.ReplaceAll(s, "\n\n\n", "\n\n")
 	}
-	return strings.TrimSpace(s)
+	return defuseThinkTags(strings.TrimSpace(s))
 }
 
 // formatElapsed renders a duration the same way the web chat's status pill

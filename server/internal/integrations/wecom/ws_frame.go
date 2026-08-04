@@ -468,6 +468,15 @@ func channelMessageFromCallback(botID string, mc aibotMsgCallback, c copyPack, t
 		Type:           channelMsgType(mc.MsgType),
 		Text:           text,
 		AddressedToBot: true,
+		// The sender's OWN words, without the quote block Text carries ahead
+		// of them. Command classification is shared (channel/message.go), and
+		// without this the shared parser falls back to Text — whose first
+		// non-empty line, when the user replied to somebody, is the rendered
+		// quote. `/new` typed under a quoted message was read as quoted prose
+		// and silently dropped, and the fresh session never happened. Lark
+		// sets this from CommandBody and Slack from its text; WeCom was the
+		// one adapter leaving it empty.
+		CommandText: command,
 		// A pure /issue command in WeChat Work should NOT trigger the
 		// agent — the engine already creates the issue and the
 		// OutboundReplier already sends "✅ 已创建 #N". Letting the agent

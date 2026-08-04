@@ -208,6 +208,7 @@ func (r *feishuSessionBinder) AppendMessage(ctx context.Context, p engine.Append
 		commandText = p.Message.Text
 	}
 	return r.session.AppendUserMessage(ctx, engine.AppendInput{
+		MessageKind:         p.MessageKind(),
 		SessionID:           p.SessionID,
 		Sender:              p.Sender,
 		InstallationID:      p.InstallationID,

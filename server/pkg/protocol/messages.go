@@ -200,6 +200,17 @@ const (
 	// the opening self-describes: chat renders the starter cards under this
 	// kind instead of quick-action chips (MUL-5765).
 	ChatMessageKindOnboardingOpening = "onboarding_opening"
+	// ChatMessageKindCommand marks a user message the ENGINE answered by
+	// itself, so no agent run should ever be given it to read. Today that is a
+	// standalone /issue on a channel that files the issue and replies "created
+	// #N" without waking the agent.
+	//
+	// The row is still stored and still the user's own words — it belongs in
+	// the transcript — but LinkUnownedChannelChatMessagesToTask skips it.
+	// Without that, suppressing the run only defers the problem: the row stays
+	// unowned, the next run's seal sweeps every unowned user row, and the
+	// agent reads the slash command anyway, one turn late.
+	ChatMessageKindCommand = "command"
 )
 
 // ChatDonePayload is broadcast when an agent finishes responding to a chat
