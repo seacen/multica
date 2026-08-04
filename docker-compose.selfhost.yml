@@ -149,6 +149,8 @@ services:
       # Room copy language: zh-Hans (default) or en. 1:1 chats ignore it and
       # read the person's own Multica profile language.
       MULTICA_WECOM_DEFAULT_LOCALE: ${MULTICA_WECOM_DEFAULT_LOCALE:-}
+      # 1 = 记录每一个出入站帧(含消息文本前 120 字),只在验证会话期间开。
+      MULTICA_WECOM_TRACE: ${MULTICA_WECOM_TRACE:-}
     restart: unless-stopped
 
   frontend:

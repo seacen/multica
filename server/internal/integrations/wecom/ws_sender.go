@@ -242,6 +242,7 @@ type replyResult struct {
 // req_ids are ours and a stream's are the server's — one lookup settles which
 // kind of answer this is without the frame having to say.
 func (s *wsSender) routeResponse(env frameEnvelope) bool {
+	traceIn(s.log, env)
 	if s.deliverReply(env) {
 		return true
 	}
@@ -509,6 +510,7 @@ func (s *wsSender) writeWithContext(ctx context.Context, frame map[string]any) e
 	if err != nil {
 		return fmt.Errorf("wecom: marshal frame: %w", err)
 	}
+	traceOut(s.log, frame)
 	if err := s.lockWriter(ctx); err != nil {
 		return err
 	}
@@ -537,6 +539,7 @@ func (s *wsSender) writeStreamFrame(ctx context.Context, reqID string, w *ackWai
 	if !s.beginStreamFrameLocked(reqID, w, finish) {
 		return errStreamSuperseded
 	}
+	traceOut(s.log, frame)
 	if err := s.writeLocked(ctx, payload); err != nil {
 		s.abortStreamFrameLocked(reqID)
 		return err

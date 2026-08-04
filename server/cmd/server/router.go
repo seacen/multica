@@ -668,6 +668,16 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				slog.Info("wecom: room copy language",
 					"locale", string(wecom.SetDeploymentLocale(os.Getenv("MULTICA_WECOM_DEFAULT_LOCALE"))))
 
+				// Frame tracing for a verification session. Off unless asked
+				// for: it records message text, bounded, and the point of it
+				// is that afterwards someone can check what the bot actually
+				// sent and to whom, instead of asking a person what they
+				// remember seeing on a phone. Turn it off when the session
+				// ends.
+				if wecom.SetTrace(os.Getenv("MULTICA_WECOM_TRACE") == "1") {
+					slog.Warn("wecom: frame tracing ON — records message text; unset MULTICA_WECOM_TRACE when done")
+				}
+
 				// Binding tokens back the per-user "link your Multica account"
 				// prompt sent to first-time WeCom senders. aibot userids are
 				// anonymized T-prefixed ids with no relation to real userids

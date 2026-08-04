@@ -310,6 +310,7 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 		}
 		pack := c.packFor(ctx, mc)
 		text, ok := mc.routableText(pack)
+		traceInbound(log, mc, text)
 		if !ok {
 			// Nothing in this message can be read: a kind the adapter does
 			// not know, or a known kind that arrived without the one field
