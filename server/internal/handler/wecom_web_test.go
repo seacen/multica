@@ -531,4 +531,17 @@ func TestWecomInstallSameBotOnASecondAgentConflicts(t *testing.T) {
 	if !strings.Contains(body, "another agent in this workspace") {
 		t.Fatalf("the message does not say where the bot is: %s", body)
 	}
+	// The sentence is the fallback; the code is what a localized client
+	// renders. Without it the settings tab can only toast the server's
+	// English at an admin who set their profile to something else.
+	var decoded struct {
+		Error string `json:"error"`
+		Code  string `json:"code"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &decoded); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	if decoded.Code != "wecom_bot_owned_by_same_workspace" {
+		t.Fatalf("code = %q, want a stable identifier the UI can localize", decoded.Code)
+	}
 }

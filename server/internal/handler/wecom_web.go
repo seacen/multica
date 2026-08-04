@@ -171,17 +171,24 @@ func (h *Handler) RegisterWecomBYO(w http.ResponseWriter, r *http.Request) {
 		// err.Error() here used to toast them the raw "duplicate key value
 		// violates unique constraint" text — and forwarded every other database
 		// error verbatim to the API caller besides.
+		// Each case carries a code as well as the sentence, so the settings tab
+		// can say this in the admin's own language instead of toasting English
+		// at them (the sentence remains the fallback).
 		switch {
 		case errors.Is(err, wecom.ErrBotOwnedBySameWorkspace):
-			writeError(w, http.StatusConflict, "this bot is already connected to another agent in this workspace — disconnect it there first, then connect it here")
+			writeErrorCode(w, http.StatusConflict, "wecom_bot_owned_by_same_workspace",
+				"this bot is already connected to another agent in this workspace — disconnect it there first, then connect it here")
 		case errors.Is(err, wecom.ErrBotOwnedByArchivedAgent):
-			writeError(w, http.StatusConflict, "this bot is connected to an archived agent in this workspace — restore that agent, or disconnect its bot, before connecting it here")
+			writeErrorCode(w, http.StatusConflict, "wecom_bot_owned_by_archived_agent",
+				"this bot is connected to an archived agent in this workspace — restore that agent, or disconnect its bot, before connecting it here")
 		case errors.Is(err, wecom.ErrBotOwnedByAnotherWorkspace):
-			writeError(w, http.StatusConflict, "this bot is already connected to a different Multica workspace — disconnect it there before connecting it here")
+			writeErrorCode(w, http.StatusConflict, "wecom_bot_owned_by_another_workspace",
+				"this bot is already connected to a different Multica workspace — disconnect it there before connecting it here")
 		default:
 			slog.Warn("wecom install failed",
 				"error", err, "workspace_id", uuidToString(wsUUID), "agent_id", uuidToString(agentUUID))
-			writeError(w, http.StatusBadRequest, "could not connect the WeCom bot — check the Bot ID and secret from the WeChat Work admin console, and that the bot is a smart bot with the long connection enabled")
+			writeErrorCode(w, http.StatusBadRequest, "wecom_install_rejected",
+				"could not connect the WeCom bot — check the Bot ID and secret from the WeChat Work admin console, and that the bot is a smart bot with the long connection enabled")
 		}
 		return
 	}

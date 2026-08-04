@@ -831,7 +831,7 @@
   },
   "wecom": {
     "section_title": "WeChat Work",
-    "page_description": "各 Multica エージェントを専用の WeChat Work スマートボットに接続します。WebSocket ロングコネクションで受信するため、公開コールバック URL は不要です。",
+    "page_description": "Multica の各エージェントを専用の WeChat Work（企业微信）スマートボットに接続します。メンバーはボットに DM を送り、グループで @ メンションし、/issue と入力して Multica の issue を作成できます。",
     "not_enabled_title": "WeChat Work 連携が有効化されていません",
     "not_enabled_description_prefix": "サーバー側で",
     "not_enabled_description_suffix": "を設定すると WeChat Work スマートボットのインストールが有効になります。",
@@ -867,6 +867,10 @@
     "byo_submitting": "接続中…",
     "byo_cancel": "キャンセル",
     "byo_success_toast": "WeChat Work ボットを接続しました",
-    "byo_failed_toast": "WeChat Work ボットを接続できませんでした"
+    "byo_failed_toast": "WeChat Work ボットを接続できませんでした",
+    "byo_conflict_same_workspace": "このボットはこのワークスペースの別のエージェントに接続済みです。先にそちらで切断してから、ここに接続してください。",
+    "byo_conflict_archived_agent": "このボットはこのワークスペースのアーカイブ済みエージェントに接続されています。そのエージェントを復元するか、ボットを切断してから接続してください。",
+    "byo_conflict_other_workspace": "このボットは別の Multica ワークスペースに接続済みです。先にそちらで切断してから接続してください。",
+    "byo_rejected": "ボットを接続できませんでした。WeChat Work 管理コンソールの Bot ID とシークレット、および長時間接続が有効なスマートボットであることを確認してください。"
   }
 }

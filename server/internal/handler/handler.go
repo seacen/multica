@@ -443,6 +443,19 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
+// writeErrorCode is writeError plus a stable, machine-readable identifier the
+// UI can localize, in the shape ApiError.body already documents and
+// dispatchReasonCode already reads (MUL-4525).
+//
+// A bare `error` string reaches the user exactly as written, in English,
+// whatever language they set their profile to — the app ships four locales and
+// the failure path is the one place that ignores them. The message stays as the
+// fallback for an older client or a non-UI caller; the code is what a localized
+// client renders.
+func writeErrorCode(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg, "code": code})
+}
+
 // Thin wrappers around util functions.
 //
 // parseUUID is intentionally the panicking variant: any handler call site

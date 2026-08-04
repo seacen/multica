@@ -832,7 +832,7 @@
   },
   "wecom": {
     "section_title": "WeChat Work",
-    "page_description": "Connect each Multica Agent to its own WeChat Work smart bot. Members message the bot in WeChat Work and the Agent replies through a long WebSocket connection — no public callback URL is required.",
+    "page_description": "Connect each Multica Agent to its own WeChat Work (企业微信) smart bot. Members can DM the bot, @ it in groups, and type /issue to spin up a new Multica issue.",
     "not_enabled_title": "WeChat Work integration not enabled",
     "not_enabled_description_prefix": "Set",
     "not_enabled_description_suffix": "on the server to enable WeChat Work smart-bot installations.",
@@ -868,6 +868,10 @@
     "byo_submitting": "Connecting…",
     "byo_cancel": "Cancel",
     "byo_success_toast": "WeChat Work bot connected",
-    "byo_failed_toast": "Could not connect the WeChat Work bot"
+    "byo_failed_toast": "Could not connect the WeChat Work bot",
+    "byo_conflict_same_workspace": "This bot is already connected to another Agent in this workspace. Disconnect it there first, then connect it here.",
+    "byo_conflict_archived_agent": "This bot is connected to an archived Agent in this workspace. Restore that Agent, or disconnect its bot, before connecting it here.",
+    "byo_conflict_other_workspace": "This bot is already connected to a different Multica workspace. Disconnect it there before connecting it here.",
+    "byo_rejected": "Could not connect the bot. Check the Bot ID and secret from the WeChat Work admin console, and that it is a smart bot with the long connection enabled."
   }
 }

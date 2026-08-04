@@ -831,7 +831,7 @@
   },
   "wecom": {
     "section_title": "企业微信",
-    "page_description": "将每个 Multica 智能体连接到专属的企业微信智能机器人。成员在企业微信中与机器人对话，Agent 通过长连接实时回复——无需公网回调地址。",
+    "page_description": "将每个 Multica 智能体连接到专属的企业微信智能机器人。成员可私聊机器人、在群里 @ 它，或输入 /issue 直接创建 Multica issue。",
     "not_enabled_title": "企业微信集成未启用",
     "not_enabled_description_prefix": "在服务器上设置",
     "not_enabled_description_suffix": "以启用企业微信智能机器人的安装。",
@@ -867,6 +867,10 @@
     "byo_submitting": "连接中…",
     "byo_cancel": "取消",
     "byo_success_toast": "企业微信机器人已连接",
-    "byo_failed_toast": "无法连接企业微信机器人"
+    "byo_failed_toast": "无法连接企业微信机器人",
+    "byo_conflict_same_workspace": "该机器人已连接到本工作区的另一个智能体。请先在那里断开，再连接到这里。",
+    "byo_conflict_archived_agent": "该机器人连接在本工作区一个已归档的智能体上。请先恢复那个智能体，或断开它的机器人，再连接到这里。",
+    "byo_conflict_other_workspace": "该机器人已连接到另一个 Multica 工作区。请先在那边断开，再连接到这里。",
+    "byo_rejected": "无法连接机器人。请核对企业微信管理后台的 Bot ID 与密钥，并确认它是已开启长连接的智能机器人。"
   }
 }

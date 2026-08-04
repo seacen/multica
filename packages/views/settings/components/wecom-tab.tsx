@@ -31,10 +31,11 @@ import { useWorkspaceId } from "@multica/core/hooks";
 import { memberListOptions } from "@multica/core/workspace/queries";
 import { useActorName } from "@multica/core/workspace/hooks";
 import { wecomInstallationsOptions, wecomKeys } from "@multica/core/wecom";
-import { api } from "@multica/core/api";
+import { api, errorCode } from "@multica/core/api";
 import type { WecomInstallation } from "@multica/core/types";
 import { ActorAvatar } from "../../common/actor-avatar";
 import { useT } from "../../i18n";
+
 
 // WecomTab is the workspace settings panel for WeChat Work smart-bot
 // installations. Listing is member-visible; the disconnect action is
@@ -312,8 +313,25 @@ export function WecomAgentBindButton({
       setBotId("");
       setSecret("");
     } catch (e) {
+      // The server sends a machine-readable `code` alongside the English
+      // sentence. Toasting the sentence — which this used to do, and which the
+      // Slack and Lark tabs still do — hands English to an app shipping four
+      // locales, on the one screen where the admin is stuck and needs telling
+      // what to do next. The sentence stays as the fallback for a server that
+      // sent no code.
+      const code = errorCode(e);
       toast.error(
-        e instanceof Error ? e.message : t(($) => $.wecom.byo_failed_toast),
+        code === "wecom_bot_owned_by_same_workspace"
+          ? t(($) => $.wecom.byo_conflict_same_workspace)
+          : code === "wecom_bot_owned_by_archived_agent"
+            ? t(($) => $.wecom.byo_conflict_archived_agent)
+            : code === "wecom_bot_owned_by_another_workspace"
+              ? t(($) => $.wecom.byo_conflict_other_workspace)
+              : code === "wecom_install_rejected"
+                ? t(($) => $.wecom.byo_rejected)
+                : e instanceof Error
+                  ? e.message
+                  : t(($) => $.wecom.byo_failed_toast),
       );
     } finally {
       setSubmitting(false);
