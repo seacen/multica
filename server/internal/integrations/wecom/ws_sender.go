@@ -102,6 +102,18 @@ type wsSender struct {
 	// that opened the turn.
 	replies map[string]*replyWaiter
 
+	// passiveUsed remembers which turns have already spent their one passive
+	// reply. aibot_respond_msg must echo the req_id of the callback that
+	// opened the turn, and a callback has exactly one response — so the route
+	// is usable once. Two attachments in one turn both falling back to it
+	// share the key, and a verdict that arrives late for the first is handed
+	// to the second: a refusal reads as delivered and nobody is told the file
+	// never arrived. Claiming the turn makes the second attempt fail loudly
+	// instead, which is what raises the "a file did not make it" notice.
+	// Guarded by ackMu; entries live as long as the connection, which is the
+	// same lifetime a turn's req_id is meaningful for.
+	passiveUsed map[string]struct{}
+
 	// ackTimeout is how long a frame waits for its verdict. A field rather
 	// than the constant so a test can exercise the give-up path without
 	// standing still for five seconds.
@@ -262,6 +274,23 @@ func (s *wsSender) awaitReply(reqID string) (*replyWaiter, bool) {
 	w := &replyWaiter{ch: make(chan replyResult, 1)}
 	s.replies[reqID] = w
 	return w, true
+}
+
+// claimPassiveReply reserves a turn's one passive reply and reports whether
+// this caller got it. A turn that has already spent it gets false, and the
+// caller must report a failure rather than wait on a key whose answer belongs
+// to somebody else.
+func (s *wsSender) claimPassiveReply(reqID string) bool {
+	s.ackMu.Lock()
+	defer s.ackMu.Unlock()
+	if s.passiveUsed == nil {
+		s.passiveUsed = make(map[string]struct{})
+	}
+	if _, taken := s.passiveUsed[reqID]; taken {
+		return false
+	}
+	s.passiveUsed[reqID] = struct{}{}
+	return true
 }
 
 // cancelReply retires a waiter. Called on every exit path, including the happy
@@ -428,12 +457,31 @@ func (s *wsSender) pruneStreamsLocked() {
 	}
 	now := time.Now()
 	for k, st := range s.streams {
-		if now.Sub(st.at) > streamMaxAge {
+		if st.sealed && now.Sub(st.at) > streamMaxAge {
 			delete(s.streams, k)
 		}
 	}
+	// Whatever is left is either sealed and young, or still open. Neither may
+	// be thrown away: this used to fall back to clear(), which wiped the live
+	// turns too, and a live turn whose counters are gone has its next frame
+	// stamped from zero. A stale verdict for an earlier frame then matches the
+	// closing one, the refusal that closing frame actually got is never seen,
+	// and the answer is reported delivered while it went nowhere — the exact
+	// misattribution the sequence numbers exist to prevent, reinstated by the
+	// sweep meant to protect them.
+	//
+	// A live turn is also the OLDEST entry by construction — its opening frame
+	// is minutes older than the burst that filled the map — so "evict oldest
+	// first" would pick exactly the wrong ones.
+	//
+	// The map can therefore exceed streamAcksMax under sustained load. That is
+	// the right trade: the cap is a memory bound on bookkeeping that is small
+	// per entry and self-clears as turns end, and losing a user's answer to
+	// save a few kilobytes is not a trade anyone would make on purpose. The
+	// warning is what says it is happening.
 	if len(s.streams) >= streamAcksMax {
-		clear(s.streams)
+		s.log.Warn("wecom: stream bookkeeping over its cap and every entry is live or young; keeping them",
+			"entries", len(s.streams), "cap", streamAcksMax)
 	}
 }
 
@@ -570,11 +618,21 @@ func (s *wsSender) writeLocked(ctx context.Context, payload []byte) error {
 // (1=single, 2=group) is decided at the wecom-side boundary, not the
 // engine's. Used by wecomChannel.Send and OutboundReplier.
 func (s *wsSender) sendText(chatID string, chatTypeInt int, content string) error {
+	return s.sendTextCtx(context.Background(), chatID, chatTypeInt, content)
+}
+
+// sendTextCtx is sendText for a caller that has a deadline of its own. The
+// socket's own write deadline is ten seconds; a caller working inside the
+// daemon's five-second transcript budget cannot afford to be held for it, and
+// being held is how that budget is blown and the post lost. Nothing about
+// delivery changes — the registry still holds the message for the reconnect
+// when the write does not land.
+func (s *wsSender) sendTextCtx(ctx context.Context, chatID string, chatTypeInt int, content string) error {
 	body, err := sendMsgTextBody(chatID, chatTypeInt, content)
 	if err != nil {
 		return err
 	}
-	return s.write(map[string]any{
+	return s.writeWithContext(ctx, map[string]any{
 		"cmd":     cmdSendMsg,
 		"headers": frameHeaders{ReqID: newReqID()},
 		"body":    body,

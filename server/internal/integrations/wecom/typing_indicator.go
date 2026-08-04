@@ -572,7 +572,11 @@ func (m *TypingIndicatorManager) recordStep(ctx context.Context, sessionID pgtyp
 		// frame — so the spinner turns for good and the user is owed a word
 		// about where the rest of the round is going to appear instead. Said
 		// once: the mark is what makes this the only refresh that gets here.
-		if sendErr := m.senders.send(h.InstallationID, pendingSend{
+		// Bounded by the caller's ctx, not by the socket's own ten seconds:
+		// this runs on the daemon's transcript-post path, whose budget is five,
+		// and a notice is not worth the post it would cost. A write cut short
+		// is held for the reconnect, so saying it stays owed either way.
+		if sendErr := m.senders.sendCtx(ctx, h.InstallationID, pendingSend{
 			ChatID:   h.ChatID,
 			ChatType: h.ChatType,
 			Content:  copyFor(h.Locale).StreamStuck,

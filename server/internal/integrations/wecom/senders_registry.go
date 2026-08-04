@@ -83,6 +83,14 @@ func (r *sendersRegistry) get(id pgtype.UUID) *wsSender {
 // queue being retried forever. A transport failure is not an error here: the
 // message is re-queued and the caller has nothing useful to do about it.
 func (r *sendersRegistry) send(id pgtype.UUID, msg pendingSend) error {
+	return r.sendCtx(context.Background(), id, msg)
+}
+
+// sendCtx is send for a caller with a budget. The write is bounded by ctx
+// instead of only by the socket's own ten-second deadline; a write cut short
+// that way is held for the reconnect exactly like any other write that did not
+// land, so the caller is released without the message being lost.
+func (r *sendersRegistry) sendCtx(ctx context.Context, id pgtype.UUID, msg pendingSend) error {
 	if _, err := sendMsgTextBody(msg.ChatID, msg.ChatType, msg.Content); err != nil {
 		return err
 	}
@@ -99,7 +107,7 @@ func (r *sendersRegistry) send(id pgtype.UUID, msg pendingSend) error {
 			"connected", sender != nil, "depth", r.pending.depth(id))
 		return nil
 	}
-	if err := sender.sendText(msg.ChatID, msg.ChatType, msg.Content); err != nil {
+	if err := sender.sendTextCtx(ctx, msg.ChatID, msg.ChatType, msg.Content); err != nil {
 		r.pending.enqueue(id, msg)
 		r.log.Warn("wecom outbound: send failed, message held for reconnect",
 			"installation_id", util.UUIDToString(id), "error", err)

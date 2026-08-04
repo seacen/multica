@@ -296,6 +296,12 @@ func (s *wsSender) sendMedia(ctx context.Context, chatID string, chatType int, r
 	s.log.Warn("wecom: media push refused, answering the turn instead",
 		"media_id", m.MediaID, "msgtype", string(m.Kind), "error", pushErr)
 
+	// One passive reply per turn — the route echoes the callback's req_id and
+	// a callback has one response. A second attachment falling back here would
+	// wait on a key whose verdict belongs to the first, so it is told no.
+	if !s.claimPassiveReply(reqID) {
+		return fmt.Errorf("wecom: media push refused (%w) and this turn's passive reply is already spent", pushErr)
+	}
 	passive, err := respondMediaBody(m)
 	if err != nil {
 		return err
