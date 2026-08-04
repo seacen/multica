@@ -220,6 +220,23 @@ type SessionBinder interface {
 // delete anything inline — every uploaded object is covered by an intent-
 // ledger row written before the PUT (see MediaIntentLedger), and the
 // asynchronous reconciler settles whatever binding did not claim.
+// MediaAbandonNotifier is an optional extra a MediaResolver may implement, for
+// the one failure it cannot see for itself.
+//
+// ResolveMedia owns telling the sender about the attachments it tried and
+// could not fetch. But the Router wraps the whole call in a media budget of
+// its own, and when THAT expires the resolver either never ran or was cut off
+// mid-way — so it observed no failure, and the notice it owns cannot fire. The
+// user is left with the bot answering the line they typed beside the picture
+// as if there were no picture, and nothing telling them to send it again.
+//
+// The Router calls this on that path, on a fresh context: the one that expired
+// cannot carry a message out. Implementing it is optional because not every
+// channel can push an unsolicited message.
+type MediaAbandonNotifier interface {
+	NotifyMediaAbandoned(ctx context.Context, inst ResolvedInstallation, msg channel.InboundMessage)
+}
+
 type MediaResolver interface {
 	// HasMedia reports whether msg references platform media that
 	// ResolveMedia would fetch. The Router calls it synchronously on the

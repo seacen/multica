@@ -566,6 +566,12 @@ func (r *Router) resolveAndBindMedia(set ResolverSet, inst ResolvedInstallation,
 			"event_id", msg.EventID,
 			"message_id", msg.MessageID,
 			"error", err)
+		// The resolver saw no failure — it was cut off, or never started — so
+		// the notice it owns will not fire. Tell it, on the finalize context,
+		// since the one that just expired cannot carry a message out.
+		if notifier, ok := set.Media.(MediaAbandonNotifier); ok {
+			notifier.NotifyMediaAbandoned(finalizeCtx, inst, msg)
+		}
 	}
 	bindErr := set.Session.BindMedia(finalizeCtx, BindMediaParams{
 		MessageID:   chatMessageID,

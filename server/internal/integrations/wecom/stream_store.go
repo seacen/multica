@@ -227,15 +227,42 @@ func (h streamHandle) address() roundAddress {
 // line — a QUEUED message's — must not adopt it and start painting the
 // previous run's tool calls as its own (feedFor checks this).
 //
-// One note per session, not per round. Two guard-closed rounds both still owed
-// their endings is a corner within a corner — a session would need two runs
-// each longer than five minutes stacked up — and the last writer's address is
-// as good as the first's: both name the same chat.
+// One note per session, but the promises inside it are counted per ROUND. A
+// single flag could not hold two: with rounds A and B both guard-closed, A's
+// own answer — the separate reply its guard promised — cleared the flag, and
+// when B's run failed the store said "already told" and B's asker heard
+// nothing at all. The address is still shared, which is fine because both
+// rounds name the same chat; it is the promises that have to be individual.
 type endedRound struct {
-	addr   roundAddress
-	owed   bool
-	at     time.Time
+	addr roundAddress
+	at   time.Time
+	// owed lists the rounds promised a separate reply that have not had one,
+	// oldest first, each holding its run id — empty when the guard fired
+	// before the run had a name. A round's own ending settles its own entry;
+	// another round's cannot.
+	owed   []string
 	taskID string
+}
+
+// isOwed reports whether anything is still promised.
+func (e endedRound) isOwed() bool { return len(e.owed) > 0 }
+
+// settle removes one promise: this round's own, matched by run id. A round
+// whose run was never named settles the oldest unnamed promise, since that is
+// the only one it could be. Returns the remaining list.
+func settle(owed []string, taskID string) []string {
+	for i, id := range owed {
+		if id == taskID {
+			return append(owed[:i:i], owed[i+1:]...)
+		}
+	}
+	if taskID == "" {
+		return owed
+	}
+	// A named ending with no matching promise settles nothing: the promise on
+	// file belongs to a different round, and taking it would leave that
+	// round's asker with silence.
+	return owed
 }
 
 // roundEntry pairs one bubble's handle with everything scoped to its life: the
@@ -523,11 +550,22 @@ func (s *streamStore) remember(sessionID pgtype.UUID, addr roundAddress, ending 
 // the old overwrite behaviour rather than contradict an answer the user is
 // already reading.
 func (s *streamStore) rememberLocked(key string, addr roundAddress, ending roundEnding, taskID string) {
-	if prev, ok := s.ended[key]; ok && prev.owed && ending == roundOver &&
-		prev.taskID != "" && taskID != "" && taskID != prev.taskID {
-		return
+	next := endedRound{addr: addr, at: s.now(), taskID: taskID}
+	if prev, ok := s.ended[key]; ok {
+		next.owed = prev.owed
+		if taskID == "" {
+			// An ending that names no run leaves the adoption fence alone:
+			// the run it was fencing off is still publishing.
+			next.taskID = prev.taskID
+		}
 	}
-	s.ended[key] = endedRound{addr: addr, owed: ending == roundContinues, at: s.now(), taskID: taskID}
+	switch ending {
+	case roundContinues:
+		next.owed = append(next.owed, taskID)
+	case roundOver:
+		next.owed = settle(next.owed, taskID)
+	}
+	s.ended[key] = next
 }
 
 // claimEnding asks whether a round with no bubble left is still owed an ending,
@@ -551,10 +589,10 @@ func (s *streamStore) claimEnding(sessionID pgtype.UUID) (roundAddress, roundVer
 		delete(s.ended, key)
 		return roundAddress{}, roundForgotten
 	}
-	if !round.owed {
+	if !round.isOwed() {
 		return round.addr, roundToldAlready
 	}
-	round.owed = false
+	round.owed = round.owed[1:]
 	s.ended[key] = round
 	return round.addr, roundOwesAnEnding
 }

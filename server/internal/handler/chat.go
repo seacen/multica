@@ -531,6 +531,22 @@ func (h *Handler) SetChatSessionArchived(w http.ResponseWriter, r *http.Request)
 	}
 
 	if req.Archived {
+		// A queued turn must go with the binding, in the same transaction.
+		// Deleting the binding alone leaves a task that is still claimable —
+		// ClaimAgentTask does not look at chat_session.status — and the claim
+		// then reads no binding at all, so the brief describes a private web
+		// chat while the adapter's in-memory handle still posts the answer
+		// into the room the message came from. The agent answers a room of
+		// many as if it were alone with one, and the person who archived the
+		// session never sees it happen.
+		//
+		// Cancelling is also what archiving means: the owner said they are
+		// done with this conversation, and DeleteChatSession has always
+		// cancelled for the same reason.
+		if _, err := qtx.CancelAgentTasksByChatSession(r.Context(), session.ID); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to cancel queued tasks for the archived session")
+			return
+		}
 		if err := qtx.DeleteChannelChatSessionBindingBySession(r.Context(), session.ID); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to clear chat session channel binding")
 			return

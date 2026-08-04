@@ -328,6 +328,22 @@ func appendFailure(list []mediaFailure, f mediaFailure) []mediaFailure {
 // deadline and will proceed with the placeholder text. That is deliberate —
 // the person can see for themselves that the picture did not get through, and
 // the answer to whatever they typed beside it is still worth having.
+// NotifyMediaAbandoned answers engine.MediaAbandonNotifier: the Router's own
+// media budget expired, so this resolver either never ran or was cut off, saw
+// no failure of its own, and would otherwise say nothing at all.
+//
+// The user gets the same line as an attachment that could not be read, because
+// from where they are sitting it is the same event and the same remedy: the
+// picture did not get through, send it again. Which side of the seam ran out
+// of time is ours to know and theirs not to care about.
+func (r *wecomMediaResolver) NotifyMediaAbandoned(_ context.Context, inst engine.ResolvedInstallation, msg channel.InboundMessage) {
+	wm, err := wecomMsgFromRaw(msg)
+	if err != nil || len(wm.Media) == 0 {
+		return
+	}
+	r.tellTheSender(inst, wm, []mediaFailure{mediaFailureUnreadable})
+}
+
 func (r *wecomMediaResolver) tellTheSender(inst engine.ResolvedInstallation, wm InboundMessage, failures []mediaFailure) {
 	if len(failures) == 0 || r.notify == nil || !inst.ID.Valid {
 		return
