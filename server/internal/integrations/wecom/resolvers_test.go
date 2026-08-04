@@ -110,7 +110,7 @@ func TestResolveInstallationRoutesOnTheBotID(t *testing.T) {
 		InstallerUserID: uuidOf(4),
 		Status:          InstallationActive,
 		BotID:           "wb-1",
-		}}
+	}}
 	r := &installationResolver{store: store}
 
 	got, err := r.ResolveInstallation(context.Background(), wecomInbound("wb-1", "T-alex", "T-alex", channel.ChatTypeP2P))

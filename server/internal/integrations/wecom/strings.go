@@ -10,12 +10,11 @@ package wecom
 // the bot — and impossible to find, because "what does this bot say" was
 // spread across three files.
 //
-// Which pack a given message uses is decided by who is going to read it, not
-// by the installation: a bound user gets their own Multica profile language
-// (language.go), and a reader nobody can name — an unbound colleague, a group
-// room as a whole — gets DefaultLocale. An installation-wide language setting
-// existed briefly and was removed: nothing could write it, and a workspace
-// speaks more than one language the moment a second person binds.
+// Which pack a given message uses is decided by the DESTINATION, not by the
+// installation (language.go): a 1:1 gets that person's Multica profile
+// language, and a room — where there is no shared profile and no member list —
+// gets the deployment's own language. An installation-wide setting existed
+// briefly and was removed: nothing could write it.
 //
 // Slack's adapter hardcodes English and Lark's hardcodes Chinese, so there is
 // no house i18n mechanism to join. This is deliberately not one either: a
@@ -25,6 +24,7 @@ package wecom
 
 import (
 	"strings"
+	"sync/atomic"
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
 )
@@ -36,10 +36,62 @@ const (
 	LocaleZhHans Locale = "zh-Hans"
 	LocaleEn     Locale = "en"
 
-	// DefaultLocale is Chinese: WeChat Work is a Chinese platform, and it is
-	// what a reader with no profile to consult gets.
+	// DefaultLocale is the compile-time fallback: Chinese, because WeChat Work
+	// is a Chinese platform. It is what a deployment that says nothing gets.
+	// Read deploymentLocale() rather than this — a deployment can say
+	// otherwise, and a room's language is a property of the deployment, not of
+	// whichever person happened to speak.
 	DefaultLocale = LocaleZhHans
 )
+
+// deploymentLocaleValue is the language this server answers in when the reader
+// is a room, or a person whose profile says nothing. Set once at boot from
+// MULTICA_WECOM_DEFAULT_LOCALE (cmd/server/router.go) and read on every
+// message, so it is an atomic rather than a plain var: -race would otherwise
+// flag the boot write against the first inbound frame.
+//
+// It exists because the alternative answers are all worse. A hardcoded
+// constant makes an English-speaking tenant's rooms Chinese with no way out
+// but a rebuild. An installation-level column was tried and removed: nothing
+// could write it. Borrowing the installer's personal profile language repeats,
+// with a different person, the exact bug that motivated this — one member's
+// setting deciding what a whole room reads. A deployment-level knob is the
+// smallest thing that is actually about the deployment.
+var deploymentLocaleValue atomic.Value
+
+// SetDeploymentLocale fixes the deployment's language from a raw config string
+// and returns what it resolved to, so the caller can log it. Anything
+// unrecognised — including empty — leaves the current value in place: a typo in
+// an env var must not silently switch a tenant's language.
+//
+// Deliberately NOT resolveLocale. That one reads a user's profile field, which
+// the API has already validated to en / zh-Hans / ko / ja, so it can treat
+// "anything that isn't Chinese" as a deliberate choice of the English pack. An
+// env var has been validated by nobody: under that rule
+// MULTICA_WECOM_DEFAULT_LOCALE=zh_Hant, or a stray quote, would quietly put a
+// Chinese tenant's rooms into English. So this one matches exactly, and an
+// operator who mistypes gets the old language and a log line, not a surprise.
+func SetDeploymentLocale(raw string) Locale {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "zh-hans", "zh":
+		deploymentLocaleValue.Store(LocaleZhHans)
+		return LocaleZhHans
+	case "en":
+		deploymentLocaleValue.Store(LocaleEn)
+		return LocaleEn
+	default:
+		return deploymentLocale()
+	}
+}
+
+// deploymentLocale is the configured language, or DefaultLocale before
+// anything has configured one — which is also what every test sees.
+func deploymentLocale() Locale {
+	if v, ok := deploymentLocaleValue.Load().(Locale); ok {
+		return v
+	}
+	return DefaultLocale
+}
 
 // resolveLocale maps a user's profile language onto a supported Locale. The
 // profile validates to en / zh-Hans / ko / ja (handler/auth.go), and there are
@@ -50,7 +102,7 @@ const (
 func resolveLocale(s string) Locale {
 	switch v := strings.ToLower(strings.TrimSpace(s)); {
 	case v == "":
-		return DefaultLocale
+		return deploymentLocale()
 	case strings.HasPrefix(v, "zh"):
 		return LocaleZhHans
 	default:
@@ -265,7 +317,7 @@ func copyFor(l Locale) copyPack {
 	if pack, ok := copyPacks[l]; ok {
 		return pack
 	}
-	return copyPacks[DefaultLocale]
+	return copyPacks[deploymentLocale()]
 }
 
 var copyPacks = map[Locale]copyPack{

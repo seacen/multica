@@ -94,7 +94,14 @@ func NewOutboundReplier(cfg OutboundReplierConfig) *OutboundReplier {
 // logged, not propagated: the replier runs detached from the inbound ACK
 // path (the engine.Router owns that goroutine).
 func (r *OutboundReplier) Reply(ctx context.Context, inst engine.ResolvedInstallation, msg channel.InboundMessage, res engine.Result) {
-	c := copyFor(localeForSender(ctx, r.languages, inst.ID, msg.Source.SenderID))
+	// These notices land in the room the message came from, so the room decides
+	// the language — not whichever member happened to trigger them.
+	//
+	// The binding prompt is the one thing here addressed to a person rather
+	// than the room, and it needs no separate resolution: its reader is unbound
+	// by definition, so they have no profile to consult and get the same
+	// deployment default the room does.
+	c := copyFor(localeFor(ctx, r.languages, inst.ID, aibotChatTypeFromChannel(msg.Source.ChatType), msg.Source.SenderID))
 	switch res.Outcome {
 	case engine.OutcomeNeedsBinding:
 		if err := r.sendBindingPrompt(ctx, inst, msg, res, c); err != nil {

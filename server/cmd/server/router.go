@@ -658,6 +658,16 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				h.WecomStore = wecomStore
 				h.WecomCredentials = credsResolver
 
+				// The language the bot answers a ROOM in. A 1:1 reads the one
+				// person's Multica profile language and never consults this;
+				// a group has many readers and no shared profile, so the
+				// deployment answers for it. Unset or unrecognised keeps the
+				// zh-Hans default — WeChat Work is a Chinese platform — and
+				// the log line is what tells an operator their value was
+				// rejected rather than applied.
+				slog.Info("wecom: room copy language",
+					"locale", string(wecom.SetDeploymentLocale(os.Getenv("MULTICA_WECOM_DEFAULT_LOCALE"))))
+
 				// Binding tokens back the per-user "link your Multica account"
 				// prompt sent to first-time WeCom senders. aibot userids are
 				// anonymized T-prefixed ids with no relation to real userids

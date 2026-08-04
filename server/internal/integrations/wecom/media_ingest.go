@@ -339,8 +339,16 @@ func (r *wecomMediaResolver) tellTheSender(inst engine.ResolvedInstallation, wm 
 	if chatID == "" {
 		return
 	}
+	// Resolve the destination before the copy, not after: this notice goes to
+	// chatID, and in a group that is the room. Choosing the language from the
+	// sender first and only then working out where it lands is how a room ended
+	// up reading one member's profile language.
+	chatType := chatTypeSingleInt
+	if strings.EqualFold(wm.ChatType, "group") {
+		chatType = chatTypeGroupInt
+	}
 	noticeCtx, cancel := context.WithTimeout(context.Background(), taskLookupTimeout)
-	c := copyFor(localeForSender(noticeCtx, r.languages, inst.ID, wm.SenderUserID))
+	c := copyFor(localeFor(noticeCtx, r.languages, inst.ID, chatType, wm.SenderUserID))
 	cancel()
 	lines := make([]string, 0, len(failures))
 	for _, f := range failures {
@@ -351,10 +359,6 @@ func (r *wecomMediaResolver) tellTheSender(inst engine.ResolvedInstallation, wm 
 			lines = append(lines, c.MediaUnreadable)
 		}
 	}
-	chatType := chatTypeSingleInt
-	if strings.EqualFold(wm.ChatType, "group") {
-		chatType = chatTypeGroupInt
-	}
 	if err := r.notify.send(inst.ID, pendingSend{
 		ChatID:   chatID,
 		ChatType: chatType,
@@ -364,4 +368,3 @@ func (r *wecomMediaResolver) tellTheSender(inst engine.ResolvedInstallation, wm 
 			"installation_id", util.UUIDToString(inst.ID), "msg_id", wm.MsgID, "err", err)
 	}
 }
-

@@ -201,7 +201,7 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 		InstallationID: inst.ID,
 		ChatID:         binding.ChannelChatID,
 		ChatType:       chatType,
-		Locale:         localeForChat(ctx, o.q, inst.ID, chatType, binding.ChannelChatID),
+		Locale:         localeFor(ctx, o.q, inst.ID, chatType, binding.ChannelChatID),
 	}
 	if content != "" {
 		if err := o.senders.send(inst.ID, pendingSend{

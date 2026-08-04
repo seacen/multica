@@ -94,14 +94,14 @@ func TestLocaleForSenderReadsTheProfile(t *testing.T) {
 
 // TestLocaleForChatIsPersonalOnlyInPrivate — a group is many people with no
 // shared profile; only a 1:1 chat's receipts follow a profile.
-func TestLocaleForChatIsPersonalOnlyInPrivate(t *testing.T) {
+func TestLocaleForIsPersonalOnlyInPrivate(t *testing.T) {
 	instID := uuidOf(3)
 	langs := fakeLanguages{senderID: "T-alex", userID: uuidOf(9), language: "en"}
 
-	if got := localeForChat(context.Background(), langs, instID, chatTypeSingleInt, "T-alex"); got != LocaleEn {
+	if got := localeFor(context.Background(), langs, instID, chatTypeSingleInt, "T-alex"); got != LocaleEn {
 		t.Fatalf("1:1 chat resolved %q, want the member's English", got)
 	}
-	if got := localeForChat(context.Background(), langs, instID, chatTypeGroupInt, "R-room"); got != DefaultLocale {
+	if got := localeFor(context.Background(), langs, instID, chatTypeGroupInt, "R-room"); got != DefaultLocale {
 		t.Fatalf("group chat resolved %q, want the default", got)
 	}
 }

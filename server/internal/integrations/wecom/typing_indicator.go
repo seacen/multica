@@ -216,7 +216,7 @@ func (m *TypingIndicatorManager) OnIngested(ctx context.Context, inst engine.Res
 		InstallationID: inst.ID,
 		ChatID:         chatID,
 		ChatType:       aibotChatTypeFromChannel(msg.Source.ChatType),
-		Locale:         localeForSender(ctx, m.languages, inst.ID, msg.Source.SenderID),
+		Locale:         localeFor(ctx, m.languages, inst.ID, aibotChatTypeFromChannel(msg.Source.ChatType), msg.Source.SenderID),
 		Level:          m.levelFor(ctx, inst, msg),
 	}
 	if m.streams.open(sessionID, h) == roundJoined {
@@ -491,7 +491,7 @@ func (m *TypingIndicatorManager) addressFromBinding(ctx context.Context, session
 		InstallationID: binding.InstallationID,
 		ChatID:         binding.ChannelChatID,
 		ChatType:       chatType,
-		Locale:         localeForChat(ctx, m.languages, binding.InstallationID, chatType, binding.ChannelChatID),
+		Locale:         localeFor(ctx, m.languages, binding.InstallationID, chatType, binding.ChannelChatID),
 	}, true
 }
 

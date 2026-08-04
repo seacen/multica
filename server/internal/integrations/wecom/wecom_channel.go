@@ -388,9 +388,17 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 // touching the pack at all and get the default without a lookup.
 func (c *wecomChannel) packFor(ctx context.Context, mc aibotMsgCallback) copyPack {
 	if !mc.needsCopy() {
-		return copyFor(DefaultLocale)
+		return copyFor(deploymentLocale())
 	}
-	return copyFor(localeForSender(ctx, c.languages, c.installationID, mc.From.UserID))
+	// Everything this pack feeds is read where the message arrived — the
+	// unsupported-type receipt goes back to that chat, and the media
+	// placeholders and quote prefix are stored in the message body the room
+	// will see quoted back. So the destination decides, not the sender.
+	chatType := chatTypeSingleInt
+	if strings.EqualFold(mc.ChatType, "group") {
+		chatType = chatTypeGroupInt
+	}
+	return copyFor(localeFor(ctx, c.languages, c.installationID, chatType, mc.From.UserID))
 }
 
 // replyUnsupportedMsgType answers a callback the adapter cannot ingest with
