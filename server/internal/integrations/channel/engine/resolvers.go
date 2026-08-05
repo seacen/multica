@@ -10,7 +10,6 @@ import (
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
 	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
-	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
 // This file defines the pluggable seams the Router runs the inbound pipeline
@@ -108,23 +107,6 @@ type AppendParams struct {
 	Message             channel.InboundMessage
 	ClaimToken          pgtype.UUID
 	MediaPendingSeconds float64
-}
-
-// MessageKind is the chat_message.message_kind this append should stamp, so
-// every adapter answers it the same way instead of each remembering to.
-//
-// SkipAgentRun says the engine has already dealt with this message and no run
-// should be triggered for it. That is only half of "the agent never sees it":
-// the row is still written unowned, and the seal that builds the NEXT run's
-// input takes every unowned user row in the session. Marking it here is what
-// keeps it out — see LinkUnownedChannelChatMessagesToTask.
-//
-// Empty for an ordinary message, which leaves the column's own default.
-func (p AppendParams) MessageKind() string {
-	if p.Message.SkipAgentRun {
-		return protocol.ChatMessageKindCommand
-	}
-	return ""
 }
 
 // AppendResult reports what AppendMessage decided.

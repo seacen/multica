@@ -339,7 +339,6 @@ func (r *sessionBinder) AppendMessage(ctx context.Context, p engine.AppendParams
 		commandText = p.Message.Text
 	}
 	return r.session.AppendUserMessage(ctx, engine.AppendInput{
-		MessageKind:         p.MessageKind(),
 		SessionID:           p.SessionID,
 		Sender:              p.Sender,
 		InstallationID:      p.InstallationID,

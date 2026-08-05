@@ -17,6 +17,7 @@ package wecom
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -26,8 +27,13 @@ import (
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
-	"github.com/multica-ai/multica/server/pkg/protocol"
 )
+
+// channelCommandKindForTest mirrors engine's own channelCommandMessageKind,
+// which is package-private upstream. If that string ever changes, this test
+// keeps passing while production breaks — so the value is asserted against the
+// real query text in TestTheSealSkipsTheKindTheEngineStamps below.
+const channelCommandKindForTest = "channel_command"
 
 // chatTranscript stands in for the database on both sides of the question
 // "what does the agent read": the append side that stores each inbound message
@@ -70,7 +76,6 @@ func (tr *chatTranscript) AppendUserMessage(_ context.Context, in engine.AppendI
 	// engine answered itself is never anybody's input. Mirrored here because
 	// the assertion is about the bodies the agent receives, not about how a row
 	// is kept out of them.
-	tr.rows = append(tr.rows, &transcriptRow{body: in.Body, kind: in.MessageKind})
 	// Same parse, off the same source, as the real binder: the stored body is
 	// the agent-readable text, the command is read off the user's own line.
 	source := in.CommandText
@@ -78,6 +83,16 @@ func (tr *chatTranscript) AppendUserMessage(_ context.Context, in engine.AppendI
 		source = in.Body
 	}
 	cmd, _ := engine.ParseIssueCommand(source)
+	// The real binder stamps chat_message.message_kind = 'channel_command' off
+	// this same parse (engine/session.go), and the seal that builds a run's
+	// input refuses that kind — so a turn the engine answered itself is never
+	// anybody's input. Written in the same statement as the row because the
+	// caller already holds tr.mu.
+	row := &transcriptRow{body: in.Body}
+	if cmd != nil {
+		row.kind = channelCommandKindForTest
+	}
+	tr.rows = append(tr.rows, row)
 	return engine.AppendResult{MessageID: uuidOf(5), IssueCommand: cmd}, nil
 }
 
@@ -91,7 +106,7 @@ func (tr *chatTranscript) EnqueueChatTask(context.Context, db.ChatSession, pgtyp
 	taskID := len(tr.batches) + 1
 	batch := []string{}
 	for _, row := range tr.rows {
-		if row.taskID != 0 || row.kind == protocol.ChatMessageKindCommand {
+		if row.taskID != 0 || row.kind == channelCommandKindForTest {
 			continue
 		}
 		row.taskID = taskID
@@ -237,4 +252,31 @@ func TestAnIssueCommandDoesNotRideAlongOnTheNextQuestion(t *testing.T) {
 		t.Fatalf("want exactly one agent run for the question, got %d (%q)", len(batches), batches)
 	}
 	assertAgentNeverSawTheCommand(t, batches, command, question)
+}
+
+// TestTheSealSkipsTheKindTheEngineStamps pins the one string this file's fake
+// shares with production. The seal that builds a run's input refuses a kind by
+// literal name, in SQL; if the engine renames it and this file does not
+// follow, every test here keeps passing while a slash command silently
+// rejoins the agent's batch.
+//
+// Asserted against the GENERATED query — the text the server actually sends —
+// rather than the .sql source, so an un-regenerated file cannot hide a rename.
+func TestTheSealSkipsTheKindTheEngineStamps(t *testing.T) {
+	body, err := os.ReadFile("../../../pkg/db/generated/chat.sql.go")
+	if err != nil {
+		t.Fatalf("read generated queries: %v", err)
+	}
+	i := strings.Index(string(body), "const linkUnownedChannelChatMessagesToTask = `")
+	if i < 0 {
+		t.Fatal("the seal query is gone — this file mirrors a seal that no longer exists")
+	}
+	stmt := string(body)[i:]
+	if end := strings.Index(stmt[45:], "`"); end > 0 {
+		stmt = stmt[:45+end]
+	}
+	if !strings.Contains(stmt, "'"+channelCommandKindForTest+"'") {
+		t.Fatalf("the seal no longer excludes %q, so a handled command would rejoin the next run's input:\n%s",
+			channelCommandKindForTest, stmt)
+	}
 }
