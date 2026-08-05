@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
 	"github.com/multica-ai/multica/server/internal/util/secretbox"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -44,6 +45,24 @@ type InstallationParams struct {
 type InstallationService struct {
 	store *Store
 	box   *secretbox.Box
+	// tx runs the reclaim and the upsert together. Optional: without it the
+	// two still run, just not atomically, so a caller that has no pool (a
+	// test, an admin CLI) keeps working and only loses the guarantee that two
+	// simultaneous installs of the same bot cannot both pass the reclaim. The
+	// loser of that race trips the unique index and gets the ordinary
+	// conflict, which is a confusing answer rather than a wrong row.
+	tx engine.TxStarter
+}
+
+// WithTx returns the service running its rebind inside one transaction.
+// Production wires it; see cmd/server/router.go.
+func (s *InstallationService) WithTx(tx engine.TxStarter) *InstallationService {
+	if s == nil {
+		return nil
+	}
+	next := *s
+	next.tx = tx
+	return &next
 }
 
 // NewInstallationService binds the service to a queries handle and a
@@ -77,7 +96,40 @@ func (s *InstallationService) Upsert(ctx context.Context, p InstallationParams) 
 		return Installation{}, err
 	}
 
-	row, err := s.store.Queries.UpsertChannelInstallation(ctx, db.UpsertChannelInstallationParams{
+	q := s.store.Queries
+	var commit func() error
+	if s.tx != nil {
+		dbtx, err := s.tx.Begin(ctx)
+		if err != nil {
+			return Installation{}, fmt.Errorf("wecom: begin install: %w", err)
+		}
+		defer dbtx.Rollback(ctx)
+		q = q.WithTx(dbtx)
+		commit = func() error { return dbtx.Commit(ctx) }
+	}
+
+	// Free the bot's routing slot from a DEAD previous owner before trying to
+	// take it. Disconnect only flips a row to 'revoked' and no product path
+	// ever deletes it, while the unique index on (channel_type, app_id) has no
+	// status condition — so without this a bot disconnected from one agent can
+	// never be connected to another. The admin was told "disconnect it there
+	// first" about a row that is already disconnected and whose Disconnect
+	// button the UI does not render, which is a dead end with no way out.
+	//
+	// A LIVE owner is deliberately left alone: it still trips the index below
+	// and becomes an accurate conflict naming where the bot actually is. Slack
+	// and Lark have always done this; wecom was the one adapter that did not.
+	// ErrNoRows means nothing was dead, which is the ordinary case.
+	if _, err := q.ReclaimDeadChannelInstallationByAppID(ctx, db.ReclaimDeadChannelInstallationByAppIDParams{
+		ChannelType: channelTypeWecom,
+		AppID:       p.BotID,
+		WorkspaceID: p.WorkspaceID,
+		AgentID:     p.AgentID,
+	}); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return Installation{}, fmt.Errorf("wecom: reclaim dead installation: %w", err)
+	}
+
+	row, err := q.UpsertChannelInstallation(ctx, db.UpsertChannelInstallationParams{
 		WorkspaceID:     p.WorkspaceID,
 		AgentID:         p.AgentID,
 		ChannelType:     channelTypeWecom,
@@ -87,9 +139,16 @@ func (s *InstallationService) Upsert(ctx context.Context, p InstallationParams) 
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
+			// Read the owner on the pool, not the transaction: the failed
+			// statement has aborted it.
 			return Installation{}, s.botOwnerConflictErr(ctx, p.WorkspaceID, p.BotID)
 		}
 		return Installation{}, fmt.Errorf("wecom: upsert installation: %w", err)
+	}
+	if commit != nil {
+		if err := commit(); err != nil {
+			return Installation{}, fmt.Errorf("wecom: commit install: %w", err)
+		}
 	}
 	return installationFromRow(row)
 }
