@@ -442,11 +442,15 @@ func channelMessageFromCallback(botID string, mc aibotMsgCallback, c copyPack, t
 		chatID = senderID
 	}
 
-	// The command is read off the user's own line. With a quote in front of
-	// it, the stored body starts with somebody else's message — and a "/issue"
-	// sitting in a quoted message is that person's old text, not a command
-	// this sender just gave.
+	// The command is read off the user's own line, with the addressing taken
+	// off the front. Two things sit between a command and the parser and both
+	// have to go: a quote block, because a "/issue" inside somebody else's
+	// quoted message is their old text and not an instruction this sender just
+	// gave; and the @-mention, because in a group that is simply how you reach
+	// the bot at all — "@Andrew /new" is a person asking for a fresh session,
+	// not prose that happens to contain a word.
 	command, _ := mc.ownText(c)
+	command = stripLeadingMentions(command)
 
 	wm := InboundMessage{
 		BotID:        botID,
@@ -492,6 +496,38 @@ func channelMessageFromCallback(botID string, mc aibotMsgCallback, c copyPack, t
 			SenderID:    senderID,
 		},
 		Raw: raw,
+	}
+}
+
+// stripLeadingMentions removes the @-mentions a message opens with, which in a
+// group chat is how the sender addresses the bot. WeCom puts them in the text
+// and sends no mention list alongside it, so there is nothing to match against
+// but the shape: an "@" at the very front, up to the next space.
+//
+// Only the front. A name further into the sentence is the sender talking ABOUT
+// somebody — "@Andrew ask @李雷 about yesterday" is one instruction naming one
+// colleague — and stripping that would quietly rewrite what they said.
+//
+// This feeds command classification only. The stored message keeps the text
+// exactly as it arrived, so the transcript still shows who was addressed.
+//
+// Slack does the same thing with a regex over its mention token
+// (slack/inbound.go cleanText); Feishu is handed an already-clean command body
+// by the platform. WeCom was the one adapter passing the raw text through.
+func stripLeadingMentions(s string) string {
+	for {
+		trimmed := strings.TrimLeftFunc(s, unicode.IsSpace)
+		if !strings.HasPrefix(trimmed, "@") {
+			return trimmed
+		}
+		i := strings.IndexFunc(trimmed, unicode.IsSpace)
+		if i < 0 {
+			// The whole message is one mention and nothing else. There is no
+			// command and no words — leave it, so an empty body is decided by
+			// the caller rather than manufactured here.
+			return trimmed
+		}
+		s = trimmed[i:]
 	}
 }
 
