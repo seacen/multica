@@ -665,6 +665,17 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				// zh-Hans default — WeChat Work is a Chinese platform — and
 				// the log line is what tells an operator their value was
 				// rejected rather than applied.
+				// Said unconditionally, and phrased as a condition, because
+				// nothing here knows the replica count. The obvious signal —
+				// REDIS_URL — means "Redis is configured", which also gates
+				// rate limiting, so plenty of single-replica deployments set
+				// it: keying on it would cry wolf at them and stay silent for
+				// a multi-replica deployment that does not use Redis. A line
+				// that states the constraint is honest at the cost of being
+				// seen once per boot; a line that guesses is worse than none.
+				slog.Warn("wecom: replies are delivered over the bot's own WebSocket, which one process holds — " +
+					"if you run more than one backend replica, replies raised on a replica without the socket " +
+					"never reach the chat. See SELF_HOSTING.md.")
 				slog.Info("wecom: room copy language",
 					"locale", string(wecom.SetDeploymentLocale(os.Getenv("MULTICA_WECOM_DEFAULT_LOCALE"))))
 
@@ -674,6 +685,14 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				// sent and to whom, instead of asking a person what they
 				// remember seeing on a phone. Turn it off when the session
 				// ends.
+				// Manufactured failures, for walking a recovery path on real
+				// hardware. Named individually in the log because whatever the
+				// bot does next is not its own behaviour, and somebody reading
+				// this later has to know that.
+				if armed := wecom.SetFaults(os.Getenv("MULTICA_WECOM_FAULTS")); len(armed) > 0 {
+					slog.Warn("wecom: FAULT INJECTION ARMED — failures below are manufactured; unset MULTICA_WECOM_FAULTS",
+						"faults", strings.Join(armed, ","))
+				}
 				if wecom.SetTrace(os.Getenv("MULTICA_WECOM_TRACE") == "1") {
 					slog.Warn("wecom: frame tracing ON — records message text; unset MULTICA_WECOM_TRACE when done")
 				}

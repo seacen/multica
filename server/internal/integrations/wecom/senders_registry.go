@@ -107,6 +107,13 @@ func (r *sendersRegistry) sendCtx(ctx context.Context, id pgtype.UUID, msg pendi
 			"connected", sender != nil, "depth", r.pending.depth(id))
 		return nil
 	}
+	if faultFires(FaultDropNextSend) {
+		// Accepted and then dropped, which is what an overflowing holding
+		// queue or a write the platform discarded looks like from here: the
+		// caller is told nothing went wrong.
+		logFault(r.log, FaultDropNextSend, "sendersRegistry.sendCtx")
+		return nil
+	}
 	if err := sender.sendTextCtx(ctx, msg.ChatID, msg.ChatType, msg.Content); err != nil {
 		r.pending.enqueue(id, msg)
 		r.log.Warn("wecom outbound: send failed, message held for reconnect",

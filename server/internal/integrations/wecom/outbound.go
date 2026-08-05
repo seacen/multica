@@ -18,6 +18,32 @@ package wecom
 // mrkdwn conversion — the reply text goes through sendMsgTextBody the
 // same way OutboundReplier's messages do (markdown msgtype, which
 // renders plaintext without escaping).
+//
+// ONE REPLICA ONLY. This is the constraint everything below rests on, and it
+// is worth stating plainly because nothing about the code makes it obvious.
+//
+// WeCom's smart bot has no HTTPS send endpoint; the only way out is the
+// WebSocket the inbound loop already holds, and exactly one process holds it
+// per bot (the ws_lease_token fence). But "the agent finished, here is the
+// reply" travels on events.Bus, which is a plain in-memory pub/sub inside ONE
+// process, published by whichever process handled the completion. Run two
+// backend replicas and those are frequently different processes: the reply
+// reaches a registry with no socket in it, and the person who asked gets
+// nothing at all.
+//
+// Slack and Lark are immune because their outbound is ordinary HTTPS that any
+// replica can make. WeCom is the first channel whose outbound is pinned to one
+// process, and until a reply can be routed to the lease holder, a WeCom
+// deployment must run a single backend replica. The operator-facing statement
+// of this lives in .env.example beside MULTICA_WECOM_SECRET_KEY and in
+// SELF_HOSTING.md; a log line at boot is not enough on its own, because it
+// only reaches somebody already reading logs.
+//
+// Our holding queue makes this quieter rather than louder, which is the part
+// to watch: a reply that cannot be delivered is held rather than refused, so a
+// wrong-replica reply waits in a queue that will never drain and surfaces only
+// as a TTL expiry a day later. That is right for a lease flip lasting seconds
+// and wrong for a topology that will never change.
 
 import (
 	"context"
@@ -192,10 +218,16 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 	if o.senders == nil {
 		return errors.New("wecom: sender registry not configured")
 	}
-	// No live connection (lease flip, Supervisor backoff, a revoke a second
-	// ago) means the reply waits for the next one rather than disappearing —
-	// see outbound_queue.go. The user asked a question; an answer a minute
-	// late still answers it.
+	// No live connection means the reply waits for the next one rather than
+	// disappearing — see outbound_queue.go. The user asked a question; an
+	// answer a minute late still answers it.
+	//
+	// Two different situations end up here and only one of them recovers. A
+	// lease flip, the Supervisor's backoff or a revoke a second ago is seconds
+	// long, and the queue is exactly right for it. A MULTI-REPLICA deployment
+	// is not: the socket is held by a different process and this one will
+	// never get it, so the reply waits until its 24h TTL and the person who
+	// asked is never answered. See the constraint at the top of this file.
 	chatType := aibotChatTypeFromChannel(channel.ChatType(binding.ChatType))
 	addr := roundAddress{
 		InstallationID: inst.ID,

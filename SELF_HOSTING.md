@@ -161,6 +161,16 @@ multica daemon status
 
 ---
 
+## WeChat Work (WeCom): one backend replica
+
+If you enable the WeChat Work smart bot (`MULTICA_WECOM_SECRET_KEY`), run **one** backend replica.
+
+WeCom's smart bot has no HTTPS send endpoint. The only way a reply leaves Multica is the WebSocket the inbound loop already holds, and exactly one process holds that socket per bot. But the "the agent finished, here is the reply" signal is in-process, so with two or more replicas it is frequently raised on a process that is not holding the socket — and the reply never reaches the chat. The person who asked sees nothing, and nothing in the UI says why.
+
+Slack and Lark are unaffected: their outbound is ordinary HTTPS, which any replica can send.
+
+If you need to scale the API horizontally, run WeCom on a separate single-replica deployment until replies can be routed to the lease holder.
+
 ## Kubernetes Deployment (Alternative)
 
 If you already run a Kubernetes cluster, you can deploy Multica there instead of Docker Compose using the released OCI Helm chart at `oci://ghcr.io/multica-ai/charts/multica` or the source chart at [`deploy/helm/multica/`](deploy/helm/multica/). It targets a typical k3s / k8s setup with an Ingress controller and a default `ReadWriteOnce` StorageClass — authored against k3s + Traefik + `local-path`, and should work on any cluster with minor tweaks.

@@ -336,6 +336,18 @@ func (s *wsSender) deliverReply(env frameEnvelope) bool {
 // a req_id belongs to its Nth frame. A verdict for a frame whose caller has
 // already given up is dropped here rather than handed to the next one.
 func (s *wsSender) deliverAck(reqID string, code int, msg string) {
+	if faultFires(FaultSwallowNextAck) {
+		// The frame landed; its verdict never arrives. The caller times out on
+		// something that actually worked, which is the one case a refusal
+		// cannot be told apart from.
+		logFault(s.log, FaultSwallowNextAck, "wsSender.deliverAck")
+		return
+	}
+	if code == 0 && faultFires(FaultRefuseNextStreamFrame) {
+		// The platform saying it will not take another frame for this bubble.
+		logFault(s.log, FaultRefuseNextStreamFrame, "wsSender.deliverAck")
+		code, msg = errcodeStreamExpired, "injected: stream no longer accepted"
+	}
 	if reqID == "" {
 		return
 	}
@@ -606,6 +618,14 @@ func (s *wsSender) writeLocked(ctx context.Context, payload []byte) error {
 	deadline := time.Now().Add(writeDeadline)
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d
+	}
+	if faultFires(FaultStallNextWrite) {
+		// Slow, not broken: the caller's own budget is what gives out.
+		logFault(s.log, FaultStallNextWrite, "wsSender.writeLocked")
+		select {
+		case <-time.After(writeDeadline):
+		case <-ctx.Done():
+		}
 	}
 	if err := s.conn.SetWriteDeadline(deadline); err != nil {
 		return err
