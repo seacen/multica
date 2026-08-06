@@ -54,10 +54,41 @@ type preMigrationHook func(ctx context.Context, pool *pgxpool.Pool) error
 // failed build can leave an INVALID relation that IF NOT EXISTS would otherwise
 // mistake for a successful retry. The hook removes only that invalid leftover;
 // migration 257 can then rebuild it while the valid v1 index remains in place.
+//
+// GH #4829: DingTalk's migration 259 rebuilds issue_origin_type_check, and a
+// rebuild restates the whole allowed list — one written before this fork's
+// 'wecom_chat' existed. 260 then VALIDATEs it, and on any deployment that has
+// been running the WeCom adapter its issues violate the narrowed constraint, so
+// 260 fails and the backend will not start. Migration 261 restores 'wecom_chat',
+// but the runner stops at the first failure and never reaches it. The hook
+// widens the constraint back — NOT VALID, so 260's own VALIDATE still does the
+// scan — before that VALIDATE runs. A deployment with no wecom rows lands in the
+// same end state either way.
 var preMigrationHooks = map[string]preMigrationHook{
 	"103_drop_legacy_daily_rollups":                         runTaskUsageHourlyHook,
 	"198_agent_task_attribution_strict_constraint_validate": runAttributionStrictHook,
 	"257_agent_task_queue_channel_media_pending_unique_v2":  cleanupInvalidConcurrentIndexHook("idx_one_pending_task_per_issue_agent_v2"),
+	"260_issue_origin_dingtalk_chat_validate":               runWecomOriginTypeHook,
+}
+
+// originTypesThrough261 is the allowed issue.origin_type set once migration 261
+// has landed. Kept as one list so the hook and the migration cannot drift.
+const originTypesThrough261 = `'autopilot', 'quick_create', 'lark_chat', 'slack_chat', 'agent_create', 'dingtalk_chat', 'wecom_chat'`
+
+// runWecomOriginTypeHook re-admits 'wecom_chat' to issue_origin_type_check
+// before DingTalk's 260 validates it. Idempotent: it drops and re-adds the
+// constraint, so running it twice leaves the same definition.
+func runWecomOriginTypeHook(ctx context.Context, pool *pgxpool.Pool) error {
+	if _, err := pool.Exec(ctx, `ALTER TABLE issue DROP CONSTRAINT IF EXISTS issue_origin_type_check`); err != nil {
+		return fmt.Errorf("drop issue_origin_type_check: %w", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		ALTER TABLE issue ADD CONSTRAINT issue_origin_type_check
+			CHECK (origin_type IN (`+originTypesThrough261+`))
+			NOT VALID`); err != nil {
+		return fmt.Errorf("re-add issue_origin_type_check with wecom_chat: %w", err)
+	}
+	return nil
 }
 
 // cleanupInvalidConcurrentIndexHook removes an INVALID index left by an
