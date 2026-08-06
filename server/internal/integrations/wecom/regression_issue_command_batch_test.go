@@ -120,6 +120,10 @@ func (tr *chatTranscript) PromoteChannelChatTasksIfMediaReady(context.Context, p
 	return nil
 }
 
+func (tr *chatTranscript) PromoteDeferredChannelIssueTask(context.Context, pgtype.UUID) error {
+	return nil
+}
+
 // agentBatches is what every run so far was given to read, oldest first.
 func (tr *chatTranscript) agentBatches() [][]string {
 	tr.mu.Lock()

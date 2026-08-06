@@ -133,9 +133,19 @@ func (fakeIssueCreator) Create(context.Context, service.IssueCreateParams, servi
 	return service.IssueCreateResult{}, nil
 }
 
+// PublishAttachmentsChanged is the realtime broadcast that tells an open issue
+// page its attachments arrived (#6388). Nothing in these tests watches the
+// websocket, so it does nothing here — the fake exists to satisfy
+// engine.IssueCreator, not to assert delivery.
+func (fakeIssueCreator) PublishAttachmentsChanged(db.Issue, pgtype.UUID) {}
+
 type fakeTaskEnqueuer struct {
 	mu       sync.Mutex
 	promoted []pgtype.UUID
+	// issueTasks records the deferred /issue tasks the router released once
+	// their media finished resolving (#6388). Kept separate from promoted:
+	// that one is per-session, this one is per-task.
+	issueTasks []pgtype.UUID
 }
 
 func (f *fakeTaskEnqueuer) EnqueueChatTask(context.Context, db.ChatSession, pgtype.UUID, bool) (db.AgentTaskQueue, error) {
@@ -146,6 +156,13 @@ func (f *fakeTaskEnqueuer) PromoteChannelChatTasksIfMediaReady(_ context.Context
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.promoted = append(f.promoted, sessionID)
+	return nil
+}
+
+func (f *fakeTaskEnqueuer) PromoteDeferredChannelIssueTask(_ context.Context, taskID pgtype.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.issueTasks = append(f.issueTasks, taskID)
 	return nil
 }
 

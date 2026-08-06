@@ -47,6 +47,10 @@ func (f *freshWatchingTasks) PromoteChannelChatTasksIfMediaReady(context.Context
 	return nil
 }
 
+func (f *freshWatchingTasks) PromoteDeferredChannelIssueTask(context.Context, pgtype.UUID) error {
+	return nil
+}
+
 func (f *freshWatchingTasks) runs() []bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
