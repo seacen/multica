@@ -277,7 +277,7 @@ func TestConnectDeliversWhatWasHeldDuringTheOutage(t *testing.T) {
 	_ = waitExit(t, done)
 }
 
-// TestDisconnectedEventEndsTheRun — WeChat allows one connection per bot, so
+// TestDisconnectedEventEndsTheRun — WeCom allows one connection per bot, so
 // this frame says another replica took over. Returning an error is what hands
 // the run back to the Supervisor for backoff instead of sitting on a socket
 // the platform has already abandoned.
@@ -417,7 +417,7 @@ func TestConnectReportsADialFailure(t *testing.T) {
 }
 
 // TestConnectDialsTheDefaultEndpointWhenUnset — the URL override is test-only
-// plumbing; production has to land on WeChat's published endpoint.
+// plumbing; production has to land on WeCom's published endpoint.
 func TestConnectDialsTheDefaultEndpointWhenUnset(t *testing.T) {
 	dialer := &scriptDialer{err: errors.New("stop here")}
 	c := liveChannel(newScriptConn())
@@ -431,7 +431,7 @@ func TestConnectDialsTheDefaultEndpointWhenUnset(t *testing.T) {
 
 // ---- frame dispatch, without the socket ----
 
-// TestServerPingIsAnswered — WeChat pings rarely, but an unanswered ping is a
+// TestServerPingIsAnswered — WeCom pings rarely, but an unanswered ping is a
 // socket the platform stops trusting.
 func TestServerPingIsAnswered(t *testing.T) {
 	c := &wecomChannel{botID: "wb-1"}

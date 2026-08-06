@@ -639,7 +639,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// WebSocket long connection to wss://openws.work.weixin.qq.com; the
 	// Supervisor drives one connection per active wecom installation, gated
 	// by the shared ws_lease_token so multi-replica deployments still hold
-	// at most one active socket per bot (WeChat itself only permits one).
+	// at most one active socket per bot (WeCom itself only permits one).
 	//
 	// Gated by MULTICA_WECOM_SECRET_KEY. Without it, the whole block is
 	// skipped and the wecom Web-UI endpoints return 503; existing deployments
@@ -662,7 +662,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				// person's Multica profile language and never consults this;
 				// a group has many readers and no shared profile, so the
 				// deployment answers for it. Unset or unrecognised keeps the
-				// zh-Hans default — WeChat Work is a Chinese platform — and
+				// zh-Hans default — WeCom is a Chinese platform — and
 				// the log line is what tells an operator their value was
 				// rejected rather than applied.
 				// Said unconditionally, and phrased as a condition, because
@@ -810,7 +810,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				// the open bubble when there is one, as a new message when
 				// there is not. Mirrors slack.NewOutbound(...).Register(bus).
 				// Without it the agent's reply lands only in Multica's web UI
-				// — the user in WeChat Work sees no response.
+				// — the user in WeCom sees no response.
 				//
 				// Outbound media: a file the agent produced with `multica
 				// attachment upload` is bound to the reply it wrote, and this

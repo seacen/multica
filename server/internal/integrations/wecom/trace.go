@@ -68,7 +68,7 @@ func tracePreview(s string) string {
 	return string(out)
 }
 
-// traceOut records a frame on its way to WeChat Work. Called from the one
+// traceOut records a frame on its way to WeCom. Called from the one
 // place that writes the socket, so nothing can be sent without appearing here.
 func traceOut(log *slog.Logger, frame map[string]any) {
 	if !tracingOn() || log == nil {
@@ -112,7 +112,7 @@ func traceOut(log *slog.Logger, frame map[string]any) {
 	log.Info("wecom trace", attrs...)
 }
 
-// traceIn records a frame arriving from WeChat Work, including the server's
+// traceIn records a frame arriving from WeCom, including the server's
 // verdict on something we sent — an errcode here is how a silent failure
 // becomes visible.
 func traceIn(log *slog.Logger, env frameEnvelope) {

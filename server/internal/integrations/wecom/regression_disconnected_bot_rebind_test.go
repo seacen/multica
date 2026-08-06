@@ -570,7 +570,7 @@ func newRebindRig(t *testing.T) (*InstallationService, *channelTable) {
 // refused with tells the admin to do the very thing they just did. The revoked
 // row draws no Disconnect button, no other screen touches installations, and
 // nothing expires — so the bot cannot be connected to anything ever again, and
-// the only remaining move is a new bot on the WeChat Work console.
+// the only remaining move is a new bot on the WeCom console.
 func TestADisconnectedBotCanBeConnectedToAnotherAgent(t *testing.T) {
 	ctx := context.Background()
 	svc, table := newRebindRig(t)

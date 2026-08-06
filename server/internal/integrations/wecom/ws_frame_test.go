@@ -1,6 +1,6 @@
 package wecom
 
-// ws_frame_test.go — the wire contract with WeChat Work. Everything here is
+// ws_frame_test.go — the wire contract with WeCom. Everything here is
 // pinned against frames shaped like the ones documented at
 // https://developer.work.weixin.qq.com/document/path/101463 , because the
 // only feedback the wire gives us in production is silence: a body with the
@@ -16,7 +16,7 @@ import (
 
 // ---- inbound: aibot_msg_callback ----
 
-// singleTextFrame is a 1:1 text message as WeChat pushes it. chatid is absent
+// singleTextFrame is a 1:1 text message as WeCom pushes it. chatid is absent
 // on the single flavour — the sender's userid is the conversation.
 const singleTextFrame = `{
   "cmd": "aibot_msg_callback",
@@ -352,7 +352,7 @@ func TestChannelMessageFromCallbackRoutingIdentity(t *testing.T) {
 				t.Errorf("SenderID = %q, want %q", msg.Source.SenderID, c.wantSender)
 			}
 			if !msg.AddressedToBot {
-				t.Error("WeChat only forwards what was addressed to the bot, so every frame counts as addressed")
+				t.Error("WeCom only forwards what was addressed to the bot, so every frame counts as addressed")
 			}
 			if msg.MessageID != mc.MsgID || msg.EventID != mc.MsgID {
 				t.Errorf("MessageID/EventID = %q/%q, want the msgid %q (the dedup key)", msg.MessageID, msg.EventID, mc.MsgID)

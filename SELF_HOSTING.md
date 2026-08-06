@@ -161,9 +161,9 @@ multica daemon status
 
 ---
 
-## WeChat Work (WeCom): one backend replica
+## WeCom: one backend replica
 
-If you enable the WeChat Work smart bot (`MULTICA_WECOM_SECRET_KEY`), run **one** backend replica.
+If you enable the WeCom smart bot (`MULTICA_WECOM_SECRET_KEY`), run **one** backend replica.
 
 WeCom's smart bot has no HTTPS send endpoint. The only way a reply leaves Multica is the WebSocket the inbound loop already holds, and exactly one process holds that socket per bot. But the "the agent finished, here is the reply" signal is in-process, so with two or more replicas it is frequently raised on a process that is not holding the socket — and the reply never reaches the chat. The person who asked sees nothing, and nothing in the UI says why.
 

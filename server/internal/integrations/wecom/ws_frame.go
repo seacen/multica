@@ -45,7 +45,7 @@ const (
 	eventFeedback     = "feedback_event"
 )
 
-// aibot receiver kinds for aibot_send_msg. WeChat uses ints, not strings.
+// aibot receiver kinds for aibot_send_msg. WeCom uses ints, not strings.
 const (
 	chatTypeSingleInt = 1
 	chatTypeGroupInt  = 2
@@ -359,7 +359,7 @@ type InboundMessage struct {
 	// is the routing key the installation resolver uses.
 	BotID string `json:"bot_id"`
 
-	// MsgID is the WeChat per-message identifier used for two-phase dedup.
+	// MsgID is the WeCom per-message identifier used for two-phase dedup.
 	MsgID string `json:"msg_id,omitempty"`
 
 	// MsgType is the raw wecom type ("text", "image", "event", ...). Media
@@ -424,7 +424,7 @@ type InboundMedia struct {
 //   - group  → ChatType=group, ChatID=chatid,  SenderID=from.userid
 //
 // A user @-mentioning the bot in a group is not distinguishable from a raw
-// group message on the wire — WeChat only forwards to the bot when it was
+// group message on the wire — WeCom only forwards to the bot when it was
 // addressed, so any received group message counts as addressed.
 //
 // text is the ingestible body the caller resolved via routableText; c is the
@@ -481,7 +481,7 @@ func channelMessageFromCallback(botID string, mc aibotMsgCallback, c copyPack, t
 		// sets this from CommandBody and Slack from its text; WeCom was the
 		// one adapter leaving it empty.
 		CommandText: command,
-		// A pure /issue command in WeChat Work should NOT trigger the
+		// A pure /issue command in WeCom should NOT trigger the
 		// agent — the engine already creates the issue and the
 		// OutboundReplier already sends "✅ 已创建 #N". Letting the agent
 		// see "/issue foo" then produces a "I don't recognize this slash
@@ -584,7 +584,7 @@ func subscribeBody(botID, secret string) map[string]any {
 // content. aibot_send_msg's supported msgtypes are markdown and
 // template_card only — text is NOT accepted on this cmd (contrast
 // aibot_respond_msg, which does accept text). We therefore ship as
-// markdown; the WeChat client renders plain text through the markdown
+// markdown; the WeCom client renders plain text through the markdown
 // path without any special escaping. chatType is 1 for single, 2 for
 // group.
 func sendMsgTextBody(chatID string, chatType int, content string) (map[string]any, error) {
@@ -702,7 +702,7 @@ func respondStreamBody(streamID, content string, finish bool) (map[string]any, e
 // one.
 //
 // The tag is the client's, not ours: per 101031 a stream body wrapped in
-// <think></think> renders as WeChat's own collapsed thinking affordance, which
+// <think></think> renders as WeCom's own collapsed thinking affordance, which
 // is what the opening and progress frames are built from. An answer that
 // happens to contain the literal — quoting a prompt, explaining this very
 // feature, pasting XML — gets the same treatment, and half the reply
@@ -756,7 +756,7 @@ func truncateStreamContent(s string) string {
 	return s[:cut] + ellipsis
 }
 
-// hasVisibleChar reports whether s contains anything the WeChat client will
+// hasVisibleChar reports whether s contains anything the WeCom client will
 // render. Whitespace and control runes do not count — that is the whole point.
 func hasVisibleChar(s string) bool {
 	for _, r := range s {

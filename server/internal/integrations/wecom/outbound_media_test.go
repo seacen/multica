@@ -1,7 +1,7 @@
 package wecom
 
 // outbound_media_test.go — the agent produced a file, and the person who asked
-// for it is in WeChat Work.
+// for it is in WeCom.
 //
 // Every test here is written against what lands in the chat: the answer in
 // words, then the file underneath it. The two are separate messages because

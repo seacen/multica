@@ -66,7 +66,7 @@ const (
 	// pathological one cannot turn a step into a paragraph.
 	//
 	// 160 is chosen from the three things it has to hold at once. A phone in
-	// WeChat fits roughly 20 full-width or 40 half-width characters to a line,
+	// WeCom fits roughly 20 full-width or 40 half-width characters to a line,
 	// so 160 is at most four wrapped lines — long enough to read, short enough
 	// that a step still looks like a step. It clears the real arguments with
 	// room to spare: an absolute path runs 40-90 characters and a command with

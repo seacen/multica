@@ -1,6 +1,6 @@
 package wecom
 
-// inbound_voice_test.go — a voice note in WeChat Work arrives as text.
+// inbound_voice_test.go — a voice note in WeCom arrives as text.
 // WeCom runs the speech recognition itself and hands the bot
 // {"voice":{"content":"..."}}; there is no audio to fetch and no key to
 // decrypt. Answering "please send it as text" to a message that already IS

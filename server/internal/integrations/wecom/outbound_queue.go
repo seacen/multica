@@ -3,7 +3,7 @@ package wecom
 // outbound_queue.go — a per-installation holding queue for messages the aibot
 // socket could not take.
 //
-// Why it exists: the smart-bot long connection is the ONLY way out. WeChat
+// Why it exists: the smart-bot long connection is the ONLY way out. WeCom
 // publishes no HTTPS equivalent of aibot_send_msg — the long-connection docs
 // (https://developer.work.weixin.qq.com/document/path/101463) describe it
 // purely as a WebSocket cmd, and the one HTTPS reply endpoint that does exist,
@@ -38,7 +38,7 @@ import (
 // still worth reading.
 const maxPendingPerInstallation = 1000
 
-// pendingTTL is how long a message is worth resending. A day matches WeChat's
+// pendingTTL is how long a message is worth resending. A day matches WeCom's
 // own 24h window for a proactive push tied to a user message; past it the
 // conversation has moved on.
 const pendingTTL = 24 * time.Hour

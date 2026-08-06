@@ -153,7 +153,7 @@ func TestUnsupportedMsgTypeGetsAReceipt(t *testing.T) {
 	}
 }
 
-// TestUnsupportedMsgTypeReceiptIsDedupedByMsgID: WeChat redelivers frames.
+// TestUnsupportedMsgTypeReceiptIsDedupedByMsgID: WeCom redelivers frames.
 // The second delivery of the same msgid must stay silent.
 func TestUnsupportedMsgTypeReceiptIsDedupedByMsgID(t *testing.T) {
 	c, conn, _ := testChannel(t, func(context.Context, channel.InboundMessage) error { return nil })

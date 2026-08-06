@@ -422,7 +422,7 @@ func TestClosingFrameAlwaysCarriesVisibleText(t *testing.T) {
 }
 
 // TestAnAnswerAboutThinkTagsIsStillReadable — <think></think> is not markup
-// this adapter invented, it is what the WeChat client folds into its own
+// this adapter invented, it is what the WeCom client folds into its own
 // thinking affordance, and the progress frames are built out of it. An answer
 // that happens to contain the literal — quoting a prompt, discussing this
 // feature, pasting XML — would be folded away with it, in a chat with no edit

@@ -34,7 +34,7 @@ package wecom
 // the handles, which is exactly right: the socket the req_ids belonged to is
 // gone too, and the answers fall back to plain messages.
 //
-// Replay is not this file's problem. WeChat redelivers callbacks after a
+// Replay is not this file's problem. WeCom redelivers callbacks after a
 // reconnect, but a redelivered frame loses the dedup claim in
 // channel_inbound_message_dedup and never reaches OutcomeIngested, so it never
 // reaches the typing indicator either. What this file does bound is the

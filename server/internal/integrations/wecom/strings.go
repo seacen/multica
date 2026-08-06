@@ -36,7 +36,7 @@ const (
 	LocaleZhHans Locale = "zh-Hans"
 	LocaleEn     Locale = "en"
 
-	// DefaultLocale is the compile-time fallback: Chinese, because WeChat Work
+	// DefaultLocale is the compile-time fallback: Chinese, because WeCom
 	// is a Chinese platform. It is what a deployment that says nothing gets.
 	// Read deploymentLocale() rather than this — a deployment can say
 	// otherwise, and a room's language is a property of the deployment, not of

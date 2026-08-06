@@ -1,6 +1,6 @@
 package wecom
 
-// media_ingest.go — the engine.MediaResolver for WeChat Work.
+// media_ingest.go — the engine.MediaResolver for WeCom.
 //
 // The shape is the one lark/media_ingest.go established and the Router
 // depends on: HasMedia is a pure in-memory look at the payload we already

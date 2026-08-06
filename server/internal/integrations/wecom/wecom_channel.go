@@ -1,7 +1,7 @@
 package wecom
 
 // wecom_channel.go — the Channel + Factory the engine.Supervisor drives, plus
-// the WebSocket run loop for one aibot smart-bot connection. WeChat allows
+// the WebSocket run loop for one aibot smart-bot connection. WeCom allows
 // only one active connection per bot; the Supervisor's WS lease enforces
 // that same "at most one per replica" invariant at the process layer, so the
 // combination gives us a single global connection per installation without
@@ -34,13 +34,13 @@ import (
 	"github.com/multica-ai/multica/server/internal/util"
 )
 
-// DefaultWSURL is the aibot long-connection endpoint. WeChat publishes a
+// DefaultWSURL is the aibot long-connection endpoint. WeCom publishes a
 // single global endpoint for every bot; the (bot_id, secret) pair carried in
 // the aibot_subscribe frame after the WS handshake identifies which bot the
 // connection belongs to.
 const DefaultWSURL = "wss://openws.work.weixin.qq.com"
 
-// pingInterval is the client-driven heartbeat cadence. WeChat's docs
+// pingInterval is the client-driven heartbeat cadence. WeCom's docs
 // prescribe 30s; below that they may kill the socket, above that we spam.
 const pingInterval = 30 * time.Second
 
@@ -83,7 +83,7 @@ type wecomChannel struct {
 	// dedup is the shared two-phase claim/mark surface over
 	// channel_inbound_message_dedup. The read loop needs it directly (not
 	// only through the ResolverSet) because the "I can only read text"
-	// receipt is sent without ever entering the engine Router, and WeChat
+	// receipt is sent without ever entering the engine Router, and WeCom
 	// redelivers frames — the claim is what stops a redelivered voice note
 	// from drawing a second receipt. nil disables the receipt.
 	dedup engine.Deduper
@@ -201,7 +201,7 @@ func (c *wecomChannel) Connect(ctx context.Context) error {
 		go c.senders.flushPending(c.installationID)
 	}
 
-	// Heartbeat — WeChat kills silent sockets past ~90s. We ping every 30s
+	// Heartbeat — WeCom kills silent sockets past ~90s. We ping every 30s
 	// via the shared writer mutex so it interleaves cleanly with other
 	// outbound frames.
 	pingCtx, pingCancel := context.WithCancel(ctx)
@@ -410,7 +410,7 @@ func (c *wecomChannel) packFor(ctx context.Context, mc aibotMsgCallback) copyPac
 // twice for one msgid.
 //
 // The claim on channel_inbound_message_dedup is what enforces that last one.
-// WeChat redelivers frames on its own schedule and a reconnect replays the
+// WeCom redelivers frames on its own schedule and a reconnect replays the
 // window, so an in-memory guard would not survive the case it exists for.
 // A failed write releases the claim, leaving the redelivery free to retry.
 func (c *wecomChannel) replyUnsupportedMsgType(ctx context.Context, mc aibotMsgCallback, pack copyPack, sender *wsSender, log *slog.Logger) {
