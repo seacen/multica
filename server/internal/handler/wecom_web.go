@@ -256,17 +256,11 @@ func (h *Handler) wecomInstallService() *wecom.InstallationService {
 	if !ok || res == nil || res.Box == nil {
 		return nil
 	}
-	svc, err := wecom.NewInstallationService(h.Queries, res.Box)
-	if err != nil {
-		return nil
-	}
 	// The install's reclaim-then-take runs in one transaction so two admins
 	// connecting the same bot at the same moment cannot both pass the reclaim.
-	// Guarded rather than passed straight through: h.TxStarter is an interface,
-	// and handing a nil one to WithTx would store a non-nil interface holding
-	// nothing, which panics on the first Begin instead of degrading.
-	if h.TxStarter != nil {
-		return svc.WithTx(h.TxStarter)
+	svc, err := wecom.NewInstallationService(h.Queries, h.TxStarter, res.Box)
+	if err != nil {
+		return nil
 	}
 	return svc
 }

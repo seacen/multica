@@ -509,6 +509,38 @@ func (tb *channelTable) Query(_ context.Context, sql string, _ ...interface{}) (
 	return nil, fmt.Errorf("regression rig: multi-row query %q is not modelled by this test's channel_installation stand-in", queryNameOf(sql))
 }
 
+// tableTx is the transaction Upsert opens around reclaim-then-take. Every
+// statement lands on the same stand-in table, so the rig sees exactly the
+// sequence production runs; commit and rollback are no-ops because a single
+// in-memory table has nothing to undo. Embedding the nil pgx.Tx interface means
+// anything the service starts calling that is NOT modelled here panics loudly
+// rather than silently doing nothing.
+type tableTx struct {
+	pgx.Tx
+	table *channelTable
+}
+
+func (tx tableTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	return tx.table.Exec(ctx, sql, args...)
+}
+
+func (tx tableTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	return tx.table.Query(ctx, sql, args...)
+}
+
+func (tx tableTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	return tx.table.QueryRow(ctx, sql, args...)
+}
+
+func (tableTx) Commit(context.Context) error   { return nil }
+func (tableTx) Rollback(context.Context) error { return nil }
+
+type tableTxStarter struct{ table *channelTable }
+
+func (s tableTxStarter) Begin(context.Context) (pgx.Tx, error) {
+	return tableTx{table: s.table}, nil
+}
+
 // newRebindRig wires a real InstallationService — the only write path to a
 // wecom channel_installation row, and the one the HTTP install endpoint uses —
 // onto the stand-in table.
@@ -523,7 +555,7 @@ func newRebindRig(t *testing.T) (*InstallationService, *channelTable) {
 		t.Fatalf("secretbox.New: %v", err)
 	}
 	table := newChannelTable()
-	svc, err := NewInstallationService(db.New(table), box)
+	svc, err := NewInstallationService(db.New(table), tableTxStarter{table: table}, box)
 	if err != nil {
 		t.Fatalf("NewInstallationService: %v", err)
 	}

@@ -44,35 +44,22 @@ type InstallationParams struct {
 // plaintext storage — the same invariant lark.InstallationService enforces.
 type InstallationService struct {
 	store *Store
-	box   *secretbox.Box
-	// tx runs the reclaim and the upsert together. Optional: without it the
-	// two still run, just not atomically, so a caller that has no pool (a
-	// test, an admin CLI) keeps working and only loses the guarantee that two
-	// simultaneous installs of the same bot cannot both pass the reclaim. The
-	// loser of that race trips the unique index and gets the ordinary
-	// conflict, which is a confusing answer rather than a wrong row.
-	tx engine.TxStarter
+	// tx runs the reclaim and the upsert together. Required: without one, two
+	// simultaneous installs of the same bot could both pass the reclaim and
+	// the loser would trip the unique index with a confusing answer.
+	tx  engine.TxStarter
+	box *secretbox.Box
 }
 
-// WithTx returns the service running its rebind inside one transaction.
-// Production wires it; see cmd/server/router.go.
-func (s *InstallationService) WithTx(tx engine.TxStarter) *InstallationService {
-	if s == nil {
-		return nil
-	}
-	next := *s
-	next.tx = tx
-	return &next
-}
-
-// NewInstallationService binds the service to a queries handle and a
-// secretbox keyed for at-rest encryption. Returns an error when the box
-// is nil; callers should surface it (do not fall back to plaintext).
-func NewInstallationService(queries *db.Queries, box *secretbox.Box) (*InstallationService, error) {
+// NewInstallationService binds the service to a queries handle, a transaction
+// starter (so the reclaim-then-upsert runs atomically), and a secretbox keyed
+// for at-rest encryption. Returns an error when the box is nil; callers should
+// surface it (do not fall back to plaintext).
+func NewInstallationService(queries *db.Queries, tx engine.TxStarter, box *secretbox.Box) (*InstallationService, error) {
 	if box == nil {
 		return nil, errors.New("wecom: InstallationService requires a non-nil secretbox.Box")
 	}
-	return &InstallationService{store: NewStore(queries), box: box}, nil
+	return &InstallationService{store: NewStore(queries), tx: tx, box: box}, nil
 }
 
 // Upsert creates or refreshes an installation row. The conflict key on
@@ -96,17 +83,15 @@ func (s *InstallationService) Upsert(ctx context.Context, p InstallationParams) 
 		return Installation{}, err
 	}
 
-	q := s.store.Queries
-	var commit func() error
-	if s.tx != nil {
-		dbtx, err := s.tx.Begin(ctx)
-		if err != nil {
-			return Installation{}, fmt.Errorf("wecom: begin install: %w", err)
-		}
-		defer dbtx.Rollback(ctx)
-		q = q.WithTx(dbtx)
-		commit = func() error { return dbtx.Commit(ctx) }
+	if s.tx == nil {
+		return Installation{}, errors.New("wecom: InstallationService requires a transaction starter")
 	}
+	tx, err := s.tx.Begin(ctx)
+	if err != nil {
+		return Installation{}, fmt.Errorf("wecom: begin install tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := s.store.WithTx(tx).Queries
 
 	// Free the bot's routing slot from a DEAD previous owner before trying to
 	// take it. Disconnect only flips a row to 'revoked' and no product path
@@ -145,10 +130,8 @@ func (s *InstallationService) Upsert(ctx context.Context, p InstallationParams) 
 		}
 		return Installation{}, fmt.Errorf("wecom: upsert installation: %w", err)
 	}
-	if commit != nil {
-		if err := commit(); err != nil {
-			return Installation{}, fmt.Errorf("wecom: commit install: %w", err)
-		}
+	if err := tx.Commit(ctx); err != nil {
+		return Installation{}, fmt.Errorf("wecom: commit install tx: %w", err)
 	}
 	return installationFromRow(row)
 }
