@@ -60,6 +60,13 @@ const writeDeadline = 10 * time.Second
 // handshakeTimeout bounds the initial TCP + WS handshake dial.
 const handshakeTimeout = 15 * time.Second
 
+// The one line sent back for a message this adapter cannot read at all is
+// copyPack.UnsupportedMsgType (strings.go). It used to say "我目前只能处理文字
+// 消息" — text only — which stopped being true the moment photos, files, videos
+// and 图文混排 started routing: a person who has just watched the bot answer a
+// screenshot, then gets told it only handles text, reads that as the bot being
+// broken rather than as this one kind not being supported.
+
 // wecomChannel is one installation's aibot smart-bot WebSocket connection.
 // The engine.Supervisor builds one per active installation via the
 // registered Factory and drives lease / reconnect lifecycle; Connect blocks
@@ -92,12 +99,13 @@ var _ channel.Channel = (*wecomChannel)(nil)
 
 func (c *wecomChannel) Type() channel.Type { return TypeWecom }
 
-// Capabilities declares what the aibot adapter supports today. Text is the
-// only fully wired capability; attachments arrive as MsgTypeImage / File /
-// Audio / Video but we do not yet download the media (WeCom's aibot API
-// requires an additional aibot_upload_media_* dance to send back media).
+// Capabilities declares what the aibot adapter supports today. Inbound
+// attachments are downloaded, decrypted and bound (media_ingest.go), so
+// CapAttachment holds in the same direction it holds for DingTalk
+// (dingtalk_channel.go:52). Sending media back out is a separate matter —
+// it needs WeCom's aibot_upload_media_* handshake — and is not claimed here.
 func (c *wecomChannel) Capabilities() channel.Capability {
-	return channel.CapText
+	return channel.CapText | channel.CapAttachment
 }
 
 // Disconnect is a no-op: the WS connection's whole lifetime is scoped to
@@ -382,24 +390,25 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 			log.Warn("wecom: bad aibot_msg_callback body", "error", err)
 			return nil
 		}
-		traceInbound(log, mc, mc.Text.Content)
-		msg := channelMessageFromCallback(c.botID, c.botDisplayName, mc, env.Headers.ReqID)
-		if mc.MsgType != "text" {
-			// Iteration 1 routes only text. Rather than drop other types
-			// (voice / image / file) silently — which reads as a broken bot —
-			// answer the same chat with a one-line "text only" receipt, then
-			// stop. Media routing, and dedup'd receipts that never double-answer
-			// a WeCom delivery retry, are a follow-up. Best-effort: a send
-			// failure degrades to the prior silent drop.
+		text, ok := mc.ownText()
+		traceInbound(log, mc, text)
+		msg := channelMessageFromCallback(c.botID, c.botDisplayName, mc, text, env.Headers.ReqID)
+		if !ok {
+			// Nothing in this message can be read: a kind the adapter does
+			// not know (a location card, a standalone voice note), or a known
+			// kind that arrived without the one field that makes it usable.
+			// Silence reads as a broken bot, so answer the same chat with a
+			// one-line receipt and stop. Best-effort: a send failure degrades
+			// to the prior silent drop.
 			//
-			// The receipt is addressed to whoever sent the unreadable message,
-			// so in a 1:1 it reads their profile language; a group has no
-			// shared profile and reads the deployment's (language.go).
+			// The receipt is addressed to whoever sent the unreadable
+			// message, so in a 1:1 it reads their profile language; a group
+			// has no shared profile and reads the deployment's (language.go).
 			chatType := aibotChatTypeFromChannel(msg.Source.ChatType)
 			cp := copyFor(localeFor(ctx, c.languages, c.installationID, chatType, msg.Source.SenderID))
-			log.Debug("wecom: non-text message, replying text-only", "msg_type", mc.MsgType, "msg_id", mc.MsgID)
+			log.Debug("wecom: unsupported message kind, replying with a receipt", "msg_type", mc.MsgType, "msg_id", mc.MsgID)
 			if err := sender.sendText(msg.Source.ChatID, chatType, cp.UnsupportedMsgType); err != nil {
-				log.Debug("wecom: text-only receipt send failed", "error", err, "msg_id", mc.MsgID)
+				log.Debug("wecom: unsupported-kind receipt send failed", "error", err, "msg_id", mc.MsgID)
 			}
 			return nil
 		}
