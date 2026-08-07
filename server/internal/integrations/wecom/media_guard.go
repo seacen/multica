@@ -158,7 +158,6 @@ type hostResolver interface {
 type mediaGuard struct {
 	allow    addrPolicy
 	resolve  hostResolver
-	dialer   *net.Dialer
 	onRefuse func(host string, addr netip.Addr) // test hook; nil in production
 }
 
@@ -185,6 +184,7 @@ func (g mediaGuard) dial(ctx context.Context, network, addr string) (net.Conn, e
 		allow = publicAddrOnly
 	}
 
+	d := &net.Dialer{Timeout: mediaDialTimeout}
 	lastErr := error(ErrMediaAddrBlocked)
 	for _, a := range addrs {
 		if !allow(a) {
@@ -192,10 +192,6 @@ func (g mediaGuard) dial(ctx context.Context, network, addr string) (net.Conn, e
 				g.onRefuse(host, a)
 			}
 			continue
-		}
-		d := g.dialer
-		if d == nil {
-			d = &net.Dialer{Timeout: mediaDialTimeout}
 		}
 		conn, dialErr := d.DialContext(ctx, network, net.JoinHostPort(a.String(), port))
 		if dialErr == nil {
