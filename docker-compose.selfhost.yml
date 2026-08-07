@@ -158,6 +158,11 @@ services:
       # instead. zh-Hans (default) or en; an unrecognised value leaves the
       # default in place and the resolved one is logged at boot.
       MULTICA_WECOM_DEFAULT_LOCALE: ${MULTICA_WECOM_DEFAULT_LOCALE:-}
+      # Comma-separated ranges the inbound media fetcher may dial even though
+      # they look reserved. Empty (the default) keeps the SSRF guard as strict
+      # as it ships; set it only behind a fake-IP proxy whose pool would
+      # otherwise get every attachment refused. See .env.example.
+      MULTICA_WECOM_MEDIA_ALLOW_CIDRS: ${MULTICA_WECOM_MEDIA_ALLOW_CIDRS:-}
     restart: unless-stopped
 
   frontend:
