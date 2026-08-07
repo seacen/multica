@@ -275,6 +275,7 @@ func (c *wecomChannel) Connect(ctx context.Context) (err error) {
 			log.Warn("wecom: bad frame envelope", "error", err, "size", len(payload))
 			continue
 		}
+		traceIn(log, env)
 		switch env.Cmd {
 		case cmdMsgCallback, cmdEventCallback:
 			select {
@@ -347,6 +348,10 @@ func (c *wecomChannel) subscribe(ctx context.Context, conn wsConn, sender *wsSen
 		if err := json.Unmarshal(payload, &env); err != nil {
 			continue
 		}
+		// Traced before the req_id filter: a subscribe that is rejected, or
+		// answered on a req_id we never sent, is exactly the failure an
+		// operator turns tracing on to see.
+		traceIn(log, env)
 		if env.Headers.ReqID != reqID {
 			continue
 		}
@@ -368,6 +373,7 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 			log.Warn("wecom: bad aibot_msg_callback body", "error", err)
 			return nil
 		}
+		traceInbound(log, mc, mc.Text.Content)
 		msg := channelMessageFromCallback(c.botID, mc, env.Headers.ReqID)
 		if mc.MsgType != "text" {
 			// Iteration 1 routes only text. Rather than drop other types
