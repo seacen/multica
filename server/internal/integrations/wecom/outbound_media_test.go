@@ -79,15 +79,21 @@ func newOutboundWithMediaAndStreams(t *testing.T, q outboundQueries, objects med
 // installation, and one file bound to this turn's assistant message.
 func oneAttachmentQueries(t *testing.T, row db.Attachment) *fakeOutboundQueries {
 	t.Helper()
-	return &fakeOutboundQueries{
+	q := &fakeOutboundQueries{
 		sessionBinding: db.ChannelChatSessionBinding{ChannelChatID: "CHAT_1", ChatType: "group"},
 		installation:   db.ChannelInstallation{Status: string(InstallationActive)},
 		attachments:    []db.Attachment{row},
 		// The turn came in over WeCom. Without this the origin gate in
 		// processEvent refuses to push anything into the room — which is what
 		// it is there for, and what every delivery fixture has to declare.
-		channelIngested: true,
+		channelIngested: askedOverWecom(),
 	}
+	// And the turn's task row has to exist: the gate reads the stamp off the
+	// batch that task owns, and a task with no row reads as reaped, which is
+	// also not delivered. chatDoneEvent sends every one of these under
+	// testTaskID.
+	q.fileTask(t, testTaskID)
+	return q
 }
 
 func chatDoneEvent(content string) events.Event {
