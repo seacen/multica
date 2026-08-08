@@ -135,6 +135,43 @@ func (p *progressRig) milestone(t *testing.T, taskName, summary string) {
 	})
 }
 
+// think publishes one increment of the agent's reasoning, the way the daemon's
+// transcript flush does.
+func (p *progressRig) think(t *testing.T, taskName, content string) {
+	t.Helper()
+	id := taskUUID(t, taskName)
+	p.bus.Publish(events.Event{
+		Type:    protocol.EventTaskMessage,
+		TaskID:  id,
+		Payload: protocol.TaskMessagePayload{TaskID: id, Type: "thinking", Content: content},
+	})
+}
+
+// lastRefresh returns the body of the newest in-flight refresh frame.
+func (p *progressRig) lastRefresh(t *testing.T) string {
+	t.Helper()
+	refreshes := p.refreshes(t)
+	if len(refreshes) == 0 {
+		t.Fatal("no in-flight refresh frame was written at all")
+	}
+	return refreshes[len(refreshes)-1]
+}
+
+// textBetween returns what sits between the first occurrence of left and the
+// first occurrence of right after it — the seam itself.
+func textBetween(body, left, right string) (string, bool) {
+	i := strings.Index(body, left)
+	if i < 0 {
+		return "", false
+	}
+	rest := body[i+len(left):]
+	j := strings.Index(rest, right)
+	if j < 0 {
+		return "", false
+	}
+	return rest[:j], true
+}
+
 // refreshes returns the in-flight refresh frames — not the opening frame,
 // which carries the placeholder, and not a closing one. They are the whole
 // feature.
@@ -206,7 +243,14 @@ func TestATaskMessagePaintsTheToolCallIntoTheBubble(t *testing.T) {
 // own, so on its own it leaves the whole middle of a run blank — but those two
 // are the only thing said before the first tool call, which on a slow start is
 // the longest silence there is.
-func TestTheDaemonsOwnMilestonesReachTheBubbleToo(t *testing.T) {
+//
+// A milestone REWRITES the round's bubble: it goes into the open one and
+// leaves it open. The two ways to get that wrong both leave the user worse off
+// than the blank spinner did — sealing the bubble takes the answer's only
+// destination away, and pushing the line as a plain message puts a status
+// update in the conversation, one per milestone, underneath a spinner that is
+// still turning.
+func TestATaskProgressEventRewritesTheOpenBubble(t *testing.T) {
 	t.Parallel()
 	rig := newProgressRig(t)
 	rig.running(t, "REQ-A", 1, "task-1")
@@ -219,6 +263,19 @@ func TestTheDaemonsOwnMilestonesReachTheBubbleToo(t *testing.T) {
 	}
 	if !strings.Contains(refreshes[0], "Launching claude") {
 		t.Errorf("the refresh does not carry the milestone: %q", refreshes[0])
+	}
+	if !strings.HasPrefix(refreshes[0], "<think>") {
+		t.Errorf("the milestone is not inside a think block (%q); it would read as the bot's answer", refreshes[0])
+	}
+	if !strings.Contains(refreshes[0], copyFor(DefaultLocale).StreamProgressPrefix) {
+		t.Errorf("the refresh is missing the progress heading %q: %q",
+			copyFor(DefaultLocale).StreamProgressPrefix, refreshes[0])
+	}
+	if rig.streams.depth() != 1 {
+		t.Error("the milestone consumed the round's bubble; the answer would arrive as a loose message under a spinner that nothing can now clear")
+	}
+	if pushes := rig.conn.pushes(t); len(pushes) != 0 {
+		t.Errorf("a milestone went out as %d plain message(s); it belongs in the bubble, not underneath it", len(pushes))
 	}
 }
 
@@ -311,6 +368,84 @@ func TestABurstOfToolCallsBecomesOneFrame(t *testing.T) {
 	}
 	if !strings.Contains(refreshes[1], "Edit.go") {
 		t.Errorf("the second frame dropped the steps folded into the first: %q", refreshes[1])
+	}
+}
+
+// ---- the seam between two reasoning increments ----
+//
+// The agent's reasoning reaches the bubble as 500ms increments of one
+// continuous stream, cut wherever the batching fell rather than at a sentence
+// or even at a word. The buffer is joined by plain concatenation, so whatever
+// whitespace sits at a seam is all that keeps the two sides apart. These two
+// guard the joined text as the person in WeCom reads it, across a flush
+// boundary — which is why they go through the bus and the round rather than
+// through the feed directly: the trimming that welds them is on the way in,
+// and a feed-level test that hands the increments over already joined cannot
+// see it.
+
+// A flush that falls between two words must not weld them together:
+// "再看router.go" where the agent wrote "再看 router.go". It is unreadable in
+// the small, and worse in mixed script, where the fused pair reads as one
+// unfamiliar token rather than as two words.
+func TestReasoningCutMidSentenceDoesNotWeldTwoWordsTogether(t *testing.T) {
+	t.Parallel()
+	rig := newProgressRig(t)
+	rig.running(t, "REQ-A", 1, "task-1")
+
+	const head = "先看 handler.go 里的分支，再看 "
+	const tail = "router.go 的注册顺序。"
+
+	rig.think(t, "task-1", head)
+	rig.tick()
+	rig.think(t, "task-1", tail)
+
+	body := rig.lastRefresh(t)
+	if !strings.Contains(body, "里的分支") || !strings.Contains(body, "的注册顺序") {
+		t.Fatalf("frame = %q lost the reasoning on one side of the seam", body)
+	}
+	gap, ok := textBetween(body, "再看", "router.go")
+	if !ok {
+		t.Fatalf("frame = %q does not carry both halves of the sentence", body)
+	}
+	if strings.TrimSpace(gap) != "" {
+		t.Fatalf("the two markers matched the wrong place; %q sits between them:\n%s", gap, body)
+	}
+	if gap == "" {
+		t.Errorf("the seam between two thinking increments lost its space: the bubble reads %q where the agent wrote %q.\n"+
+			"Every 500ms boundary that falls between two words welds them into one.\nwhole frame:\n%s",
+			"再看router.go", "再看 router.go", body)
+	}
+}
+
+// A reasoning delta announces a new block by opening with a blank line,
+// because concatenation is how the buffer is built. That blank line is leading
+// whitespace of its increment, and it is the only thing marking the break.
+func TestTwoReasoningBlocksDoNotRunTogetherAcrossAFlush(t *testing.T) {
+	t.Parallel()
+	rig := newProgressRig(t)
+	rig.running(t, "REQ-A", 1, "task-1")
+
+	const first = "先确认 handler.go 里的分支。"
+	const second = "\n\n再决定要不要改 router.go 的注册顺序。"
+
+	rig.think(t, "task-1", first)
+	rig.tick()
+	rig.think(t, "task-1", second)
+
+	body := rig.lastRefresh(t)
+	if !strings.Contains(body, "里的分支") || !strings.Contains(body, "的注册顺序") {
+		t.Fatalf("frame = %q lost one of the two reasoning blocks", body)
+	}
+	gap, ok := textBetween(body, "里的分支。", "再决定")
+	if !ok {
+		t.Fatalf("frame = %q does not carry both reasoning blocks", body)
+	}
+	if strings.TrimSpace(gap) != "" {
+		t.Fatalf("the two markers matched the wrong place; %q sits between them:\n%s", gap, body)
+	}
+	if !strings.Contains(gap, "\n") {
+		t.Errorf("the break between two reasoning blocks was dropped at the flush boundary: they are separated by %q, "+
+			"so the bubble runs them together as one paragraph.\nThe agent sent a blank line between them.\nwhole frame:\n%s", gap, body)
 	}
 }
 
