@@ -49,6 +49,9 @@ type outboundQueries interface {
 	GetChannelInstallation(ctx context.Context, arg db.GetChannelInstallationParams) (db.ChannelInstallation, error)
 	FindChannelBindingForMember(ctx context.Context, arg db.FindChannelBindingForMemberParams) (db.ChannelUserBinding, error)
 	GetWorkspace(ctx context.Context, id pgtype.UUID) (db.Workspace, error)
+	// Which language this subscriber's messages are written in: the inbox
+	// card reads the recipient's own profile (language.go).
+	languageLookup
 }
 
 // Outbound delivers an agent's chat reply back to WeCom over the same
@@ -269,13 +272,18 @@ func (o *Outbound) tryDeliverInbox(ctx context.Context, item map[string]any, rec
 		return false // supervisor down or reconnecting — no live connection
 	}
 
+	// The card is a 1:1 push to a known Multica member, so their own profile
+	// language decides what it says — the one surface where the reader is
+	// always resolvable by construction.
+	cp := copyFor(localeForUser(ctx, o.q, recipientID))
+
 	// Resolve slug for the link. Best-effort — a missing slug just falls
 	// back to the workspace UUID in the URL.
 	slug := ""
 	if ws, err := o.q.GetWorkspace(ctx, workspaceID); err == nil {
 		slug = ws.Slug
 	}
-	content := buildInboxMarkdown(item, workspaceIDStr, slug)
+	content := buildInboxMarkdown(item, workspaceIDStr, slug, cp)
 	if content == "" {
 		return false
 	}
