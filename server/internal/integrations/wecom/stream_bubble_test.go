@@ -120,11 +120,11 @@ func (c *bubbleConn) pushes(t *testing.T) []map[string]any {
 type bubbleRig struct {
 	conn    *bubbleConn
 	streams *streamStore
+	senders *sendersRegistry
 	typing  *TypingIndicatorManager
 	out     *Outbound
 	q       *fakeOutboundQueries
 	bus     *events.Bus
-	senders *sendersRegistry
 	instID  pgtype.UUID
 	now     time.Time
 }
