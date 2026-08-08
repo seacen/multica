@@ -123,6 +123,14 @@ type copyPack struct {
 	// all — sent from the read loop, which never reaches the Replier.
 	UnsupportedMsgType string
 
+	// MediaSendFailed says the agent produced a file and it did not reach the
+	// chat. The answer is already on screen and may well point at the file, so
+	// silence would leave the user waiting for something that is not coming.
+	// One line covers the whole turn however many files failed — the reason
+	// (too big, storage down, WeCom refused it) is a log line, not something
+	// the reader can act on.
+	MediaSendFailed string
+
 	// BindingPromptPrefix / BindingPromptSuffix wrap the bind URL.
 	// BindingPending replaces the whole thing when the mint was throttled and
 	// there is no URL to print. Both go to the sender alone, never to a room
@@ -212,6 +220,7 @@ var copyPacks = map[Locale]copyPack{
 		AgentOffline:         "⚠️ 智能体当前不在线，你的消息已收到，等它上线后会处理。",
 		AgentArchived:        "⚠️ 该智能体已归档，无法回复。请联系工作区管理员。",
 		UnsupportedMsgType:   "抱歉，我目前只能处理文字消息。",
+		MediaSendFailed:      "⚠️ 有文件没能发出来，我这边保留着，需要的话我再试一次。",
 		BindingPromptPrefix:  "👋 请先绑定你的 Multica 账号，才能与我对话：\n",
 		BindingPromptSuffix:  "\n（链接 15 分钟内有效）",
 		BindingPending:       "👋 绑定链接刚才已经发给你了，就在上方，请直接点击完成绑定。",
@@ -240,6 +249,7 @@ var copyPacks = map[Locale]copyPack{
 		AgentOffline:         "⚠️ The agent is offline right now. Your message was received and will be handled once it's back.",
 		AgentArchived:        "⚠️ This agent has been archived and can't reply. Please contact your workspace admin.",
 		UnsupportedMsgType:   "Sorry, I can only read text messages for now.",
+		MediaSendFailed:      "⚠️ I couldn't send one of the files. It is still here — say the word and I'll try again.",
 		BindingPromptPrefix:  "👋 Link your Multica account before we can talk:\n",
 		BindingPromptSuffix:  "\n(the link is good for 15 minutes)",
 		BindingPending:       "👋 I already sent you a link — it is just above, tap it to finish linking.",

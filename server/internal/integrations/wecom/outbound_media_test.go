@@ -273,7 +273,7 @@ func TestSendAttachments_TellsTheUserWhenAFileFailed(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("text sends = %v, want the answer and a note that the file failed", got)
 	}
-	if got[1] != mediaSendFailedText {
+	if got[1] != copyFor(DefaultLocale).MediaSendFailed {
 		t.Errorf("second message = %q, want the failure notice", got[1])
 	}
 	if n := len(mediaSends(t, conn)); n != 0 {
@@ -298,7 +298,7 @@ func TestSendAttachments_ReportsAnUnreadableObject(t *testing.T) {
 		t.Errorf("upload init frames = %d, want 0 — there were no bytes to upload", n)
 	}
 	got := markdownSends(t, conn)
-	if len(got) != 2 || got[1] != mediaSendFailedText {
+	if len(got) != 2 || got[1] != copyFor(DefaultLocale).MediaSendFailed {
 		t.Errorf("text sends = %v, want the answer and the failure notice", got)
 	}
 }

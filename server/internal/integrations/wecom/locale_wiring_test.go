@@ -250,7 +250,44 @@ func TestInboxCardUnknownTypeUsesTheSamePacksFallback(t *testing.T) {
 	}
 }
 
-// ---- surface 3: the read loop's own receipt ----
+// ---- surface 3: the attachment-failure notice ----
+
+// TestAttachmentSendFailureNoticeReadsTheDestinationsLanguage drives the whole
+// chat:done path, not sendAttachments directly, because the locale is resolved
+// by the caller and handed down in attachmentTarget — the delivery itself runs
+// detached, with no context left to read a profile with. Constructing the
+// target by hand here would test the pack and skip the wiring.
+func TestAttachmentSendFailureNoticeReadsTheDestinationsLanguage(t *testing.T) {
+	t.Parallel()
+	for _, tc := range localeCases {
+		t.Run(tc.name, func(t *testing.T) {
+			q := oneAttachmentQueries(t, db.Attachment{
+				ID: mustTestUUID(t), Filename: "big.bin", Url: "https://cdn.example/obj/bin",
+			})
+			// A 1:1 with the asker, so their own profile answers.
+			q.sessionBinding.ChannelChatID = "T-asker"
+			q.sessionBinding.ChatType = string(channel.ChatTypeP2P)
+			q.userLanguage = tc.language
+			q.userBindingID = localeTestUserID
+
+			o, instID, conn := newOutboundWithMedia(t, q, &fakeObjectStore{key: "obj/bin", data: []byte("DATA")})
+			q.sessionBinding.InstallationID = instID
+			q.installation.ID = instID
+			conn.refuse[cmdUploadMediaInit] = 40058 // the server will not take the file
+
+			if err := o.processEvent(context.Background(), chatDoneEvent("See the attached dump.")); err != nil {
+				t.Fatalf("processEvent: %v", err)
+			}
+			got := markdownSends(t, conn)
+			want := copyPacks[tc.locale].MediaSendFailed
+			if len(got) != 2 || got[1] != want {
+				t.Fatalf("sends = %q, want the answer then the %s failure notice %q", got, tc.locale, want)
+			}
+		})
+	}
+}
+
+// ---- surface 4: the read loop's own receipt ----
 
 func TestUnreadableKindReceiptReadsTheSendersLanguage(t *testing.T) {
 	t.Parallel()

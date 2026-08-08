@@ -221,6 +221,12 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 		InstallationID: binding.InstallationID,
 		ChatID:         binding.ChannelChatID,
 		ChatType:       chatType,
+		// Resolved here rather than at the failure, which happens on a
+		// detached goroutine with no context left to read a profile with. In
+		// a 1:1 the bound chatid IS the reader's userid, which is what
+		// localeFor wants; a room ignores it and reads the deployment's
+		// language (language.go).
+		Locale: localeFor(ctx, o.q, binding.InstallationID, chatType, binding.ChannelChatID),
 	})
 	return nil
 }
