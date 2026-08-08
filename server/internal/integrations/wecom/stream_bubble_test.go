@@ -384,8 +384,8 @@ func TestAnEmptyAnswerStillClosesTheBubbleWithWords(t *testing.T) {
 	if !hasVisibleChar(content) {
 		t.Fatalf("the closing frame carries nothing visible (%q); WeCom discards it and the bubble spins forever", content)
 	}
-	if content != streamCopyNoReply {
-		t.Errorf("closing copy = %q, want %q", content, streamCopyNoReply)
+	if content != copyFor(DefaultLocale).StreamNoReply {
+		t.Errorf("closing copy = %q, want %q", content, copyFor(DefaultLocale).StreamNoReply)
 	}
 }
 
@@ -455,9 +455,9 @@ func TestAQueuedRoundWithNothingToSaySaysItWasMerged(t *testing.T) {
 	if len(frames) != 4 {
 		t.Fatalf("got %d stream frames, want 4 (two opens, two seals)", len(frames))
 	}
-	if frames[3]["content"] != streamCopyMerged {
+	if frames[3]["content"] != copyFor(DefaultLocale).StreamMerged {
 		t.Errorf("a queued round's empty answer closed with %q, want %q",
-			frames[3]["content"], streamCopyMerged)
+			frames[3]["content"], copyFor(DefaultLocale).StreamMerged)
 	}
 }
 
@@ -496,8 +496,8 @@ func TestAFailedRunClosesTheBubble(t *testing.T) {
 	if frames[1]["finish"] != true {
 		t.Fatal("the failure did not seal the bubble")
 	}
-	if frames[1]["content"] != streamCopyFailed {
-		t.Errorf("failure copy = %q, want %q", frames[1]["content"], streamCopyFailed)
+	if frames[1]["content"] != copyFor(DefaultLocale).StreamFailed {
+		t.Errorf("failure copy = %q, want %q", frames[1]["content"], copyFor(DefaultLocale).StreamFailed)
 	}
 }
 
@@ -520,8 +520,8 @@ func TestTheGuardClosesABubbleTheWindowIsAboutToStrand(t *testing.T) {
 	if len(frames) != 2 {
 		t.Fatalf("the guard wrote %d stream frames, want 2 — the bubble runs into the window and strands", len(frames))
 	}
-	if frames[1]["content"] != streamCopyStillWorking {
-		t.Errorf("guard copy = %q, want %q", frames[1]["content"], streamCopyStillWorking)
+	if frames[1]["content"] != copyFor(DefaultLocale).StreamStillWorking {
+		t.Errorf("guard copy = %q, want %q", frames[1]["content"], copyFor(DefaultLocale).StreamStillWorking)
 	}
 	// The round is NOT over: the guard promised a separate reply, filed under
 	// the run the flush named.

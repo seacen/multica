@@ -259,11 +259,11 @@ func TestACancelledRunClosesItsBubble(t *testing.T) {
 	// Asserted against the FAILURE copy, not just against its own constant: a
 	// cancellation closed with "请稍后再试一次" invites a retry of something the
 	// user just stopped on purpose.
-	if content == streamCopyFailed {
+	if content == copyFor(DefaultLocale).StreamFailed {
 		t.Errorf("a cancelled run was closed with the failure copy %q", content)
 	}
-	if content != streamCopyCancelled {
-		t.Errorf("cancellation copy = %q, want %q", content, streamCopyCancelled)
+	if content != copyFor(DefaultLocale).StreamCancelled {
+		t.Errorf("cancellation copy = %q, want %q", content, copyFor(DefaultLocale).StreamCancelled)
 	}
 	if rig.streams.depth() != 0 {
 		t.Fatalf("store holds %d open rounds after the cancel, want 0", rig.streams.depth())
@@ -298,7 +298,7 @@ func TestCancellingEveryQueuedTurnClosesEachOwnBubble(t *testing.T) {
 		opened[f["id"]] = true
 	}
 	for _, f := range frames[3:] {
-		if f["finish"] != true || f["content"] != streamCopyCancelled {
+		if f["finish"] != true || f["content"] != copyFor(DefaultLocale).StreamCancelled {
 			t.Fatalf("a closing frame did not carry the cancellation: %v", f)
 		}
 		if !opened[f["id"]] {
@@ -333,7 +333,7 @@ func TestCancellingAfterTheGuardKeepsThePromise(t *testing.T) {
 		t.Fatalf("a cancel after the guard sent %d plain messages, want 1 — the guard promised a separate reply and nothing ever came", len(pushes))
 	}
 	md, _ := pushes[0]["markdown"].(map[string]any)
-	if md == nil || md["content"] != streamCopyCancelled {
+	if md == nil || md["content"] != copyFor(DefaultLocale).StreamCancelled {
 		t.Fatalf("the promised reply did not say it was cancelled: %v", pushes[0])
 	}
 }
@@ -392,7 +392,7 @@ func TestAGuardClosedRoundsFailureIsStillReported(t *testing.T) {
 			"the second asker was promised a reply and heard nothing", len(pushes))
 	}
 	md, _ := pushes[1]["markdown"].(map[string]any)
-	if md == nil || md["content"] != streamCopyFailed {
+	if md == nil || md["content"] != copyFor(DefaultLocale).StreamFailed {
 		t.Fatalf("the second round's failure did not reach its asker: %v", pushes[1])
 	}
 	// The same failure once more — the sweeper repeat the block comment above
@@ -430,7 +430,7 @@ func TestARepeatedFailureDoesNotSpendAnotherRoundsPromise(t *testing.T) {
 		t.Fatalf("one run's failure was announced %d times, want 1 — the repeat spent the promise made to the OTHER "+
 			"question, whose run is still going", len(pushes))
 	}
-	if md, _ := pushes[0]["markdown"].(map[string]any); md == nil || md["content"] != streamCopyFailed {
+	if md, _ := pushes[0]["markdown"].(map[string]any); md == nil || md["content"] != copyFor(DefaultLocale).StreamFailed {
 		t.Fatalf("the failure notice did not carry the failure copy: %v", pushes[0])
 	}
 
@@ -473,7 +473,7 @@ func TestACancelSpendsTheCancelledRoundsPromiseNotTheRunningOnes(t *testing.T) {
 			"a promise was left unspent for the late failure to claim, so the user read a failure notice under a delivered answer", len(pushes))
 	}
 	first, _ := pushes[0]["markdown"].(map[string]any)
-	if first == nil || first["content"] != streamCopyCancelled {
+	if first == nil || first["content"] != copyFor(DefaultLocale).StreamCancelled {
 		t.Fatalf("the first message was not the cancellation: %v", pushes[0])
 	}
 	second, _ := pushes[1]["markdown"].(map[string]any)
@@ -554,8 +554,8 @@ func TestAFlushThatStartedNoRunClosesItsOwnBubble(t *testing.T) {
 		t.Fatalf("the settled flush sealed bubble %v, want batch 1's %v — it closed the waiting question's bubble instead",
 			frames[2]["id"], frames[0]["id"])
 	}
-	if frames[2]["content"] != streamCopyNotStarted {
-		t.Errorf("settle copy = %q, want %q", frames[2]["content"], streamCopyNotStarted)
+	if frames[2]["content"] != copyFor(DefaultLocale).StreamNotStarted {
+		t.Errorf("settle copy = %q, want %q", frames[2]["content"], copyFor(DefaultLocale).StreamNotStarted)
 	}
 }
 
