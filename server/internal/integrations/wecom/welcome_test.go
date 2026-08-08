@@ -232,7 +232,7 @@ func TestNoBindingSurfaceStillGreets(t *testing.T) {
 
 	c.handleEnterChat(context.Background(), enterChatFrame(t, "req-5", "single", "T-alex"), sender, slog.Default())
 
-	if said := welcomeSaid(t, conn); said != welcomeBoundText {
+	if said := welcomeSaid(t, conn); said != copyFor(DefaultLocale).WelcomeBound {
 		t.Fatalf("said %q, want the plain greeting", said)
 	}
 }

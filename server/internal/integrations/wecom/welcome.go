@@ -52,22 +52,13 @@ const welcomeDeadline = 4 * time.Second
 // buys nothing and a shallow one keeps a burst off the read loop.
 const welcomeQueueDepth = 8
 
-// The greeting itself. Hardcoded Chinese, the same way every other
-// user-visible string in this adapter is (replier.go, the text-only receipt in
-// dispatchFrame) — WeCom deployments are China-only and the package has no
-// locale layer.
-const (
-	// welcomeBoundText is the greeting for somebody already linked, and the
-	// fallback whenever we cannot establish that they are not. Offering a bind
-	// link to a linked user is the confusing outcome, so on doubt we do not.
-	welcomeBoundText = "👋 你好，我是 Multica 智能助手。有事直接发消息给我，或者用 “/issue 标题” 建一条任务。（目前只能处理文字消息）"
-
-	// welcomeUnboundPrefix / Suffix wrap the bind URL. The wording matches the
-	// needs_binding prompt in replier.go on purpose — a user who sees both
-	// should not have to work out whether they are the same link.
-	welcomeUnboundPrefix = "👋 你好，我是 Multica 智能助手。请先绑定你的 Multica 账号，才能与我对话：\n"
-	welcomeUnboundSuffix = "\n（链接 15 分钟内有效）"
-)
+// The greeting itself lives in the copy pack (strings.go): copyPack.
+// WelcomeBound for somebody already linked — which is also the fallback
+// whenever we cannot establish that they are not, because offering a bind link
+// to a linked user is the confusing outcome — and WelcomeUnboundPrefix /
+// Suffix around the bind URL for somebody who is not. The unbound wording
+// matches the needs_binding prompt in replier.go on purpose: a user who sees
+// both should not have to work out whether they are the same link.
 
 // defaultBindingPath is where the web app serves the bind page.
 const defaultBindingPath = "/wecom/bind"
@@ -179,11 +170,17 @@ func (c *wecomChannel) handleEnterChat(ctx context.Context, env frameEnvelope, s
 // welcomeText builds the greeting for one person, or "" when there is nothing
 // worth saying.
 func (c *wecomChannel) welcomeText(ctx context.Context, wecomUserID string, log *slog.Logger) string {
+	// handleEnterChat greets one person in a 1:1 and nobody else, so the
+	// reader is always resolvable: their own profile language when they are
+	// already linked, and the deployment's when they are not — which is every
+	// greeting that carries a bind link (language.go).
+	cp := copyFor(localeFor(ctx, c.languages, c.installationID, chatTypeSingleInt, wecomUserID))
+
 	if c.welcome == nil || !c.installationID.Valid {
 		// No lookup wired — a deployment without the binding surface. Greet
 		// without offering a link we cannot mint. Degrading to silence would
 		// make the bot look broken over a feature it does not have.
-		return welcomeBoundText
+		return cp.WelcomeBound
 	}
 
 	_, err := c.welcome.GetChannelUserBindingByUserID(ctx, db.GetChannelUserBindingByUserIDParams{
@@ -193,19 +190,19 @@ func (c *wecomChannel) welcomeText(ctx context.Context, wecomUserID string, log 
 	switch {
 	case err == nil:
 		// Already linked: say hello and what to do, no link.
-		return welcomeBoundText
+		return cp.WelcomeBound
 	case !errors.Is(err, pgx.ErrNoRows):
 		// Could not tell. Offering a link to somebody already linked reads as
 		// the bot having lost their account, so on doubt we do not — and we do
 		// not mint a token for a user we cannot prove needs one.
 		log.WarnContext(ctx, "wecom: welcome binding lookup failed", "error", err)
-		return welcomeBoundText
+		return cp.WelcomeBound
 	}
 
 	// Unlinked, and this is a 1:1 chat, so the link goes to the one person it
 	// is about.
 	if c.binding == nil || c.appURL == "" {
-		return welcomeBoundText
+		return cp.WelcomeBound
 	}
 	row, err := c.welcome.GetChannelInstallation(ctx, db.GetChannelInstallationParams{
 		ID:          c.installationID,
@@ -213,15 +210,23 @@ func (c *wecomChannel) welcomeText(ctx context.Context, wecomUserID string, log 
 	})
 	if err != nil {
 		log.WarnContext(ctx, "wecom: welcome could not load its installation", "error", err)
-		return welcomeBoundText
+		return cp.WelcomeBound
 	}
 	token, err := c.binding.Mint(ctx, row.WorkspaceID, c.installationID, wecomUserID)
 	if err != nil {
 		log.WarnContext(ctx, "wecom: welcome could not mint a binding token", "error", err)
-		return welcomeBoundText
+		return cp.WelcomeBound
+	}
+	if token.Reused {
+		// The throttle suppressed the mint because a live link is already with
+		// this person, and only its hash was ever stored — there is no URL to
+		// rebuild. Interpolating token.Raw here prints a greeting whose link
+		// ends in "?token=" and redeems nothing, so point them at the message
+		// that already has one.
+		return cp.WelcomeUnboundPending
 	}
 	bindURL := c.appURL + c.bindingPath() + "?token=" + url.QueryEscape(token.Raw)
-	return welcomeUnboundPrefix + bindURL + welcomeUnboundSuffix
+	return cp.WelcomeUnboundPrefix + bindURL + cp.WelcomeUnboundSuffix
 }
 
 // bindingPath is where the web app serves the bind page. Read through a method
