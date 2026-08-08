@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"strings"
 	"time"
 
 	cryptorand "crypto/rand"
@@ -370,6 +371,31 @@ func (c *wecomChannel) subscribe(ctx context.Context, conn wsConn, sender *wsSen
 	}
 }
 
+// packFor resolves the copy pack for the destination a callback came from.
+//
+// The lookup is two indexed reads, so it is paid only when the message will
+// actually use a string from the pack: a quote prefix, or the
+// unsupported-type receipt. A plain sentence with nothing quoted — which is
+// almost every message — passes through on the deployment's default without
+// touching the database.
+//
+// Destination, not sender: the receipt goes back to the chat the message
+// arrived in, and the quote prefix is stored in a body the whole room can
+// have read back to it. A 1:1 has one person, so their profile language is
+// the destination's; a room has no shared profile and reads the deployment's
+// (language.go).
+func (c *wecomChannel) packFor(ctx context.Context, mc aibotMsgCallback) copyPack {
+	if !mc.needsCopy() {
+		return copyFor(deploymentLocale())
+	}
+	chatType := chatTypeSingleInt
+	if strings.EqualFold(mc.ChatType, "group") {
+		chatType = chatTypeGroupInt
+	}
+	sender := mc.From.UserID
+	return copyFor(localeFor(ctx, c.languages, c.installationID, chatType, sender))
+}
+
 // dispatchFrame routes one server frame. Only aibot_msg_callback ever
 // escalates back to the loop's caller (as a handler infra failure);
 // events are logged + acked and everything else is silently dropped.
@@ -381,8 +407,9 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 			log.Warn("wecom: bad aibot_msg_callback body", "error", err)
 			return nil
 		}
-		text, ok := mc.ownText()
-		msg := channelMessageFromCallback(c.botID, mc, text, env.Headers.ReqID)
+		pack := c.packFor(ctx, mc)
+		text, ok := mc.routableText(pack)
+		msg := channelMessageFromCallback(c.botID, mc, pack, text, env.Headers.ReqID)
 		if !ok {
 			// Nothing in this message can be read: a kind the adapter does
 			// not know (a location card, a standalone voice note until
@@ -390,14 +417,9 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 			// that makes it usable. Silence reads as a broken bot, so answer
 			// the same chat with a one-line receipt and stop. Best-effort: a
 			// send failure degrades to the prior silent drop.
-			//
-			// The receipt is addressed to whoever sent the unreadable
-			// message, so in a 1:1 it reads their profile language; a group
-			// has no shared profile and reads the deployment's (language.go).
 			chatType := aibotChatTypeFromChannel(msg.Source.ChatType)
-			cp := copyFor(localeFor(ctx, c.languages, c.installationID, chatType, msg.Source.SenderID))
 			log.Debug("wecom: unsupported message kind, replying with a receipt", "msg_type", mc.MsgType, "msg_id", mc.MsgID)
-			if err := sender.sendText(msg.Source.ChatID, chatType, cp.UnsupportedMsgType); err != nil {
+			if err := sender.sendText(msg.Source.ChatID, chatType, pack.UnsupportedMsgType); err != nil {
 				log.Debug("wecom: unsupported-kind receipt send failed", "error", err, "msg_id", mc.MsgID)
 			}
 			return nil

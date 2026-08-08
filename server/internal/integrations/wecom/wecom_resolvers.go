@@ -226,12 +226,22 @@ func (r *sessionBinder) EnsureSession(ctx context.Context, p engine.EnsureSessio
 }
 
 func (r *sessionBinder) AppendMessage(ctx context.Context, p engine.AppendParams) (engine.AppendResult, error) {
+	// The adapter's own command source wins, and Text is only the fallback.
+	// A message that quotes another one is stored with the quote in front, so
+	// parsing /issue off the stored body would read somebody else's text —
+	// and miss the command that follows it. The adapter has already worked
+	// out the un-quoted line and put it on the envelope.
+	// Same two lines as lark/feishu_resolvers.go and slack/resolvers.go.
+	command := p.Message.CommandText
+	if command == "" {
+		command = p.Message.Text
+	}
 	return r.session.AppendUserMessage(ctx, engine.AppendInput{
 		SessionID:      p.SessionID,
 		Sender:         p.Sender,
 		InstallationID: p.InstallationID,
 		Body:           p.Message.Text,
-		CommandText:    p.Message.Text, // wecom has no enrichment; command == body
+		CommandText:    command,
 		MessageID:      p.Message.MessageID,
 		ClaimToken:     p.ClaimToken,
 		// How long the chat task waits before it runs. Without this the run
