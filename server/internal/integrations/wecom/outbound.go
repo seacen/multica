@@ -71,6 +71,10 @@ type Outbound struct {
 //
 // streams is the same store the typing indicator writes to; nil disables the
 // in-place reply and leaves every answer going out as a new message.
+//
+// No metrics parameter: the counters this subscriber reports reach the sink
+// through senders, which it already holds and which every outbound write goes
+// through anyway. See sendersRegistry.WithMetrics.
 func NewOutbound(q outboundQueries, senders *sendersRegistry, streams *streamStore, logger *slog.Logger) *Outbound {
 	if logger == nil {
 		logger = slog.Default()
@@ -128,6 +132,15 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 		// The frame was refused. Say it as a new message instead — and never
 		// re-send the stream frame itself, whose req_id will have expired long
 		// before another connection could carry it.
+		//
+		// Counted, because from outside the two endings are
+		// indistinguishable: the user gets the answer either way, and nobody
+		// reports "the bubble I was watching turned into a separate message".
+		// A bubble that has stopped working at all — a WeCom-side change to
+		// the stream frame, a req_id convention that drifted — shows up as
+		// this number climbing to meet stream_finished, and nowhere else.
+		// senders is non-nil here: takeStream returns false without it.
+		o.senders.mx().RecordStreamFellBack()
 		content = text
 	}
 	if content == "" {
@@ -211,6 +224,10 @@ func (o *Outbound) takeStream(ctx context.Context, sessionID pgtype.UUID, e even
 // is not fatal to the reply — it means the caller falls back to a new message —
 // so it is logged with the one detail that explains it: whether the stream is
 // beyond saving (past its window, bad req_id) or the socket simply blinked.
+//
+// The success is counted inside sendersRegistry.stream, which every bubble
+// closer goes through; the fall-back is counted at the branch below, which is
+// the only place it happens.
 func (o *Outbound) finishStream(ctx context.Context, h streamHandle, text string) error {
 	err := o.senders.stream(ctx, h, text, true)
 	if err == nil {

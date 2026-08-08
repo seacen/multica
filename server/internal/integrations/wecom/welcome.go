@@ -136,6 +136,17 @@ func isWelcomeFrame(env frameEnvelope) bool {
 //     reasoning sendBindingPrompt spells out in replier.go, and here it is
 //     simpler to obey — a room nobody has spoken in yet has nothing to be
 //     told.
+//
+// THE THREE OUTCOMES ARE COUNTED. The greeting is never retried and its
+// failure is never told to anybody, so the counter is the only trace a missed
+// one leaves: an operator asking "is the bot greeting people?" has nothing
+// else to read. Skipped is the deliberate one and should track group traffic;
+// failed is a window that closed before the greeting could be written.
+//
+// The malformed frames above them are not counted. A body that will not
+// decode, a missing sender, a missing req_id — none of those is the greeting
+// path failing, and folding them in would make the ratio an operator reads
+// depend on how much junk WeCom sent.
 func (c *wecomChannel) handleEnterChat(ctx context.Context, env frameEnvelope, sender *wsSender, log *slog.Logger) {
 	if ctx.Err() != nil {
 		// The connection is going away. This req_id dies with it, so there is
@@ -148,6 +159,7 @@ func (c *wecomChannel) handleEnterChat(ctx context.Context, env frameEnvelope, s
 		return
 	}
 	if ev.ChatType != "" && ev.ChatType != "single" {
+		c.mx().RecordWelcomeSkipped()
 		log.Debug("wecom: enter_chat in a group, no greeting", "chat_type", ev.ChatType)
 		return
 	}
@@ -172,8 +184,11 @@ func (c *wecomChannel) handleEnterChat(ctx context.Context, env frameEnvelope, s
 	if err := sender.respondWelcome(ctx, env.Headers.ReqID, text); err != nil {
 		// Never retried. The req_id is spent either way, and the user's next
 		// message gets the ordinary binding prompt.
+		c.mx().RecordWelcomeFailed()
 		log.Warn("wecom: welcome reply failed", "error", err, "msg_id", ev.MsgID)
+		return
 	}
+	c.mx().RecordWelcomeSent()
 }
 
 // welcomeText builds the greeting for one person, or "" when there is nothing

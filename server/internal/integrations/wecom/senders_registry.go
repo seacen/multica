@@ -28,11 +28,43 @@ import (
 type sendersRegistry struct {
 	mu    sync.RWMutex
 	byKey map[string]*wsSender
+	// metrics is the health sink every write through this registry reports
+	// to. Set once at boot via WithMetrics; a registry built without one
+	// discards, which is what a deployment with /metrics off gets.
+	metrics Metrics
 }
 
 // newSendersRegistry constructs an empty registry.
 func newSendersRegistry() *sendersRegistry {
-	return &sendersRegistry{byKey: make(map[string]*wsSender)}
+	return &sendersRegistry{byKey: make(map[string]*wsSender), metrics: nopMetrics{}}
+}
+
+// WithMetrics points the registry's counters at a real sink. Called once at
+// boot, before any connection exists.
+//
+// The registry is where this belongs rather than in each caller's
+// constructor: it is the one object every outbound write already goes
+// through, and it is already held by the two things that need to report —
+// the outbound subscriber and the media resolver — neither of which has any
+// other reason to know that metrics exist.
+func (r *sendersRegistry) WithMetrics(m Metrics) *sendersRegistry {
+	r.metrics = orNopMetrics(m)
+	return r
+}
+
+// mx is the sink, safe to call on a registry built by a test literal.
+func (r *sendersRegistry) mx() Metrics {
+	if r == nil || r.metrics == nil {
+		return nopMetrics{}
+	}
+	return r.metrics
+}
+
+// RecordMediaFailure lets the media resolver report through the registry it
+// already holds, rather than threading a second sink through a constructor
+// that has no other reason to know about metrics.
+func (r *sendersRegistry) RecordMediaFailure(reason string) {
+	r.mx().RecordMediaFailure(reason)
 }
 
 // NewSendersRegistry is the public constructor boot uses to inject the
@@ -89,7 +121,17 @@ func (r *sendersRegistry) stream(ctx context.Context, h streamHandle, content st
 	if sender == nil {
 		return errNoLiveConnection
 	}
-	return sender.respondStream(ctx, h.ReqID, h.StreamID, content, finish)
+	err := sender.respondStream(ctx, h.ReqID, h.StreamID, content, finish)
+	if finish && err == nil {
+		// The answer landed in the bubble the question opened, which is the
+		// outcome this whole path exists for. Counted here rather than at one
+		// caller because every closer comes through this line — the answer,
+		// and the failure and cancellation notices the typing indicator
+		// writes — and each of them is a bubble that ended in words. Every
+		// other ending is a fall-back, counted where it happens.
+		r.mx().RecordStreamFinished()
+	}
+	return err
 }
 
 // sendTextCtx pushes a plain message to a chat over the installation's live

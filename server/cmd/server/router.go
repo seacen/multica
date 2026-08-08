@@ -676,7 +676,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				// ChannelDeps write side and the Replier read side both
 				// receive it, and each Channel.Connect self-registers on
 				// entry and clears on exit.
-				wecomSenders := wecom.NewSendersRegistry()
+				// One registry, one metrics sink. Every outbound write goes
+				// through here, and so do the counters the outbound subscriber
+				// and the media resolver report — which is why neither of them
+				// takes a sink of its own.
+				wecomSenders := wecom.NewSendersRegistry().WithMetrics(wecomMetricsOrNil(opts.WecomMetrics))
 
 				wecomReplier := wecom.NewOutboundReplier(wecom.OutboundReplierConfig{
 					Binding: wecomBinding,

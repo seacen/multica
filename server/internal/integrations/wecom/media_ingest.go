@@ -75,7 +75,8 @@ type wecomMediaResolver struct {
 // NewMediaResolver builds the wecom MediaResolver. storage and ledger are
 // required — without either there is nothing durable to point an attachment
 // at, and the resolver degrades to leaving the placeholder in place. senders
-// is optional: without it a failed attachment is only logged.
+// is optional: without it a failed attachment is only logged, and the failure
+// counter — which reports through the same registry — goes nowhere.
 func NewMediaResolver(storage mediaStorage, ledger engine.MediaIntentLedger, senders *sendersRegistry, logger *slog.Logger) engine.MediaResolver {
 	if logger == nil {
 		logger = slog.Default()
@@ -90,6 +91,21 @@ func NewMediaResolver(storage mediaStorage, ledger engine.MediaIntentLedger, sen
 		notify: senders,
 		logger: logger,
 	}
+}
+
+// recordFailure reports one attachment that never reached the agent, under
+// the reason an operator would act on.
+//
+// It goes through the senders registry the resolver already holds rather than
+// a sink of its own: this type is built at boot from router.go with four
+// arguments already, and the registry is the one thing here that both knows
+// about metrics and is guaranteed to be the same instance the read loop
+// reports through.
+func (r *wecomMediaResolver) recordFailure(f mediaFailure) {
+	if r.notify == nil {
+		return
+	}
+	r.notify.RecordMediaFailure(f.metricReason())
 }
 
 // HasMedia reports whether this callback carried anything to download. It
@@ -129,6 +145,14 @@ func (r *wecomMediaResolver) ResolveMedia(ctx context.Context, inst engine.Resol
 		if err != nil {
 			failure := classifyMediaFailure(err)
 			failures = appendFailure(failures, failure)
+			// Counted per attachment, not per message: appendFailure
+			// deliberately collapses four expired links into one sentence for
+			// the sender, and an operator asking how much media is being lost
+			// wants the four. Counted here rather than beside the notice for
+			// the same reason the log line is here — tellTheSender is skipped
+			// entirely when there is no live socket to write to, which is
+			// exactly the moment a failure most wants recording.
+			r.recordFailure(failure)
 			// A refused address gets its own line because the operator's next
 			// move is different from every other failure here: the attachment
 			// is fine and the deployment declined to dial where its host
@@ -349,6 +373,21 @@ func classifyMediaFailure(err error) mediaFailure {
 		return mediaFailureBlocked
 	}
 	return mediaFailureUnreadable
+}
+
+// metricReason is the label this failure is counted under. The sender's
+// wording folds "blocked" into "unreadable" — there is nothing they can do
+// differently either way — but the operator's does not, which is the whole
+// reason this kind exists.
+func (f mediaFailure) metricReason() string {
+	switch f {
+	case mediaFailureTooLarge:
+		return mediaDropTooLarge
+	case mediaFailureBlocked:
+		return mediaDropBlockedAddress
+	default:
+		return mediaDropUnreadable
+	}
 }
 
 // appendFailure keeps one entry per kind. A message with four attachments

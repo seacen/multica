@@ -124,6 +124,7 @@ type bubbleRig struct {
 	out     *Outbound
 	q       *fakeOutboundQueries
 	bus     *events.Bus
+	senders *sendersRegistry
 	instID  pgtype.UUID
 	now     time.Time
 }
@@ -141,6 +142,7 @@ func newBubbleRig(t *testing.T) *bubbleRig {
 	rig := &bubbleRig{
 		conn:    conn,
 		streams: streams,
+		senders: reg,
 		instID:  instID,
 		now:     time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC),
 	}
