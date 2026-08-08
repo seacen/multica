@@ -150,6 +150,10 @@ func newBubbleRig(t *testing.T) *bubbleRig {
 		sessionBinding: db.ChannelChatSessionBinding{InstallationID: instID, ChannelChatID: "CHAT_1", ChatType: "p2p"},
 		installation:   db.ChannelInstallation{ID: instID, Status: string(InstallationActive)},
 		tasks:          map[string]db.AgentTaskQueue{},
+		// Every round in this file was opened by a WeCom message, which is
+		// what the origin gate in processEvent asks before it touches the
+		// room — or the room's bubble.
+		channelIngested: askedOverWecom(),
 	}
 	rig.q = q
 	rig.typing = NewTypingIndicator(TypingIndicatorConfig{
@@ -213,9 +217,13 @@ func (r *bubbleRig) ask(t *testing.T, reqID string, batch engine.RunBatchID) {
 }
 
 // runStarted is the debounced flush reporting the task it created for a batch,
-// the way Router.flushChatRun does after EnqueueChatTask returns.
+// the way Router.flushChatRun does after EnqueueChatTask returns. It files the
+// agent_task_queue row too, because that is the other half of what the flush
+// does: EnqueueChatTask writes the row, and the origin gate reads it back off
+// this rig before it will push anything into the room.
 func (r *bubbleRig) runStarted(t *testing.T, batch engine.RunBatchID, taskName string) {
 	t.Helper()
+	r.q.fileTask(t, taskUUID(t, taskName))
 	r.typing.OnRunStarted(context.Background(), bubbleSessionID(t), batch, mustParseTestUUID(t, taskName))
 }
 
@@ -267,6 +275,16 @@ func (r *bubbleRig) cancelled(t *testing.T, taskName string) {
 			"status":  "cancelled",
 		},
 	})
+}
+
+// guardClosed is the five-minute guard firing on one round: it takes the
+// bubble and leaves the promise behind, which is what armGuard's timer does,
+// without a test having to wait out the window. The run carries on.
+func (r *bubbleRig) guardClosed(t *testing.T, batch engine.RunBatchID) {
+	t.Helper()
+	if _, ok := r.streams.takeBatch(bubbleSessionID(t), batch, roundContinues); !ok {
+		t.Fatalf("could not guard-close round %d", batch)
+	}
 }
 
 // mustParseTestUUID turns a readable test name into a stable UUID, so a test
@@ -505,8 +523,9 @@ func TestTheGuardClosesABubbleTheWindowIsAboutToStrand(t *testing.T) {
 	if frames[1]["content"] != streamCopyStillWorking {
 		t.Errorf("guard copy = %q, want %q", frames[1]["content"], streamCopyStillWorking)
 	}
-	// The round is NOT over: the guard promised a separate reply.
-	if _, verdict := rig.streams.claimEnding(bubbleSessionID(t)); verdict != roundOwesAnEnding {
+	// The round is NOT over: the guard promised a separate reply, filed under
+	// the run the flush named.
+	if _, verdict := rig.streams.claimEnding(bubbleSessionID(t), taskUUID(t, "task-1")); verdict != roundOwesAnEnding {
 		t.Fatalf("after a guard close the store says %v, want roundOwesAnEnding — the promised reply would never be sent", verdict)
 	}
 }
@@ -545,5 +564,62 @@ func TestAGuardClosedRunDoesNotSealTheNextQuestionsBubble(t *testing.T) {
 	last := frames[len(frames)-1]
 	if last["content"] != "the second run's answer" || last["finish"] != true {
 		t.Fatalf("the second question's own answer did not seal its bubble: %v", last)
+	}
+}
+
+// TestTheBubbleWindowsKeepTheirDistance pins the three numbers that decide how
+// long a bubble may live, which nothing else does: every other test in this
+// package moves the clock relative to these constants, so they walk wherever
+// the constants walk and both could be an hour with the suite still green.
+//
+// The numbers themselves are a judgement call — the long-connection doc says
+// ten minutes, Tencent's own OpenClaw plugin behaves as if it were six — so
+// what is pinned here is the relationships that have to hold whichever number
+// turns out to be right, and the outer bound nobody disputes.
+func TestTheBubbleWindowsKeepTheirDistance(t *testing.T) {
+	t.Parallel()
+	if streamGuardAfter >= streamMaxAge {
+		t.Errorf("streamGuardAfter (%s) must fire before streamMaxAge (%s); a guard that runs after the server has closed the stream writes into a bubble it can no longer replace", streamGuardAfter, streamMaxAge)
+	}
+	if streamMaxAge-streamGuardAfter < time.Minute {
+		t.Errorf("only %s of headroom between the guard and the ceiling; one slow frame eats that and the user is left with a spinner", streamMaxAge-streamGuardAfter)
+	}
+	if streamMaxAge > 10*time.Minute {
+		t.Errorf("streamMaxAge = %s, past the ten minutes the long-connection doc gives a stream; beyond it the handle is worse than none, because it swallows the answer instead of delivering it", streamMaxAge)
+	}
+	if streamGuardAfter < time.Minute {
+		t.Errorf("streamGuardAfter = %s; an agent that thinks for longer than that is ordinary, and closing on it turns every real run into a fallback message", streamGuardAfter)
+	}
+	if roundMemory <= streamMaxAge {
+		t.Errorf("roundMemory (%s) must outlast the bubble (%s): the guard promises a separate reply and the run it promised about carries on long after the stream is gone", roundMemory, streamMaxAge)
+	}
+}
+
+// TestTheOtherStreamNumbersStayInsideTheirReasons is the same guard for the
+// four constants left. None of them is pinned by anything else: every test
+// that touches one measures against it, so any of them could be set to one and
+// the suite would stay green while the behaviour the number was chosen for
+// quietly stopped happening.
+//
+// streamContentLimit is the only one with an exact right answer — it is the
+// server's documented cap, and the whole long-answer split is arithmetic
+// around it — so it is checked for equality. The rest are engineering choices,
+// checked against the reason each was written down with.
+func TestTheOtherStreamNumbersStayInsideTheirReasons(t *testing.T) {
+	t.Parallel()
+	if streamContentLimit != 20480 {
+		t.Errorf("streamContentLimit = %d, want 20480 — aibot's documented cap on stream.content (developer.work.weixin.qq.com/document/path/101031). It is not ours to tune: the split arithmetic is only correct against the number the server enforces", streamContentLimit)
+	}
+	if maxFinishedRounds < 2 {
+		t.Errorf("maxFinishedRounds = %d; below two, a session that answered twice in a row forgets the earlier ending and a late repeat re-opens a bubble that was already closed", maxFinishedRounds)
+	}
+	if taskLookupTimeout < 100*time.Millisecond || taskLookupTimeout > 2*time.Second {
+		t.Errorf("taskLookupTimeout = %s; it runs on somebody else's goroutine, so it has to clear an indexed read on a loaded pool and still not hold a publisher", taskLookupTimeout)
+	}
+	if streamCloseTimeout <= taskLookupTimeout {
+		t.Errorf("streamCloseTimeout (%s) must outlast taskLookupTimeout (%s): the close does the lookup and then still has a frame to write", streamCloseTimeout, taskLookupTimeout)
+	}
+	if streamAcksMax < 64 {
+		t.Errorf("streamAcksMax = %d; it is the backstop behind the age sweep, and a cap small enough to drop live entries puts their closing frames out of step", streamAcksMax)
 	}
 }

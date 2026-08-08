@@ -162,7 +162,11 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 	// The bubble this run's round opened, if there is one. Taken up front and
 	// unconditionally: from here on this turn owns it, and a handle left in
 	// the store after the turn ends is a handle pointing at a sealed message.
-	if handle, streaming := o.takeStream(ctx, sessionID, e); streaming {
+	batchOwner := ""
+	if task.ChatInputTaskID.Valid {
+		batchOwner = util.UUIDToString(task.ChatInputTaskID)
+	}
+	if handle, streaming := o.takeStream(ctx, sessionID, e, batchOwner); streaming {
 		// A bubble on screen has to end in words. An empty completion is a
 		// legitimate outcome — the agent had nothing to add — but an endless
 		// spinner is not, so the copy stands in for the silence. For a round
@@ -213,7 +217,28 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 		return errors.New("wecom: connection not ready on this replica")
 	}
 	chatType := aibotChatTypeFromChannel(channel.ChatType(binding.ChatType))
-	return sender.sendTextCtx(ctx, binding.ChannelChatID, chatType, content)
+	if err := sender.sendTextCtx(ctx, binding.ChannelChatID, chatType, content); err != nil {
+		return err
+	}
+	// The answer went out as an ordinary message. For a round the guard closed
+	// at five minutes that message IS the separate reply it promised, so the
+	// promise is now kept and has to come off the list — by this run's own id,
+	// leaving a promise another round is still waiting on exactly where it is.
+	// Left on the list it would be claimed by the next repeat of this run's
+	// failure, which would tell the user "这次没跑通" underneath the answer they
+	// have just read.
+	o.rounds().settle(ctx, sessionID, taskIDFromEvent(e), roundAddress{
+		InstallationID: inst.ID,
+		ChatID:         binding.ChannelChatID,
+		ChatType:       chatType,
+	})
+	return nil
+}
+
+// rounds builds the matcher that turns a task id on an event into the round it
+// belongs to — the same one the typing indicator's endings go through.
+func (o *Outbound) rounds() roundTaker {
+	return roundTaker{streams: o.streams, tasks: o.tasks, log: o.logger}
 }
 
 // chatDoneTaskID recovers the task id an EventChatDone belongs to. The
@@ -239,12 +264,13 @@ func chatDoneTaskID(e events.Event) (pgtype.UUID, bool) {
 // bound to the round when it created the run — so a session with several
 // rounds open never has to guess which bubble an answer belongs in, and an
 // auto-retry's answer still finds the round its first attempt opened.
-func (o *Outbound) takeStream(ctx context.Context, sessionID pgtype.UUID, e events.Event) (streamHandle, bool) {
+// owner is the batch owner off the task row the origin gate has already read,
+// so the retry-clone lookup costs nothing here: one row per ending, not two.
+func (o *Outbound) takeStream(ctx context.Context, sessionID pgtype.UUID, e events.Event, owner string) (streamHandle, bool) {
 	if o.streams == nil || o.senders == nil {
 		return streamHandle{}, false
 	}
-	taker := roundTaker{streams: o.streams, tasks: o.tasks, log: o.logger}
-	return taker.take(ctx, sessionID, taskIDFromEvent(e), roundOver)
+	return o.rounds().takeKnowing(ctx, sessionID, taskIDFromEvent(e), owner, roundOver)
 }
 
 // finishStream writes the answer into the bubble and seals it. A failure here
