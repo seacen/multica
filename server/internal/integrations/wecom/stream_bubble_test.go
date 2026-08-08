@@ -153,7 +153,7 @@ func newBubbleRig(t *testing.T) *bubbleRig {
 		// Every round in this file was opened by a WeCom message, which is
 		// what the origin gate in processEvent asks before it touches the
 		// room — or the room's bubble.
-		channelIngested: true,
+		channelIngested: askedOverWecom(),
 	}
 	rig.q = q
 	rig.typing = NewTypingIndicator(TypingIndicatorConfig{
@@ -217,9 +217,13 @@ func (r *bubbleRig) ask(t *testing.T, reqID string, batch engine.RunBatchID) {
 }
 
 // runStarted is the debounced flush reporting the task it created for a batch,
-// the way Router.flushChatRun does after EnqueueChatTask returns.
+// the way Router.flushChatRun does after EnqueueChatTask returns. It files the
+// agent_task_queue row too, because that is the other half of what the flush
+// does: EnqueueChatTask writes the row, and the origin gate reads it back off
+// this rig before it will push anything into the room.
 func (r *bubbleRig) runStarted(t *testing.T, batch engine.RunBatchID, taskName string) {
 	t.Helper()
+	r.q.fileTask(t, taskUUID(t, taskName))
 	r.typing.OnRunStarted(context.Background(), bubbleSessionID(t), batch, mustParseTestUUID(t, taskName))
 }
 

@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
-	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 // ---- 1. the round boundary ----
@@ -97,7 +96,12 @@ func TestAnEndingNeverTakesABubbleItWasNotBoundTo(t *testing.T) {
 
 	rig.ran(t, "REQ-MINE", 1, "task-1")
 	// task-2 belongs to a different session's round, or to a turn from before
-	// this process started. Either way it has no bubble here.
+	// this process started. Either way it has no bubble here. Its row is filed
+	// because it is a real task somewhere — what it does not have is a round
+	// on this rig, and that is what has to refuse it. Leave the row out and
+	// the origin gate refuses it first, for want of a task, and the binding
+	// this test is named after is never consulted.
+	rig.q.fileTask(t, taskUUID(t, "task-2"))
 	rig.answer(t, "somebody else's answer", "task-2")
 
 	frames := rig.conn.streamFrames(t)
@@ -160,10 +164,7 @@ func TestTheRetryAnswerLandsInTheBubbleTheFirstAttemptOpened(t *testing.T) {
 	rig.failed(t, "task-1", true)
 
 	// FailTask's retry child: fresh id, inheriting the parent's input batch.
-	rig.q.tasks[taskUUID(t, "retry")] = db.AgentTaskQueue{
-		ID:              mustParseTestUUID(t, "retry"),
-		ChatInputTaskID: mustParseTestUUID(t, "task-1"),
-	}
+	rig.q.fileRetryClone(t, taskUUID(t, "retry"), taskUUID(t, "task-1"))
 	rig.answer(t, "the retry's answer", "retry")
 
 	frames := rig.conn.streamFrames(t)
@@ -201,7 +202,10 @@ func TestTheRetryLookupIsNotPaidForOnEveryAnswer(t *testing.T) {
 		t.Fatalf("an answer that matched its own round read %d task row(s), want only the origin gate's one", rig.q.taskGets)
 	}
 	// Nothing open now, so an unmatched ending must not read a row on top of
-	// the gate's either.
+	// the gate's either. task-3's row is filed so the gate lets it through:
+	// an ending refused for want of a task row never reaches the matcher, and
+	// the read this test is counting would be missing for the wrong reason.
+	rig.q.fileTask(t, taskUUID(t, "task-3"))
 	rig.answer(t, "a late stray", "task-3")
 	if rig.q.taskGets != 2 {
 		t.Fatalf("an ending for a session with no open round read %d task row(s), want two gate reads and nothing else", rig.q.taskGets)
