@@ -130,8 +130,8 @@ func TestAPhotoTheMediaBudgetGaveUpOnBeforeItStartedIsNotSilentlyDropped(t *test
 	if len(said) != 1 {
 		t.Fatalf("the sender got %d notices for one abandoned message: %q", len(said), said)
 	}
-	if said[0] != mediaUnreadableNotice {
-		t.Fatalf("the notice reads %q, want the line that tells them to send it again (%q)", said[0], mediaUnreadableNotice)
+	if want := copyFor(DefaultLocale).MediaUnreadable; said[0] != want {
+		t.Fatalf("the notice reads %q, want the line that tells them to send it again (%q)", said[0], want)
 	}
 }
 
@@ -168,20 +168,20 @@ func TestAnAttachmentCutOffByTheBudgetIsApologisedForOnce(t *testing.T) {
 // dropping the repeated line must not drop it too.
 func TestTheVerdictTheSenderCanActOnSurvivesTheBudget(t *testing.T) {
 	t.Parallel()
-	got := withoutNotice([]mediaFailure{mediaFailureUnreadable, mediaFailureTooLarge}, mediaUnreadableNotice)
+	got := withoutNotice([]mediaFailure{mediaFailureUnreadable, mediaFailureTooLarge}, mediaFailureUnreadable)
 	if len(got) != 1 || got[0] != mediaFailureTooLarge {
 		t.Fatalf("kept %v, want the too-large verdict to survive — it is the only one the sender can act on", got)
 	}
-	if left := withoutNotice([]mediaFailure{mediaFailureUnreadable}, mediaUnreadableNotice); len(left) != 0 {
+	if left := withoutNotice([]mediaFailure{mediaFailureUnreadable}, mediaFailureUnreadable); len(left) != 0 {
 		t.Fatalf("kept %v, want nothing: the Router is about to say that line itself", left)
 	}
 	// A refused address reads to the sender as "it did not arrive", the same
-	// sentence the Router repeats, so it has to be dropped by wording rather
-	// than by kind.
-	if left := withoutNotice([]mediaFailure{mediaFailureBlocked}, mediaUnreadableNotice); len(left) != 0 {
+	// sentence the Router repeats, so it has to be dropped by which sentence
+	// it would say rather than by which kind it is.
+	if left := withoutNotice([]mediaFailure{mediaFailureBlocked}, mediaFailureUnreadable); len(left) != 0 {
 		t.Fatalf("kept %v, want nothing: a blocked address says the same sentence the Router repeats", left)
 	}
-	if kept := withoutNotice([]mediaFailure{mediaFailureTooLarge}, mediaUnreadableNotice); len(kept) != 1 {
+	if kept := withoutNotice([]mediaFailure{mediaFailureTooLarge}, mediaFailureUnreadable); len(kept) != 1 {
 		t.Fatalf("kept %v, want the unrelated verdict untouched", kept)
 	}
 }

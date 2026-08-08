@@ -30,6 +30,7 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -38,13 +39,13 @@ import (
 	"github.com/multica-ai/multica/server/internal/util"
 )
 
-// mediaFailureNotice lines. WeCom deployments are China-only, so these follow
-// the Chinese product voice the rest of this adapter already writes in
-// (wecom_channel.go's receipt, router.go's session titles).
-const (
-	mediaUnreadableNotice = "抱歉，有附件没能收到，麻烦重新发一次。"
-	mediaTooLargeNotice   = "抱歉，附件太大了，我这边收不下。"
-)
+// The two failure lines are copyPack.MediaUnreadable / MediaTooLarge
+// (strings.go), read in the language of the chat they land in.
+
+// mediaNoticeLocaleTimeout bounds the profile lookup behind the failure
+// notice. Deliberately small: the notice is worth sending in the wrong
+// language, and not worth delaying.
+const mediaNoticeLocaleTimeout = 2 * time.Second
 
 // mediaStorage is the slice of storage.Storage this resolver drives.
 // ObjectURL is a pure function of configuration, which is what lets the
@@ -69,14 +70,19 @@ type wecomMediaResolver struct {
 	// sender an attachment did not make it. nil disables the notice and
 	// leaves only the log.
 	notify *sendersRegistry
-	logger *slog.Logger
+	// languages picks the failure notice's language from where it lands
+	// (language.go): a 1:1 reads the sender's profile, a room the
+	// deployment's. nil puts every notice on the deployment default.
+	languages languageLookup
+	logger    *slog.Logger
 }
 
 // NewMediaResolver builds the wecom MediaResolver. storage and ledger are
 // required — without either there is nothing durable to point an attachment
 // at, and the resolver degrades to leaving the placeholder in place. senders
-// is optional: without it a failed attachment is only logged.
-func NewMediaResolver(storage mediaStorage, ledger engine.MediaIntentLedger, senders *sendersRegistry, logger *slog.Logger) engine.MediaResolver {
+// is optional: without it a failed attachment is only logged, and so is
+// languages — without it the notice is written in the deployment's language.
+func NewMediaResolver(storage mediaStorage, ledger engine.MediaIntentLedger, senders *sendersRegistry, languages languageLookup, logger *slog.Logger) engine.MediaResolver {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -86,9 +92,10 @@ func NewMediaResolver(storage mediaStorage, ledger engine.MediaIntentLedger, sen
 		// Never a bare http.Client: the URL being fetched came off the wire,
 		// and this client refuses to connect to anything that is not public
 		// internet (media_guard.go).
-		http:   newMediaHTTPClient(mediaGuard{}),
-		notify: senders,
-		logger: logger,
+		http:      newMediaHTTPClient(mediaGuard{}),
+		notify:    senders,
+		languages: languages,
+		logger:    logger,
 	}
 }
 
@@ -163,7 +170,7 @@ func (r *wecomMediaResolver) ResolveMedia(ctx context.Context, inst engine.Resol
 	// verdict was reached on its own merits before the clock ran out, and it
 	// is the one the sender can actually act on, so it still goes.
 	if ctx.Err() != nil {
-		failures = withoutNotice(failures, mediaUnreadableNotice)
+		failures = withoutNotice(failures, mediaFailureUnreadable)
 	}
 
 	r.tellTheSender(inst, wm, failures)
@@ -376,31 +383,43 @@ func appendFailure(list []mediaFailure, f mediaFailure) []mediaFailure {
 	return append(list, f)
 }
 
-// noticeFor is the one place a failure kind becomes a sentence. Two kinds
-// share the unreadable wording, so anything that reasons about which failures
-// would read the same to the sender — withoutNotice below, tellTheSender's own
-// dedupe — has to ask here rather than re-derive the mapping and drift from it.
+// noticeKind collapses the failure kinds that read as the same sentence down
+// to the one that names it. Two kinds do: mediaFailureBlocked lands on the
+// unreadable wording deliberately, because from the sender's side a refused
+// address and a download that fell over are the same event — the attachment
+// did not arrive — and the thing that separates them is what the operator must
+// change, which belongs in the log. Neither the resolved address nor the
+// signed url goes into a chat message.
 //
-// mediaFailureBlocked lands on the unreadable wording deliberately. From the
-// sender's side a refused address and a download that fell over are the same
-// event — the attachment did not arrive — and the thing that separates them is
-// what the operator must change, which belongs in the log. Neither the
-// resolved address nor the signed url goes into a chat message.
-func noticeFor(f mediaFailure) string {
+// Anything reasoning about "would these two read the same" asks here. It
+// cannot compare the rendered sentences: since the copy pack those are the
+// reader's, and two readers in one group get different strings for the one
+// event.
+func noticeKind(f mediaFailure) mediaFailure {
 	if f == mediaFailureTooLarge {
-		return mediaTooLargeNotice
+		return mediaFailureTooLarge
 	}
-	return mediaUnreadableNotice
+	return mediaFailureUnreadable
 }
 
-// withoutNotice drops every kind that would say notice, leaving the rest in
-// order. It filters by the sentence rather than by the kind because the
-// sender reads sentences: dropping mediaFailureUnreadable while leaving
-// mediaFailureBlocked in the list would still print the same line twice.
-func withoutNotice(list []mediaFailure, notice string) []mediaFailure {
+// noticeFor is the one place a failure kind becomes a sentence, in the
+// language c is written in.
+func noticeFor(c copyPack, f mediaFailure) string {
+	if noticeKind(f) == mediaFailureTooLarge {
+		return c.MediaTooLarge
+	}
+	return c.MediaUnreadable
+}
+
+// withoutNotice drops every kind that would read the same as drop, leaving the
+// rest in order. It goes through noticeKind rather than comparing kinds
+// directly because the sender reads sentences: dropping mediaFailureUnreadable
+// while leaving mediaFailureBlocked in the list would still print the same
+// line twice.
+func withoutNotice(list []mediaFailure, drop mediaFailure) []mediaFailure {
 	out := list[:0]
 	for _, f := range list {
-		if noticeFor(f) != notice {
+		if noticeKind(f) != noticeKind(drop) {
 			out = append(out, f)
 		}
 	}
@@ -454,6 +473,14 @@ func (r *wecomMediaResolver) tellTheSender(inst engine.ResolvedInstallation, wm 
 	if strings.EqualFold(wm.ChatType, "group") {
 		chatType = chatTypeGroupInt
 	}
+	// Its own context, not ResolveMedia's. The commonest reason to be here is
+	// a download that ran out of time, and on that path the caller's context
+	// is already done — reusing it would put every timed-out attachment's
+	// notice on the deployment default no matter who is reading it.
+	noticeCtx, cancel := context.WithTimeout(context.Background(), mediaNoticeLocaleTimeout)
+	defer cancel()
+	c := copyFor(localeFor(noticeCtx, r.languages, inst.ID, chatType, wm.SenderUserID))
+
 	lines := make([]string, 0, len(failures))
 	for _, f := range failures {
 		// Deduped by sentence, not by kind: two kinds share the unreadable
@@ -461,7 +488,7 @@ func (r *wecomMediaResolver) tellTheSender(inst engine.ResolvedInstallation, wm 
 		// unreadable attachment is still one piece of news. That is why the
 		// dedupe is here rather than in appendFailure, which the operator log
 		// needs kept per-kind.
-		if notice := noticeFor(f); !slices.Contains(lines, notice) {
+		if notice := noticeFor(c, f); !slices.Contains(lines, notice) {
 			lines = append(lines, notice)
 		}
 	}

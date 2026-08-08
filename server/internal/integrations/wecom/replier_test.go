@@ -185,7 +185,7 @@ func TestSendBindingPrompt_GroupNeverLeaksToken(t *testing.T) {
 		ChatType: channel.ChatTypeGroup,
 		SenderID: senderID,
 	}}
-	if err := r.sendBindingPrompt(context.Background(), inst, msg, engine.Result{Sender: senderID}); err != nil {
+	if err := r.sendBindingPrompt(context.Background(), inst, msg, engine.Result{Sender: senderID}, copyFor(DefaultLocale)); err != nil {
 		t.Fatalf("sendBindingPrompt: %v", err)
 	}
 
@@ -249,7 +249,7 @@ func TestSendBindingPrompt_P2PSendsOnlyPrivately(t *testing.T) {
 	r.binding = fakeBinder{raw: rawToken}
 
 	msg := channel.InboundMessage{Source: channel.Source{ChatID: "USER_A", ChatType: channel.ChatTypeP2P, SenderID: "USER_A"}}
-	if err := r.sendBindingPrompt(context.Background(), inst, msg, engine.Result{Sender: "USER_A"}); err != nil {
+	if err := r.sendBindingPrompt(context.Background(), inst, msg, engine.Result{Sender: "USER_A"}, copyFor(DefaultLocale)); err != nil {
 		t.Fatalf("sendBindingPrompt: %v", err)
 	}
 	conn.mu.Lock()
@@ -290,7 +290,7 @@ func TestSendBindingPrompt_ThrottledSendsNoURL(t *testing.T) {
 		ChatType: channel.ChatTypeGroup,
 		SenderID: senderID,
 	}}
-	if err := r.sendBindingPrompt(context.Background(), inst, msg, engine.Result{Sender: senderID}); err != nil {
+	if err := r.sendBindingPrompt(context.Background(), inst, msg, engine.Result{Sender: senderID}, copyFor(DefaultLocale)); err != nil {
 		t.Fatalf("sendBindingPrompt: %v", err)
 	}
 
@@ -363,5 +363,134 @@ func TestPost_HonoursTheCallersDeadline(t *testing.T) {
 	case <-time.After(ackTimeout / 2):
 		t.Fatal("post ignored the caller's cancelled ctx and sat on the ack wait — " +
 			"the deadline the publishing goroutine budgeted for is not being applied")
+	}
+}
+
+// TestIssueConfirmationDoesNotRenderReporterLinks: the confirmation goes back
+// into the chat that triggered the /issue — in a group, in front of the room —
+// and carries the bot's authority. A title is the reporter's own text.
+func TestIssueConfirmationDoesNotRenderReporterLinks(t *testing.T) {
+	res := engine.Result{
+		IssueIdentifier: "MUL-1",
+		IssueTitle:      "安全升级：请点击 [重置密码](https://evil.example) 完成验证",
+	}
+	got := issueCreatedText(res, copyFor(DefaultLocale))
+	if strings.Contains(got, "](") {
+		t.Fatalf("a reporter-authored link rendered in a bot-authored group message: %q", got)
+	}
+	if !strings.Contains(got, "重置密码") {
+		t.Errorf("the visible text was eaten: %q", got)
+	}
+	if strings.Contains(got, `\`) {
+		t.Fatalf("a backslash reached the reply: %q — WeCom shows it raw in the list preview and reads it as a math delimiter in the bubble", got)
+	}
+}
+
+// TestIssueConfirmationDefinesNoLinkReference: a title carrying a line break
+// can define the link instead of writing it inline, which reaches the same
+// working link with no "](" anywhere in it.
+func TestIssueConfirmationDefinesNoLinkReference(t *testing.T) {
+	res := engine.Result{
+		IssueIdentifier: "MUL-1",
+		IssueTitle:      "安全升级\n\n[重置密码]: https://evil.example\n\n[重置密码]",
+	}
+	got := issueCreatedText(res, copyFor(DefaultLocale))
+	if dests := markdownDestinations(got); hasDestinationTo(dests, "evil.example") {
+		t.Fatalf("a reporter-defined link resolved in a bot-authored group message: %q resolves %v", got, dests)
+	}
+	if !strings.Contains(got, "重置密码") {
+		t.Errorf("the visible text was eaten: %q", got)
+	}
+}
+
+// TestIssueConfirmationKeepsAnOrdinaryTitleVerbatim: the confirmation echoes
+// what the reporter typed straight back at them in the same chat, so anything
+// added to it is immediately visible as a mistake. Only a title that actually
+// contains "](", or a definition with a real destination behind it, is edited
+// at all — "[Bug]: 登录失败" is not.
+func TestIssueConfirmationKeepsAnOrdinaryTitleVerbatim(t *testing.T) {
+	for _, title := range []string{
+		"[Bug] 登录失败 (P0)!",
+		"[Bug]: 登录失败",
+	} {
+		res := engine.Result{IssueIdentifier: "MUL-1", IssueTitle: title}
+		if got, want := issueCreatedText(res, copyFor(DefaultLocale)), "✅ 已创建 MUL-1 — "+title; got != want {
+			t.Fatalf("the reporter's own title came back altered:\n got %q\nwant %q", got, want)
+		}
+	}
+}
+
+// TestIssueDuplicateIsNotReportedAsCreated: when the engine refuses a /issue
+// because an active issue already covers it, it carries the OTHER issue's id,
+// number and title. Answering with the created copy tells the reporter their
+// bug was filed under a number somebody else opened, under a title they never
+// wrote — so they stop chasing it and the report is lost.
+func TestIssueDuplicateIsNotReportedAsCreated(t *testing.T) {
+	t.Parallel()
+	res := engine.Result{
+		IssueID:         pgtype.UUID{Bytes: [16]byte{7}, Valid: true},
+		IssueIdentifier: "MUL-99",
+		IssueTitle:      "somebody else's title",
+		IssueDuplicate:  true,
+	}
+	text := issueCreatedText(res, copyFor(DefaultLocale))
+	if res.IssueDuplicate {
+		text = issueDuplicateText(res, copyFor(DefaultLocale))
+	}
+	if strings.Contains(text, "已创建") {
+		t.Errorf("a duplicate was reported as created: %q", text)
+	}
+	if !strings.Contains(text, "MUL-99") {
+		t.Errorf("the duplicate reply does not name the issue that already exists: %q", text)
+	}
+}
+
+// TestIssueDuplicateTitleCannotFormALinkInTheRoom drives the real Reply path so
+// the assertion lands on the bytes that go out on the wire. The duplicate
+// branch names the OTHER issue, so the title it quotes was written by whoever
+// opened that issue, and sendMsgTextBody ships every aibot_send_msg as
+// "msgtype": "markdown" — a title carrying "](" would otherwise arrive in the
+// group as a working link with the bot's authority behind it.
+//
+// The assertion is on the adjacency, not on the URL: "](" is what both
+// CommonMark and the naive rewriters need to build a link, and it is the one
+// thing breakLinkAdjacency removes. The title's own words must survive — a
+// guard that dropped the title would pass a "no link" check while losing the
+// information the reply exists to carry.
+func TestIssueDuplicateTitleCannotFormALinkInTheRoom(t *testing.T) {
+	t.Parallel()
+	const hostileTitle = "安全升级：请点击 [重置密码](https://evil.example) 完成验证"
+
+	r, inst, conn := newReplierWithConn(t)
+	r.Reply(context.Background(), inst,
+		channel.InboundMessage{Source: channel.Source{ChatID: "GROUP_CHAT_ID", ChatType: channel.ChatTypeGroup}},
+		engine.Result{
+			Outcome:         engine.OutcomeIngested,
+			IssueID:         pgtype.UUID{Bytes: [16]byte{7}, Valid: true},
+			IssueIdentifier: "MUL-99",
+			IssueTitle:      hostileTitle,
+			IssueDuplicate:  true,
+		})
+
+	conn.mu.Lock()
+	n := len(conn.frames)
+	conn.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("expected one duplicate-confirmation frame, got %d", n)
+	}
+	body := conn.sendBody(t, 0)
+	md, _ := body["markdown"].(map[string]any)
+	content, _ := md["content"].(string)
+	if content == "" {
+		t.Fatalf("no markdown content in the duplicate confirmation: %v", body)
+	}
+	if strings.Contains(content, "](") {
+		t.Errorf("a member-authored title formed a working markdown link in the room: %q", content)
+	}
+	if !strings.Contains(content, "MUL-99") {
+		t.Errorf("the duplicate reply does not name the issue that already exists: %q", content)
+	}
+	if !strings.Contains(content, "重置密码") || !strings.Contains(content, "https://evil.example") {
+		t.Errorf("the guard dropped the title instead of breaking the link: %q", content)
 	}
 }
