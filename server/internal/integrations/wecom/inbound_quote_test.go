@@ -69,12 +69,20 @@ func TestQuotedMultiLineTextStaysOneBlock(t *testing.T) {
 	}
 }
 
-// TestQuotedMediaRendersAsItsPlaceholder — and is NOT fetched. The quoted
-// message's own attachment would arrive with no way to tell it apart from
-// one the user just sent, and its url is on somebody else's five-minute
-// clock. The placeholder says a picture was being talked about, which is the
-// part that matters.
-func TestQuotedMediaRendersAsItsPlaceholder(t *testing.T) {
+// TestAQuotedImageArrivesWithItsBytes is the reference an agent could not
+// resolve.
+//
+// A quote of a picture renders as one line, `> Quoted: [Image]`, and the
+// callback carries nothing else about it: no sender, no message id, no
+// timestamp — the documented `quote` object is msgtype plus the body, and
+// that is all. So an agent handed that line cannot tell a screenshot it read
+// a minute ago (which it has, with an attachment id) from one it has never
+// seen, and "左下角那块看不清" is a question about a picture it does not have.
+//
+// The url and key on the quote are the only thing that settles it, and they
+// are handed over in this same callback. Fetching them turns the quote into an
+// attachment, which is a thing the agent can actually look at.
+func TestAQuotedImageArrivesWithItsBytes(t *testing.T) {
 	t.Parallel()
 	got, _, _ := dispatchOne(t, quotingFrame("msg-q3", "左下角那块看不清", map[string]any{
 		"msgtype": "image",
@@ -90,8 +98,107 @@ func TestQuotedMediaRendersAsItsPlaceholder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode raw: %v", err)
 	}
+	if len(wm.Media) != 1 {
+		t.Fatalf("the quoted image produced %d attachments, want 1 — the agent is left with a bare %q "+
+			"and no way to tell whether it is a picture it has already read or one it has never seen: %+v",
+			len(wm.Media), "[Image]", wm.Media)
+	}
+	if wm.Media[0].Kind != channel.MsgTypeImage {
+		t.Errorf("kind = %v, want image", wm.Media[0].Kind)
+	}
+	if wm.Media[0].URL != "https://cos.invalid/quoted.enc" {
+		t.Errorf("url = %q, want the quote's own", wm.Media[0].URL)
+	}
+	if wm.Media[0].AESKey != testAESKey {
+		t.Error("the quoted image's key did not travel with it, so the bytes cannot be decrypted")
+	}
+}
+
+// TestAQuotedPictureComesBeforeTheSendersOwn: the quote block is rendered
+// above the sender's words, so the quoted picture's placeholder is the first
+// one in the body — and the attachments have to be in that same order, or an
+// agent asked to compare two pictures compares them the wrong way round.
+func TestAQuotedPictureComesBeforeTheSendersOwn(t *testing.T) {
+	t.Parallel()
+	body, _ := json.Marshal(map[string]any{
+		"msgid":    "msg-q3b",
+		"aibotid":  "bot",
+		"chattype": "single",
+		"chatid":   "T-alex",
+		"from":     map[string]any{"userid": "T-alex"},
+		"msgtype":  "mixed",
+		"mixed": map[string]any{"msg_item": []any{
+			map[string]any{"msgtype": "text", "text": map[string]any{"content": "这版好一些吗"}},
+			map[string]any{"msgtype": "image", "image": map[string]any{"url": "https://cos.invalid/mine", "aeskey": testAESKey}},
+		}},
+		"quote": map[string]any{
+			"msgtype": "image",
+			"image":   map[string]any{"url": "https://cos.invalid/theirs", "aeskey": testAESKey},
+		},
+	})
+	got, _, _ := dispatchOne(t, frameEnvelope{Cmd: cmdMsgCallback, Body: body})
+
+	wm, err := wecomMsgFromRaw(got)
+	if err != nil {
+		t.Fatalf("decode raw: %v", err)
+	}
+	if len(wm.Media) != 2 {
+		t.Fatalf("attachments = %+v, want the quoted picture and the sender's own", wm.Media)
+	}
+	if wm.Media[0].URL != "https://cos.invalid/theirs" || wm.Media[1].URL != "https://cos.invalid/mine" {
+		t.Fatalf("attachment order = [%q %q], want the quoted one first: its placeholder is the first "+
+			"in the body, and the agent reads the two lists against each other",
+			wm.Media[0].URL, wm.Media[1].URL)
+	}
+}
+
+// TestAQuoted图文混排ContributesEveryPictureInIt: a quoted 图文混排 renders one
+// placeholder per run, so it has to produce one attachment per run too — a
+// missing one shifts every placeholder after it onto the wrong picture.
+func TestAQuotedMixedContributesEveryPictureInIt(t *testing.T) {
+	t.Parallel()
+	got, _, _ := dispatchOne(t, quotingFrame("msg-q3c", "第二张是哪天的", map[string]any{
+		"msgtype": "mixed",
+		"mixed": map[string]any{"msg_item": []any{
+			map[string]any{"msgtype": "text", "text": map[string]any{"content": "两版对比"}},
+			map[string]any{"msgtype": "image", "image": map[string]any{"url": "https://cos.invalid/a", "aeskey": testAESKey}},
+			map[string]any{"msgtype": "image", "image": map[string]any{"url": "https://cos.invalid/b", "aeskey": testAESKey}},
+		}},
+	}))
+
+	wm, err := wecomMsgFromRaw(got)
+	if err != nil {
+		t.Fatalf("decode raw: %v", err)
+	}
+	if len(wm.Media) != 2 {
+		t.Fatalf("attachments = %+v, want both pictures in the quoted 图文混排", wm.Media)
+	}
+	if strings.Count(got.Text, "[Image]") != 2 {
+		t.Fatalf("Text = %q, want a placeholder per picture — the count has to match the attachments", got.Text)
+	}
+}
+
+// TestAQuotedAttachmentWithNoURLIsNotQueued: a body with nothing to fetch must
+// not produce an attachment, because it does not produce a placeholder either.
+// An intent-ledger row for an object that can never exist is the cost of
+// getting this wrong; a body whose placeholder and attachment disagree is the
+// bigger one.
+func TestAQuotedAttachmentWithNoURLIsNotQueued(t *testing.T) {
+	t.Parallel()
+	got, _, _ := dispatchOne(t, quotingFrame("msg-q3d", "这个", map[string]any{
+		"msgtype": "image",
+		"image":   map[string]any{"aeskey": testAESKey},
+	}))
+
+	wm, err := wecomMsgFromRaw(got)
+	if err != nil {
+		t.Fatalf("decode raw: %v", err)
+	}
 	if len(wm.Media) != 0 {
-		t.Fatalf("the quoted message's attachment was queued for download: %+v", wm.Media)
+		t.Fatalf("attachments = %+v, want none — there is no url to fetch", wm.Media)
+	}
+	if strings.Contains(got.Text, "[Image]") {
+		t.Fatalf("Text = %q, want no placeholder for a picture that was never there", got.Text)
 	}
 }
 

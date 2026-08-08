@@ -107,8 +107,19 @@ type aibotMsgCallback struct {
 		Content string `json:"content"`
 	} `json:"voice"`
 	// Quote is the message this one is a reply to, present when the sender
-	// used 引用. It carries the quoted message's own msgtype and body and
-	// nothing else — no sender, no id, no timestamp.
+	// used 引用. Only a text or 图文混排 message carries one.
+	//
+	// It is the quoted message's CONTENT and nothing about its provenance.
+	// The documented fields are msgtype plus the typed body that goes with it
+	// — text.content, voice.content (already transcribed), image/file/video
+	// as the same {url, aeskey} pair a standalone attachment carries in
+	// long-connection mode, and mixed.msg_item for a quoted 图文混排. There is
+	// no from.userid, no msgid, no create_time: who said it and when are not
+	// on the wire, and no amount of rendering can put them there.
+	//
+	// Which is why the media reference matters. It is the only field that can
+	// tell a quote of a picture the agent has already read from a quote of one
+	// it has never seen — see attachments.
 	Quote *quotedMessage `json:"quote"`
 }
 
@@ -122,12 +133,10 @@ type quotedMessage struct {
 	} `json:"mixed"`
 }
 
-// render turns the quoted message into the text it contributes. A quoted
-// attachment renders as its placeholder and is deliberately NOT queued for
-// download: it belongs to a message somebody else sent, the agent would have
-// no way to tell it apart from what this sender just attached, and its url is
-// running down someone else's five-minute clock. Saying a picture was being
-// discussed is the part that carries the meaning.
+// render turns the quoted message into the text it contributes. An attachment
+// renders as its placeholder, the same one it would get as a message of its
+// own; the bytes behind that placeholder arrive through media, on the same
+// detached path an inbound attachment takes.
 func (q *quotedMessage) render() string {
 	if q == nil {
 		return ""
@@ -142,6 +151,30 @@ func (q *quotedMessage) render() string {
 		return strings.Join(runs, "\n")
 	}
 	return q.mixedItem.render()
+}
+
+// media lists the quoted message's downloadable attachments, in the order
+// render lays their placeholders out.
+//
+// Fetching them is the whole of the fix for a quoted picture. `> Quoted:
+// [Image]` is all a quote of an image can be rendered as — the payload carries
+// no sender, no message id and no timestamp to say WHICH image — so an agent
+// reading that line cannot tell a screenshot it read a minute ago from one it
+// has never seen, and answers "左下角那块看不清" about a picture it does not
+// have. The url and key on the quote are the only thing that resolves it, and
+// they are handed over in this callback like any other attachment's.
+func (q *quotedMessage) media() []InboundMedia {
+	if q == nil {
+		return nil
+	}
+	if strings.EqualFold(q.MsgType, "mixed") {
+		var out []InboundMedia
+		for _, item := range q.Mixed.MsgItem {
+			out = append(out, item.media()...)
+		}
+		return out
+	}
+	return q.mixedItem.media()
 }
 
 // mediaBody is the {url, aeskey} pair every downloadable kind carries. In
@@ -188,6 +221,18 @@ func (item mixedItem) render() string {
 	}
 }
 
+// media is the downloadable attachment behind this run's placeholder, if it
+// has one. Paired with render on purpose: a run that renders a placeholder
+// must produce an attachment here and a run that renders nothing must produce
+// none, or the positional correspondence the body relies on slips by one.
+func (item mixedItem) media() []InboundMedia {
+	body, kind, ok := mediaFor(item.MsgType, item.Image, item.File, item.Video)
+	if !ok || strings.TrimSpace(body.URL) == "" {
+		return nil
+	}
+	return []InboundMedia{{Kind: kind, URL: body.URL, AESKey: body.AESKey}}
+}
+
 // mediaPlaceholder is the marker that stands in for an attachment in the
 // stored message body, so the agent can see that something was attached
 // before (or instead of) the bytes arriving on the detached media path.
@@ -225,28 +270,36 @@ func mediaFor(msgType string, image, file, video mediaBody) (mediaBody, channel.
 }
 
 // attachments lists the downloadable media on this callback, in the order the
-// user sent it. A body with no url is skipped: there is nothing to fetch, and
-// carrying it forward would only produce an intent-ledger row for an object
-// that can never exist.
+// placeholders standing for them appear in the body. A body with no url is
+// skipped: there is nothing to fetch, and carrying it forward would only
+// produce an intent-ledger row for an object that can never exist.
+//
+// The quoted message's attachments come FIRST, because that is where its
+// placeholders are: routableText renders the quote block above the sender's
+// own words. The Nth placeholder in the body is the Nth attachment here, and
+// that correspondence is the only thing an agent has to work out which picture
+// is which — 图文混排 already depends on it.
+//
+// Quoted media is fetched at all because the alternative is a reference the
+// agent cannot resolve. The callback says nothing about whose message was
+// quoted or when, so a bare `[Image]` inside a quote block is indistinguishable
+// between a screenshot already read this turn and one never seen. It goes down
+// the same download-and-bind path an inbound attachment takes (media_ingest.go)
+// and is subject to the same size cap, address guard and failure notice; no new
+// access is involved either, because WeCom put those bytes in this callback.
 func (mc aibotMsgCallback) attachments() []InboundMedia {
-	var out []InboundMedia
-	add := func(body mediaBody, kind channel.MsgType) {
-		if strings.TrimSpace(body.URL) == "" {
-			return
-		}
-		out = append(out, InboundMedia{Kind: kind, URL: body.URL, AESKey: body.AESKey})
-	}
+	out := mc.Quote.media()
 	if body, kind, ok := mediaFor(mc.MsgType, mc.Image, mc.File, mc.Video); ok {
-		add(body, kind)
+		if strings.TrimSpace(body.URL) != "" {
+			out = append(out, InboundMedia{Kind: kind, URL: body.URL, AESKey: body.AESKey})
+		}
 		return out
 	}
 	if !strings.EqualFold(mc.MsgType, "mixed") {
-		return nil
+		return out
 	}
 	for _, item := range mc.Mixed.MsgItem {
-		if body, kind, ok := mediaFor(item.MsgType, item.Image, item.File, item.Video); ok {
-			add(body, kind)
-		}
+		out = append(out, item.media()...)
 	}
 	return out
 }
