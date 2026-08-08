@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -36,6 +37,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
 	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
 	"github.com/multica-ai/multica/server/internal/service"
+	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -414,5 +416,251 @@ func TestInboundImageMessageHoldsTheAgentRunUntilMediaLands(t *testing.T) {
 	}
 	if !pendingUntil.Time.After(time.Now()) {
 		t.Errorf("channel_media_pending_until = %v, already in the past — it buys the download no time at all", pendingUntil.Time)
+	}
+}
+
+// ---- which picture is the quoted one ----
+
+// wecomQuotedPlusOwnCallback is the shape this file exists for: somebody
+// quotes a colleague's screenshot, types a question, and attaches a screenshot
+// of their own. Two attachments on one message, one of them referred to and
+// one of them sent, through the real frame decoder so the fixture cannot
+// drift from the wire.
+func wecomQuotedPlusOwnCallback(t *testing.T, botID, senderID, msgID, quotedURL, ownURL string) channel.InboundMessage {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{
+		"msgid":    msgID,
+		"aibotid":  botID,
+		"chattype": "single",
+		"chatid":   senderID,
+		"from":     map[string]any{"userid": senderID},
+		"msgtype":  "mixed",
+		"mixed": map[string]any{"msg_item": []any{
+			map[string]any{"msgtype": "text", "text": map[string]any{"content": "这版好一些吗"}},
+			map[string]any{"msgtype": "image", "image": map[string]any{"url": ownURL, "aeskey": testAESKey}},
+		}},
+		"quote": map[string]any{
+			"msgtype": "image",
+			"image":   map[string]any{"url": quotedURL, "aeskey": testAESKey},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal callback: %v", err)
+	}
+	var mc aibotMsgCallback
+	if err := json.Unmarshal(raw, &mc); err != nil {
+		t.Fatalf("decode callback: %v", err)
+	}
+	c := copyFor(DefaultLocale)
+	text, ok := mc.routableText(c)
+	if !ok {
+		t.Fatal("the callback is not routable; the fixture is wrong")
+	}
+	return channelMessageFromCallback(botID, "", mc, c, text, "req-quote-1")
+}
+
+// TestTheQuotedPictureIsNamedWhenTwoArriveTogether is the case one attachment
+// cannot test.
+//
+// With a single attachment on the message, the quote's "[Image]" and the one
+// entry in the attachment list are obviously the same picture — you get the
+// join for free, from there being nothing else it could be, and a test built
+// on that passes whether or not anything joins them. With two the inference
+// is gone: the body holds two markers, the message holds two attachment ids,
+// and the ordering rule that pairs them ("quoted attachments come first") is
+// a rule the reader was never told.
+//
+// So the quote's marker names its attachment. What is asserted here is that
+// the id in the body is the id of THE QUOTED PICTURE and not of the one the
+// sender just attached — a body that named either one would pass a weaker
+// check, and naming the wrong one is the failure this is really guarding.
+func TestTheQuotedPictureIsNamedWhenTwoArriveTogether(t *testing.T) {
+	pool := mediaBindTestDB(t)
+	fixture := seedMediaBindFixture(t, pool)
+	ctx := context.Background()
+	queries := db.New(pool)
+
+	// Different bytes and different names, so the attachment rows can be told
+	// apart by something other than the order they were inserted in.
+	theirs := cosServer(t, []byte("\xff\xd8\xff\xe0 the picture being quoted"), `attachment; filename="theirs.jpg"`)
+	defer theirs.Close()
+	mine := cosServer(t, []byte("\xff\xd8\xff\xe0 the picture just attached"), `attachment; filename="mine.jpg"`)
+	defer mine.Close()
+
+	storage := &fakeMediaStorage{}
+	resolver := newTestResolver(storage, engine.NewDBMediaIntentLedger(queries), nil)
+	session := engine.NewChatSession(queries, pool, TypeWecom, engine.SessionTitles{
+		Group: "群聊", Direct: "单聊", Fallback: "会话",
+	})
+	tasks := &bindTestTasks{}
+	router := engine.NewRouter(bindTestIssues{}, tasks, queries, engine.RouterConfig{
+		MediaTimeout: 20 * time.Second,
+		Logger:       testLogger(),
+	})
+	router.Register(TypeWecom, NewResolverSet(NewStore(queries), session, nil, resolver))
+
+	msgID := fmt.Sprintf("MSGID-QUOTE2-%d", time.Now().UnixNano())
+	if err := router.Handle(ctx, wecomQuotedPlusOwnCallback(t, fixture.botID, fixture.senderID, msgID, theirs.URL, mine.URL)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	// Binding is detached from the ACK path, so poll for it. Both the rows and
+	// the promotion, for the reason the test above documents: the promotion is
+	// the call after the bind transaction, and the body rewrite rides in that
+	// transaction.
+	var chatMessageID pgtype.UUID
+	var body string
+	var attachments int
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if err := pool.QueryRow(ctx, `
+			SELECT cm.id, cm.content
+			FROM chat_message cm
+			JOIN chat_session cs ON cs.id = cm.chat_session_id
+			WHERE cs.workspace_id = $1 AND cm.role = 'user'
+			ORDER BY cm.created_at DESC LIMIT 1`,
+			fixture.workspaceID).Scan(&chatMessageID, &body); err != nil {
+			if time.Now().After(deadline) {
+				t.Fatalf("no durable chat_message was ever written: %v", err)
+			}
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM attachment WHERE chat_message_id = $1`, chatMessageID).Scan(&attachments); err != nil {
+			t.Fatalf("count attachments: %v", err)
+		}
+		if (attachments == 2 && tasks.promotions() > 0) || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// The precondition. Both pictures have to land, or there is no ambiguity
+	// left to resolve and the rest of this proves nothing.
+	if attachments != 2 {
+		t.Fatalf("attachment rows = %d, want 2 (the quoted picture and the sender's own) — with fewer than two "+
+			"this test cannot tell a body that names the right one from a body that names the only one", attachments)
+	}
+
+	ids := map[string]string{} // filename -> attachment id
+	rows, err := pool.Query(ctx,
+		`SELECT id, filename FROM attachment WHERE chat_message_id = $1`, chatMessageID)
+	if err != nil {
+		t.Fatalf("load attachments: %v", err)
+	}
+	for rows.Next() {
+		var id pgtype.UUID
+		var filename string
+		if err := rows.Scan(&id, &filename); err != nil {
+			t.Fatalf("scan attachment: %v", err)
+		}
+		ids[filename] = util.UUIDToString(id)
+	}
+	rows.Close()
+	quotedID, ok := ids["theirs.jpg"]
+	if !ok {
+		t.Fatalf("no attachment came from the quoted picture; rows = %v", ids)
+	}
+	ownID, ok := ids["mine.jpg"]
+	if !ok {
+		t.Fatalf("no attachment came from the sender's own picture; rows = %v", ids)
+	}
+
+	// The whole point, stated as the body the agent is handed.
+	c := copyFor(DefaultLocale)
+	want := "> " + c.QuotePrefix + "[Image: " + quotedID + "]\n这版好一些吗\n[Image]"
+	if body != want {
+		t.Fatalf("durable body = %q\nwant %q\n\n"+
+			"the message carries two attachments — %s (the quoted picture) and %s (the one just sent) — and the "+
+			"body has to say which of them the quote refers to. Two markers spelled the same way and two ids in a "+
+			"separate list leave the reader guessing, and it can only guess right by knowing an ordering rule "+
+			"nobody told it.",
+			body, want, quotedID, ownID)
+	}
+	// Stated the other way round, because a body that named BOTH pictures
+	// would satisfy the check above if the sender's own marker were ever
+	// rewritten too: only the quote's marker carries an id.
+	if strings.Contains(body, ownID) {
+		t.Errorf("durable body = %q names the sender's own picture %s; its placeholder must stay the bare %q",
+			body, ownID, "[Image]")
+	}
+}
+
+// TestAQuotedPictureThatNeverArrivesSaysSo is the other half of naming the
+// quoted attachment: what the marker says when there is no attachment to
+// name.
+//
+// Both ways of not arriving end in the same place — a download that fails and
+// a host the media address guard refuses both leave ingestOne without a ref,
+// so nothing rewrites the marker — and what it has to leave behind is a body
+// an agent can read correctly. It must not silently look like a picture that
+// did arrive, and it must not look like no picture was ever quoted.
+func TestAQuotedPictureThatNeverArrivesSaysSo(t *testing.T) {
+	pool := mediaBindTestDB(t)
+	fixture := seedMediaBindFixture(t, pool)
+	ctx := context.Background()
+	queries := db.New(pool)
+
+	// The quoted url is dead; the sender's own picture is fine. One of each,
+	// so the body has to distinguish them rather than merely fail everywhere.
+	gone := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer gone.Close()
+	mine := cosServer(t, []byte("\xff\xd8\xff\xe0 the picture just attached"), `attachment; filename="mine.jpg"`)
+	defer mine.Close()
+
+	storage := &fakeMediaStorage{}
+	resolver := newTestResolver(storage, engine.NewDBMediaIntentLedger(queries), nil)
+	session := engine.NewChatSession(queries, pool, TypeWecom, engine.SessionTitles{})
+	tasks := &bindTestTasks{}
+	router := engine.NewRouter(bindTestIssues{}, tasks, queries, engine.RouterConfig{
+		MediaTimeout: 20 * time.Second,
+		Logger:       testLogger(),
+	})
+	router.Register(TypeWecom, NewResolverSet(NewStore(queries), session, nil, resolver))
+
+	msgID := fmt.Sprintf("MSGID-QUOTEFAIL-%d", time.Now().UnixNano())
+	if err := router.Handle(ctx, wecomQuotedPlusOwnCallback(t, fixture.botID, fixture.senderID, msgID, gone.URL, mine.URL)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	var chatMessageID pgtype.UUID
+	var body string
+	var attachments int
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if err := pool.QueryRow(ctx, `
+			SELECT cm.id, cm.content
+			FROM chat_message cm
+			JOIN chat_session cs ON cs.id = cm.chat_session_id
+			WHERE cs.workspace_id = $1 AND cm.role = 'user'
+			ORDER BY cm.created_at DESC LIMIT 1`,
+			fixture.workspaceID).Scan(&chatMessageID, &body); err != nil {
+			if time.Now().After(deadline) {
+				t.Fatalf("no durable chat_message was ever written: %v", err)
+			}
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM attachment WHERE chat_message_id = $1`, chatMessageID).Scan(&attachments); err != nil {
+			t.Fatalf("count attachments: %v", err)
+		}
+		if (attachments == 1 && tasks.promotions() > 0) || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if attachments != 1 {
+		t.Fatalf("attachment rows = %d, want 1 — only the sender's own picture can land, the quoted url returns 500", attachments)
+	}
+	c := copyFor(DefaultLocale)
+	if want := "> " + c.QuotePrefix + "[Image: unavailable]\n这版好一些吗\n[Image]"; body != want {
+		t.Fatalf("durable body = %q, want %q — a marker with no id is how the agent reads "+
+			"\"there was a picture here and it did not arrive\"; no marker at all is how it reads \"there was no picture\"",
+			body, want)
 	}
 }

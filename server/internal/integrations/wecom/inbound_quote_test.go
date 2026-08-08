@@ -90,7 +90,7 @@ func TestAQuotedImageArrivesWithItsBytes(t *testing.T) {
 	}))
 
 	c := copyFor(DefaultLocale)
-	want := "> " + c.QuotePrefix + "[Image]\n左下角那块看不清"
+	want := "> " + c.QuotePrefix + "[Image: unavailable]\n左下角那块看不清"
 	if got.Text != want {
 		t.Fatalf("Text = %q, want %q", got.Text, want)
 	}
@@ -111,6 +111,47 @@ func TestAQuotedImageArrivesWithItsBytes(t *testing.T) {
 	}
 	if wm.Media[0].AESKey != testAESKey {
 		t.Error("the quoted image's key did not travel with it, so the bytes cannot be decrypted")
+	}
+	// The marker the binder has to find again, and which occurrence of it.
+	// Without the pair the download still happens and the attachment still
+	// lands, and the quote block still says only that a picture was there.
+	if wm.Media[0].InlinePlaceholder != "[Image: unavailable]" || wm.Media[0].InlineIndex != 0 {
+		t.Errorf("inline marker = (%q, %d), want (%q, 0) — the attachment has nothing pointing at the placeholder it belongs to",
+			wm.Media[0].InlinePlaceholder, wm.Media[0].InlineIndex, "[Image: unavailable]")
+	}
+}
+
+// TestAQuotedPlaceholderSaysSoWhenNothingArrived: the marker a quoted
+// attachment renders as has to be true before anything has been downloaded,
+// because that is the state it stays in when the download fails, when the
+// media address guard refuses the host, and when there is no storage
+// configured at all. Only an attachment row replaces it.
+//
+// The distinction it has to carry is between "there was a picture here and it
+// did not arrive" and "there was no picture": the first is a marker with no
+// id, the second is no marker.
+func TestAQuotedPlaceholderSaysSoWhenNothingArrived(t *testing.T) {
+	t.Parallel()
+	c := copyFor(DefaultLocale)
+
+	got, _, _ := dispatchOne(t, quotingFrame("msg-q-unavail", "这张呢", map[string]any{
+		"msgtype": "image",
+		"image":   map[string]any{"url": "https://cos.invalid/gone.enc", "aeskey": testAESKey},
+	}))
+	if want := "> " + c.QuotePrefix + "[Image: unavailable]\n这张呢"; got.Text != want {
+		t.Fatalf("Text = %q, want %q", got.Text, want)
+	}
+
+	// No url: nothing was ever there to fetch, so there is no marker either.
+	// A reader that sees no marker must not conclude an attachment went
+	// missing, and a reader that sees one must not conclude a picture was
+	// never sent.
+	none, _, _ := dispatchOne(t, quotingFrame("msg-q-none", "这张呢", map[string]any{
+		"msgtype": "text",
+		"text":    map[string]any{"content": "改好了"},
+	}))
+	if strings.Contains(none.Text, "[Image") {
+		t.Fatalf("Text = %q, want no marker at all for a quote that carried no picture", none.Text)
 	}
 }
 
@@ -150,6 +191,20 @@ func TestAQuotedPictureComesBeforeTheSendersOwn(t *testing.T) {
 			"in the body, and the agent reads the two lists against each other",
 			wm.Media[0].URL, wm.Media[1].URL)
 	}
+	// Only the quoted one is stamped. The sender's own picture keeps the bare
+	// "[Image]" it has always had — it is the attachment on the message being
+	// read, so nothing about it is ambiguous.
+	if wm.Media[0].InlinePlaceholder != "[Image: unavailable]" {
+		t.Errorf("the quoted picture's marker = %q, want %q", wm.Media[0].InlinePlaceholder, "[Image: unavailable]")
+	}
+	if wm.Media[1].InlinePlaceholder != "" {
+		t.Errorf("the sender's own picture was stamped with %q; its placeholder must be left exactly as it was",
+			wm.Media[1].InlinePlaceholder)
+	}
+	c := copyFor(DefaultLocale)
+	if want := "> " + c.QuotePrefix + "[Image: unavailable]\n这版好一些吗\n[Image]"; got.Text != want {
+		t.Fatalf("Text = %q, want %q", got.Text, want)
+	}
 }
 
 // TestAQuoted图文混排ContributesEveryPictureInIt: a quoted 图文混排 renders one
@@ -173,8 +228,48 @@ func TestAQuotedMixedContributesEveryPictureInIt(t *testing.T) {
 	if len(wm.Media) != 2 {
 		t.Fatalf("attachments = %+v, want both pictures in the quoted 图文混排", wm.Media)
 	}
-	if strings.Count(got.Text, "[Image]") != 2 {
+	if strings.Count(got.Text, "[Image: unavailable]") != 2 {
 		t.Fatalf("Text = %q, want a placeholder per picture — the count has to match the attachments", got.Text)
+	}
+	// Two markers with the same spelling: the occurrence number is the only
+	// thing that keeps them apart, and it has to run 0, 1 in render order or
+	// the binder names the second picture at the first one's placeholder.
+	if wm.Media[0].InlineIndex != 0 || wm.Media[1].InlineIndex != 1 {
+		t.Fatalf("occurrences = [%d %d], want [0 1] — two identical markers with the same index name the same placeholder twice",
+			wm.Media[0].InlineIndex, wm.Media[1].InlineIndex)
+	}
+}
+
+// TestQuotedMarkersAreCountedPerKind: an occurrence number is a position
+// within its OWN marker, not within the attachment list. A quote carrying a
+// document and then a picture holds one "[File: unavailable]" and one
+// "[Image: unavailable]", and both are the first of their spelling.
+func TestQuotedMarkersAreCountedPerKind(t *testing.T) {
+	t.Parallel()
+	got, _, _ := dispatchOne(t, quotingFrame("msg-q3e", "对得上吗", map[string]any{
+		"msgtype": "mixed",
+		"mixed": map[string]any{"msg_item": []any{
+			map[string]any{"msgtype": "file", "file": map[string]any{"url": "https://cos.invalid/doc", "aeskey": testAESKey}},
+			map[string]any{"msgtype": "image", "image": map[string]any{"url": "https://cos.invalid/pic", "aeskey": testAESKey}},
+		}},
+	}))
+
+	wm, err := wecomMsgFromRaw(got)
+	if err != nil {
+		t.Fatalf("decode raw: %v", err)
+	}
+	if len(wm.Media) != 2 {
+		t.Fatalf("attachments = %+v, want the document and the picture", wm.Media)
+	}
+	for i, want := range []struct {
+		marker string
+		index  int
+	}{{"[File: unavailable]", 0}, {"[Image: unavailable]", 0}} {
+		if wm.Media[i].InlinePlaceholder != want.marker || wm.Media[i].InlineIndex != want.index {
+			t.Errorf("attachment %d marker = (%q, %d), want (%q, %d) — counting both kinds together sends the binder "+
+				"looking for a second %q that the body does not contain",
+				i, wm.Media[i].InlinePlaceholder, wm.Media[i].InlineIndex, want.marker, want.index, want.marker)
+		}
 	}
 }
 
@@ -197,7 +292,7 @@ func TestAQuotedAttachmentWithNoURLIsNotQueued(t *testing.T) {
 	if len(wm.Media) != 0 {
 		t.Fatalf("attachments = %+v, want none — there is no url to fetch", wm.Media)
 	}
-	if strings.Contains(got.Text, "[Image]") {
+	if strings.Contains(got.Text, "[Image") {
 		t.Fatalf("Text = %q, want no placeholder for a picture that was never there", got.Text)
 	}
 }
@@ -218,11 +313,11 @@ func TestQuotedKindsEachRenderTheirOwnWay(t *testing.T) {
 				map[string]any{"msgtype": "text", "text": map[string]any{"content": "两版对比"}},
 				map[string]any{"msgtype": "image", "image": map[string]any{"url": "https://cos.invalid/a"}},
 			}},
-		}, "两版对比\n[Image]"},
+		}, "两版对比\n[Image: unavailable]"},
 		{"a quoted file", map[string]any{
 			"msgtype": "file",
 			"file":    map[string]any{"url": "https://cos.invalid/b"},
-		}, "[File]"},
+		}, "[File: unavailable]"},
 		{"a quoted voice run is its transcript", map[string]any{
 			"msgtype": "mixed",
 			"mixed": map[string]any{"msg_item": []any{
