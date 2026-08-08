@@ -14,8 +14,11 @@ package wecom
 import (
 	"context"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -250,7 +253,105 @@ func TestInboxCardUnknownTypeUsesTheSamePacksFallback(t *testing.T) {
 	}
 }
 
-// ---- surface 3: the read loop's own receipt ----
+// ---- surface 3: the media failure notice ----
+
+// TestMediaFailureNoticeReadsTheSendersLanguage drives the whole ingest, not
+// tellTheSender directly: the notice runs after the download has already
+// failed, on a context the caller may well have let expire, and resolving the
+// language is the part of that path most likely to be skipped by accident.
+func TestMediaFailureNoticeReadsTheSendersLanguage(t *testing.T) {
+	t.Parallel()
+	expired := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer expired.Close()
+
+	for _, tc := range localeCases {
+		t.Run(tc.name, func(t *testing.T) {
+			storage := &fakeMediaStorage{}
+			senders, conn := notifierWithLiveSocket(uuidOf(1))
+			// mediaMessage sends as T-alex in a 1:1, so the notice is
+			// addressed to one person and reads their profile.
+			r := NewMediaResolver(storage, newFakeMediaLedger(storage), senders,
+				fakeLanguages{senderID: "T-alex", userID: localeTestUserID, language: tc.language},
+				testLogger()).(*wecomMediaResolver)
+			r.http = testMediaClient()
+
+			msg := mediaMessage(t, "image", map[string]any{
+				"image": map[string]any{"url": expired.URL, "aeskey": testAESKey},
+			})
+			r.ResolveMedia(context.Background(), mediaInstallation(), engine.ResolvedIdentity{}, uuidOf(6), uuidOf(5), msg)
+
+			if got, want := sentMarkdown(t, conn, 0), copyPacks[tc.locale].MediaUnreadable; got != want {
+				t.Fatalf("failure notice = %q, want the %s copy %q", got, tc.locale, want)
+			}
+		})
+	}
+}
+
+// stalledLanguages is a languageLookup that never answers. It stands for the
+// case the notice's own budget exists for: the profile row is behind a lock,
+// or the pool is drained by whatever also broke the download.
+type stalledLanguages struct{}
+
+func (stalledLanguages) GetChannelUserBindingByUserID(ctx context.Context, _ db.GetChannelUserBindingByUserIDParams) (db.ChannelUserBinding, error) {
+	<-ctx.Done()
+	return db.ChannelUserBinding{}, ctx.Err()
+}
+
+func (stalledLanguages) GetUser(ctx context.Context, _ pgtype.UUID) (db.User, error) {
+	<-ctx.Done()
+	return db.User{}, ctx.Err()
+}
+
+// TestMediaFailureNoticeSurvivesAStalledLookup pins mediaNoticeLocaleTimeout,
+// which nothing else does: every other test here resolves a language
+// instantly, so the budget could be a nanosecond or ten minutes and they would
+// all still pass.
+//
+// Two halves, because the number and the behaviour can each be wrong on their
+// own. The bounds say what the number is for — long enough that an ordinary
+// indexed lookup lands inside it, short enough that a stalled one does not sit
+// on a message somebody is waiting for. The drive says the notice really does
+// go out when the lookup never answers, in the deployment's language, instead
+// of being dropped with the attachment that already failed.
+func TestMediaFailureNoticeSurvivesAStalledLookup(t *testing.T) {
+	if mediaNoticeLocaleTimeout < 500*time.Millisecond || mediaNoticeLocaleTimeout > 5*time.Second {
+		t.Fatalf("mediaNoticeLocaleTimeout = %s; it has to clear an indexed lookup on a loaded database and still not hold the notice", mediaNoticeLocaleTimeout)
+	}
+
+	restoreLocale(t, LocaleEn)
+
+	expired := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer expired.Close()
+
+	storage := &fakeMediaStorage{}
+	senders, conn := notifierWithLiveSocket(uuidOf(1))
+	r := NewMediaResolver(storage, newFakeMediaLedger(storage), senders, stalledLanguages{}, testLogger()).(*wecomMediaResolver)
+	r.http = testMediaClient()
+
+	msg := mediaMessage(t, "image", map[string]any{
+		"image": map[string]any{"url": expired.URL, "aeskey": testAESKey},
+	})
+
+	started := time.Now()
+	r.ResolveMedia(context.Background(), mediaInstallation(), engine.ResolvedIdentity{}, uuidOf(6), uuidOf(5), msg)
+	waited := time.Since(started)
+
+	if got, want := sentMarkdown(t, conn, 0), copyPacks[LocaleEn].MediaUnreadable; got != want {
+		t.Fatalf("notice = %q, want the deployment's %q — a lookup that never answers must not change what is said, only who it is said to", got, want)
+	}
+	if waited < mediaNoticeLocaleTimeout {
+		t.Errorf("the notice went out in %s, before the %s budget was spent — the lookup was not actually waited on, so this proves nothing", waited, mediaNoticeLocaleTimeout)
+	}
+	if waited > 4*mediaNoticeLocaleTimeout {
+		t.Errorf("the notice took %s against a %s budget; something other than the lookup is holding it", waited, mediaNoticeLocaleTimeout)
+	}
+}
+
+// ---- surface 4: the read loop's own receipt ----
 
 func TestUnreadableKindReceiptReadsTheSendersLanguage(t *testing.T) {
 	t.Parallel()

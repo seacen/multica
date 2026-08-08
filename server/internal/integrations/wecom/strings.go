@@ -126,6 +126,13 @@ type copyPack struct {
 	// only handles text reads that as the bot being broken.
 	UnsupportedMsgType string
 
+	// MediaTooLarge / MediaUnreadable tell the sender that an attachment did
+	// not make it. Two reasons rather than one because the fix differs: a
+	// file over the limit needs splitting or a link, whereas an expired or
+	// undecryptable download just needs sending again.
+	MediaTooLarge   string
+	MediaUnreadable string
+
 	// BindingPromptPrefix / BindingPromptSuffix wrap the bind URL.
 	// BindingPending replaces the whole thing when the mint was throttled and
 	// there is no URL to print. Both go to the sender alone, never to a room
@@ -215,6 +222,8 @@ var copyPacks = map[Locale]copyPack{
 		AgentOffline:         "⚠️ 智能体当前不在线，你的消息已收到，等它上线后会处理。",
 		AgentArchived:        "⚠️ 该智能体已归档，无法回复。请联系工作区管理员。",
 		UnsupportedMsgType:   "抱歉，我暂时无法处理这类消息。",
+		MediaTooLarge:        "抱歉，附件太大了，我这边收不下。",
+		MediaUnreadable:      "抱歉，有附件没能收到，麻烦重新发一次。",
 		BindingPromptPrefix:  "👋 请先绑定你的 Multica 账号，才能与我对话：\n",
 		BindingPromptSuffix:  "\n（链接 15 分钟内有效）",
 		BindingPending:       "👋 绑定链接刚才已经发给你了，就在上方，请直接点击完成绑定。",
@@ -243,6 +252,8 @@ var copyPacks = map[Locale]copyPack{
 		AgentOffline:         "⚠️ The agent is offline right now. Your message was received and will be handled once it's back.",
 		AgentArchived:        "⚠️ This agent has been archived and can't reply. Please contact your workspace admin.",
 		UnsupportedMsgType:   "Sorry, I can't read that kind of message.",
+		MediaTooLarge:        "Sorry, that attachment is too big for me to take.",
+		MediaUnreadable:      "Sorry, an attachment didn't come through — please send it again.",
 		BindingPromptPrefix:  "👋 Link your Multica account before we can talk:\n",
 		BindingPromptSuffix:  "\n(the link is good for 15 minutes)",
 		BindingPending:       "👋 I already sent you a link — it is just above, tap it to finish linking.",
