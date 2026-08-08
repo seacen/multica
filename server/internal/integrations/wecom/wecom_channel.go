@@ -288,6 +288,7 @@ func (c *wecomChannel) Connect(ctx context.Context) (err error) {
 			log.Warn("wecom: bad frame envelope", "error", err, "size", len(payload))
 			continue
 		}
+		traceIn(log, env)
 		switch env.Cmd {
 		case cmdMsgCallback, cmdEventCallback:
 			select {
@@ -360,6 +361,10 @@ func (c *wecomChannel) subscribe(ctx context.Context, conn wsConn, sender *wsSen
 		if err := json.Unmarshal(payload, &env); err != nil {
 			continue
 		}
+		// Traced before the req_id filter: a subscribe that is rejected, or
+		// answered on a req_id we never sent, is exactly the failure an
+		// operator turns tracing on to see.
+		traceIn(log, env)
 		if env.Headers.ReqID != reqID {
 			continue
 		}
@@ -382,6 +387,10 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 			return nil
 		}
 		text, ok := mc.ownText()
+		// Trace the resolved body rather than mc.Text.Content: a photo or a
+		// 图文混排 carries nothing in the raw text field, so tracing that would
+		// report an empty message for one that routed fine.
+		traceInbound(log, mc, text)
 		msg := channelMessageFromCallback(c.botID, c.botDisplayName, mc, text, env.Headers.ReqID)
 		if !ok {
 			// Nothing in this message can be read: a kind the adapter does
