@@ -176,12 +176,30 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 				text = streamCopyMerged
 			}
 		}
-		if err := o.finishStream(ctx, handle, text); err == nil {
+		// A stream frame is capped at the same 20480 bytes as any other body,
+		// and the closing frame is CLIPPED to fit — the answer ends in an
+		// ellipsis and there is no way to read the rest of it, anywhere. An
+		// agent's code review or a pasted log runs past that routinely.
+		//
+		// So the bubble carries as much as a frame holds and the remainder
+		// follows as ordinary messages, split at the same places and numbered
+		// the same way sendTextCtx would have split them. It arrives in the
+		// chat rather than behind a link to a web app the reader may not be
+		// signed into on their phone.
+		//
+		// Defused BEFORE the split, not after: respondStreamBody defuses the
+		// closing frame, and defusing inserts bytes — so splitting first could
+		// hand the frame a head that fits and then push it back over the cap.
+		// Defusing is idempotent, so the frame's own pass is a no-op.
+		head, rest := splitForBubble(defuseThinkTags(text))
+		if err := o.finishStream(ctx, handle, head); err == nil {
+			o.sendRest(ctx, handle, rest)
 			return nil
 		}
 		// The frame was refused. Say it as a new message instead — and never
 		// re-send the stream frame itself, whose req_id will have expired long
-		// before another connection could carry it.
+		// before another connection could carry it. The whole answer goes down
+		// that path, which splits it again on its own.
 		content = text
 	}
 	if content == "" {
@@ -283,6 +301,37 @@ func (o *Outbound) finishStream(ctx context.Context, h streamHandle, text string
 		"installation_id", uuidStringPub(h.InstallationID),
 		"stream_unusable", streamUnusable(err), "error", err)
 	return err
+}
+
+// splitForBubble divides an answer into the part a stream frame can hold and
+// the part that has to follow it.
+//
+// It reuses splitForWire so a bubble and a plain message break an answer at
+// the same places and number the pieces the same way; the only difference is
+// that the first piece goes into the sealed bubble and the rest do not.
+func splitForBubble(text string) (head string, rest []string) {
+	pieces := splitForWire(text)
+	if len(pieces) <= 1 {
+		return text, nil
+	}
+	return pieces[0], pieces[1:]
+}
+
+// sendRest delivers the pieces that did not fit in the bubble, as ordinary
+// messages underneath it.
+//
+// One at a time and in order, because that is the order they are meant to be
+// read in. A piece that fails stops the rest for the same reason: what follows
+// it only makes sense after it.
+func (o *Outbound) sendRest(ctx context.Context, h streamHandle, rest []string) {
+	for i, piece := range rest {
+		if err := o.senders.sendTextCtx(ctx, h.InstallationID, h.ChatID, h.ChatType, piece); err != nil {
+			o.logger.WarnContext(ctx, "wecom outbound: could not send the rest of a long answer",
+				"installation_id", uuidStringPub(h.InstallationID),
+				"piece", i+2, "of", len(rest)+1, "error", err)
+			return
+		}
+	}
 }
 
 // chatDoneContent extracts the reply text from an EventChatDone payload
