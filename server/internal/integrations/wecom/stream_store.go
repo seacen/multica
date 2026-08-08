@@ -173,6 +173,13 @@ type streamHandle struct {
 	// at open; callers registering a handle leave it false.
 	QueuedBehind bool
 
+	// Locale is the language this round's closing words are written in,
+	// resolved from the asker when the bubble was opened (typing_indicator.go).
+	// It travels on the handle because every closer runs later, from an event
+	// that names a task and nobody else — and one of them runs on a timer,
+	// minutes after the goroutine that knew who asked is gone.
+	Locale Locale
+
 	CreatedAt time.Time
 }
 

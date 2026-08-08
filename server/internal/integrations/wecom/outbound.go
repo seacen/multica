@@ -166,9 +166,11 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 		// explanation: the reply ahead of it already covered this message.
 		text := content
 		if !hasVisibleChar(text) {
-			text = streamCopyNoReply
+			// The round's own language, captured when its bubble was opened.
+			c := copyFor(handle.Locale)
+			text = c.StreamNoReply
 			if handle.QueuedBehind {
-				text = streamCopyMerged
+				text = c.StreamMerged
 			}
 		}
 		if err := o.finishStream(ctx, handle, text); err == nil {

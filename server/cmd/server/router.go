@@ -729,7 +729,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					// mid-run — still owes the user the news, and the binding
 					// row is where the chat is found when no handle is left.
 					Bindings: queries,
-					Logger:   slog.Default(),
+					// The bubble's own words are written in the reader's
+					// language, resolved when the round is opened and carried
+					// on the handle to whichever closer gets there.
+					Languages: queries,
+					Logger:    slog.Default(),
 				})
 				// Subscribes task:failed and task:cancelled: neither a failed
 				// nor a cancelled run publishes chat:done, so this is the
