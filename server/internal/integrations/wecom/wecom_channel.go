@@ -76,6 +76,10 @@ type wecomChannel struct {
 	installationID pgtype.UUID
 	botID          string
 	secret         string
+	// botDisplayName is what this bot is called in a chat, from the
+	// installation config. Empty on every installation that has not filled it
+	// in; see stripLeadingMentions for what an empty name falls back to.
+	botDisplayName string
 	handler        channel.InboundHandler
 	dialer         Dialer
 	wsURL          string
@@ -378,7 +382,7 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 			return nil
 		}
 		text, ok := mc.ownText()
-		msg := channelMessageFromCallback(c.botID, mc, text, env.Headers.ReqID)
+		msg := channelMessageFromCallback(c.botID, c.botDisplayName, mc, text, env.Headers.ReqID)
 		if !ok {
 			// Nothing in this message can be read: a kind the adapter does
 			// not know (a location card), or a known kind that arrived
@@ -563,6 +567,7 @@ func newWecomFactory(deps ChannelDeps) channel.Factory {
 			installationID: cfg.ID,
 			botID:          creds.BotID,
 			secret:         creds.Secret,
+			botDisplayName: ic.BotDisplayName,
 			handler:        cfg.Handler,
 			dialer:         deps.Dialer,
 			wsURL:          deps.WSURL,

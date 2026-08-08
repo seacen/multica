@@ -18,7 +18,7 @@ func TestVoiceTranscriptIsTreatedAsText(t *testing.T) {
 		t.Errorf("body = %q, want the transcript", body)
 	}
 
-	msg := channelMessageFromCallback("bot-1", mc, body, "req-1")
+	msg := channelMessageFromCallback("bot-1", "", mc, body, "req-1")
 	if msg.Text != "把登录跳转的 bug 记一下" {
 		t.Errorf("InboundMessage.Text = %q, want the transcript", msg.Text)
 	}
@@ -29,7 +29,7 @@ func TestSpokenIssueCommandIsACommand(t *testing.T) {
 	mc := aibotMsgCallback{MsgType: "voice"}
 	mc.Voice.Content = "/issue the login redirect is broken"
 	spoken, _ := mc.ownText()
-	msg := channelMessageFromCallback("bot-1", mc, spoken, "req-1")
+	msg := channelMessageFromCallback("bot-1", "", mc, spoken, "req-1")
 	if !msg.SkipAgentRun {
 		t.Error("a spoken /issue did not register as a command")
 	}
