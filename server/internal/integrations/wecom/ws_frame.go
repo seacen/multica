@@ -97,11 +97,16 @@ type aibotMsgCallback struct {
 	Mixed struct {
 		MsgItem []mixedItem `json:"msg_item"`
 	} `json:"mixed"`
-	// There is deliberately no Voice field here. A standalone voice message
-	// is #6599's subject; this adapter still answers it with the
-	// unsupported-kind receipt. mixedItem does carry one, because a voice
-	// run inside a 图文混排 would otherwise drop a spoken sentence out of
-	// the middle of a message whose other runs are read.
+	// Voice carries the TRANSCRIPT, not audio. WeCom runs the speech
+	// recognition on its side and delivers only the result, so a voice note
+	// needs no download, no media key and no storage — it is a sentence that
+	// happened to be spoken. Single chats only (WeCom errcode 100719 covers
+	// the group case). mixedItem carries the same field, because a voice run
+	// inside a 图文混排 would otherwise drop a spoken sentence out of the
+	// middle of a message whose other runs are read.
+	Voice struct {
+		Content string `json:"content"`
+	} `json:"voice"`
 }
 
 // mediaBody is the {url, aeskey} pair every downloadable kind carries. In
@@ -221,12 +226,20 @@ func (mc aibotMsgCallback) attachments() []InboundMedia {
 // its runs rendered in the order they were composed, so "look at this" still
 // reads above the picture it was written about.
 //
-// Everything else — a standalone voice note, a location card, a kind WeCom
-// adds next year — answers false and takes the receipt path.
+// A standalone voice note answers with its transcript. Recognition comes back
+// empty on background noise or a half-second press, and an empty body would
+// reach the agent as a turn with nothing in it — so an empty transcript
+// reports false and takes the receipt path.
+//
+// Everything else — a location card, a kind WeCom adds next year — answers
+// false and takes the receipt path too.
 func (mc aibotMsgCallback) ownText() (string, bool) {
 	switch strings.ToLower(mc.MsgType) {
 	case "text":
 		return mc.Text.Content, true
+	case "voice":
+		transcript := strings.TrimSpace(mc.Voice.Content)
+		return transcript, transcript != ""
 	case "image", "file", "video":
 		body, kind, _ := mediaFor(mc.MsgType, mc.Image, mc.File, mc.Video)
 		if strings.TrimSpace(body.URL) == "" {

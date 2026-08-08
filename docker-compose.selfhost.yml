@@ -146,17 +146,23 @@ services:
       # subscribe credentials at connection time, and to seal the secret when
       # an installation is created from the WeCom settings tab.
       MULTICA_WECOM_SECRET_KEY: ${MULTICA_WECOM_SECRET_KEY:-}
+      # Comma-separated ranges the inbound media fetcher may dial even though
+      # they look reserved. Empty (the default) keeps the SSRF guard as strict
+      # as it ships; set it only behind a fake-IP proxy whose pool would
+      # otherwise get every attachment refused. See .env.example.
+      MULTICA_WECOM_MEDIA_ALLOW_CIDRS: ${MULTICA_WECOM_MEDIA_ALLOW_CIDRS:-}
+      # 1 = log every inbound and outbound WeCom frame, including the first
+      # 120 runes of each message body, so a real-device session can be
+      # checked against the server afterwards. Off unless set; turn it on only
+      # for a debugging session and unset it when that session ends, because
+      # what it records is user message content.
+      MULTICA_WECOM_TRACE: ${MULTICA_WECOM_TRACE:-}
       # Which language the bot's own copy is written in for readers whose
       # language cannot be looked up — a group chat, or anyone not linked to a
       # Multica account yet. A linked person reads their own profile language
       # instead. zh-Hans (default) or en; an unrecognised value leaves the
       # default in place and the resolved one is logged at boot.
       MULTICA_WECOM_DEFAULT_LOCALE: ${MULTICA_WECOM_DEFAULT_LOCALE:-}
-      # Comma-separated ranges the inbound media fetcher may dial even though
-      # they look reserved. Empty (the default) keeps the SSRF guard as strict
-      # as it ships; set it only behind a fake-IP proxy whose pool would
-      # otherwise get every attachment refused. See .env.example.
-      MULTICA_WECOM_MEDIA_ALLOW_CIDRS: ${MULTICA_WECOM_MEDIA_ALLOW_CIDRS:-}
     restart: unless-stopped
 
   frontend:

@@ -101,6 +101,15 @@ type wsSender struct {
 	// rather than the constant so a test can exercise the give-up path without
 	// standing still for five seconds.
 	ackTimeout time.Duration
+
+	// seq numbers outbound frames in the order they reach the socket.
+	// Guarded by the writer slot (wmu), which is the point at which the ping
+	// loop, agent replies, inbox pushes and stream frames become ordered — so
+	// it is the wire order by construction, and it is what pairs a traced send
+	// attempt with its outcome. req_id cannot do that job, because a pong
+	// echoes the server's req_id and that may be empty or repeated. It never
+	// goes on the wire.
+	seq uint64
 }
 
 func newWSSender(conn wsConn, log *slog.Logger) *wsSender {
@@ -574,12 +583,18 @@ func (s *wsSender) write(frame map[string]any) error {
 	if err != nil {
 		return fmt.Errorf("wecom: marshal frame: %w", err)
 	}
+	// Extract the trace fields before taking the writer. Extraction is the
+	// expensive half (a regexp redaction pass and a rune-wise cut over the
+	// message body) and needs no ordering guarantee; what runs inside the
+	// writer is a nil check when tracing is off, and two log lines when it is
+	// on, against a socket write already in the same section.
+	t := traceOutFields(s.log, frame)
 	ctx := context.Background()
 	if err := s.lockWriter(ctx); err != nil {
 		return err
 	}
 	defer s.unlockWriter()
-	return s.writeLocked(ctx, payload)
+	return s.writeLocked(ctx, payload, t)
 }
 
 // writeStreamFrame is write() for a stream frame: the same serialized push,
@@ -596,6 +611,7 @@ func (s *wsSender) writeStreamFrame(ctx context.Context, reqID string, w *ackWai
 	if err != nil {
 		return fmt.Errorf("wecom: marshal frame: %w", err)
 	}
+	t := traceOutFields(s.log, frame)
 	if err := s.lockWriter(ctx); err != nil {
 		return err
 	}
@@ -603,7 +619,7 @@ func (s *wsSender) writeStreamFrame(ctx context.Context, reqID string, w *ackWai
 	if !s.beginStreamFrameLocked(reqID, w, finish) {
 		return errStreamSuperseded
 	}
-	if err := s.writeLocked(ctx, payload); err != nil {
+	if err := s.writeLocked(ctx, payload, t); err != nil {
 		s.abortStreamFrameLocked(reqID)
 		return err
 	}
@@ -616,15 +632,29 @@ func (s *wsSender) writeStreamFrame(ctx context.Context, reqID string, w *ackWai
 // whatever the caller gave itself. A frame is a few kilobytes, so a socket that
 // cannot take one inside a caller's budget is congested rather than busy, and
 // the Supervisor's reconnect is the designed answer to that.
-func (s *wsSender) writeLocked(ctx context.Context, payload []byte) error {
+// t carries the frame's trace fields, extracted by the caller before it took
+// the writer; nil when tracing is off. Both lines are emitted from in here, so
+// the recorded order is the wire order by construction — a line taken outside
+// the writer is only correlated with it, because a goroutine can emit its line
+// and be descheduled before it gets its turn, and the log then names the wrong
+// frame as first.
+func (s *wsSender) writeLocked(ctx context.Context, payload []byte, t *outTrace) error {
+	s.seq++
+	seq := s.seq
+	traceOutAttempt(s.log, seq, t)
+
 	deadline := time.Now().Add(writeDeadline)
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d
 	}
-	if err := s.conn.SetWriteDeadline(deadline); err != nil {
-		return err
+	stage := traceStageDeadline
+	err := s.conn.SetWriteDeadline(deadline)
+	if err == nil {
+		stage = traceStageWrite
+		err = s.conn.WriteMessage(websocket.TextMessage, payload)
 	}
-	return s.conn.WriteMessage(websocket.TextMessage, payload)
+	traceOutResult(s.log, seq, t, stage, err)
+	return err
 }
 
 // sendText pushes an aibot_send_msg (proactive push) with plain text to a

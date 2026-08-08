@@ -329,6 +329,9 @@ func (c *wecomChannel) Connect(ctx context.Context) (err error) {
 			log.Warn("wecom: bad frame envelope", "error", err, "size", len(payload))
 			continue
 		}
+		// Before the welcome fork, so an enter_chat frame is traced like every
+		// other inbound frame rather than disappearing down a side path.
+		traceIn(log, env)
 		if isWelcomeFrame(env) {
 			// A full welcome queue DROPS. This is the OPPOSITE of the
 			// callback queue ten lines below, which blocks, and both are
@@ -422,6 +425,10 @@ func (c *wecomChannel) subscribe(ctx context.Context, conn wsConn, sender *wsSen
 		if err := json.Unmarshal(payload, &env); err != nil {
 			continue
 		}
+		// Traced before the req_id filter: a subscribe that is rejected, or
+		// answered on a req_id we never sent, is exactly the failure an
+		// operator turns tracing on to see.
+		traceIn(log, env)
 		if env.Headers.ReqID != reqID {
 			continue
 		}
@@ -444,14 +451,19 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 			return nil
 		}
 		text, ok := mc.ownText()
+		// Trace the resolved body rather than mc.Text.Content: a photo or a
+		// 图文混排 carries nothing in the raw text field, so tracing that would
+		// report an empty message for one that routed fine.
+		traceInbound(log, mc, text)
 		msg := channelMessageFromCallback(c.botID, c.botDisplayName, mc, text, env.Headers.ReqID)
 		if !ok {
 			// Nothing in this message can be read: a kind the adapter does
-			// not know (a location card, a standalone voice note until
-			// #6599), or a known kind that arrived without the one field
-			// that makes it usable. Silence reads as a broken bot, so answer
-			// the same chat with a one-line receipt and stop. Best-effort: a
-			// send failure degrades to the prior silent drop.
+			// not know (a location card), or a known kind that arrived
+			// without the one field that makes it usable — a photo with no
+			// url, a voice note whose recognition came back empty. Silence
+			// reads as a broken bot, so answer the same chat with a one-line
+			// receipt and stop. Best-effort: a send failure degrades to the
+			// prior silent drop.
 			//
 			// The receipt is addressed to whoever sent the unreadable
 			// message, so in a 1:1 it reads their profile language; a group
