@@ -120,7 +120,10 @@ type copyPack struct {
 	AgentArchived string
 
 	// UnsupportedMsgType answers a message kind the adapter cannot read at
-	// all — sent from the read loop, which never reaches the Replier.
+	// all — sent from the read loop, which never reaches the Replier. It does
+	// not name text, because photos, files, videos and 图文混排 route: a person
+	// who has just watched the bot answer a screenshot and is then told it
+	// only handles text reads that as the bot being broken.
 	UnsupportedMsgType string
 
 	// BindingPromptPrefix / BindingPromptSuffix wrap the bind URL.
@@ -211,7 +214,7 @@ var copyPacks = map[Locale]copyPack{
 	LocaleZhHans: {
 		AgentOffline:         "⚠️ 智能体当前不在线，你的消息已收到，等它上线后会处理。",
 		AgentArchived:        "⚠️ 该智能体已归档，无法回复。请联系工作区管理员。",
-		UnsupportedMsgType:   "抱歉，我目前只能处理文字消息。",
+		UnsupportedMsgType:   "抱歉，我暂时无法处理这类消息。",
 		BindingPromptPrefix:  "👋 请先绑定你的 Multica 账号，才能与我对话：\n",
 		BindingPromptSuffix:  "\n（链接 15 分钟内有效）",
 		BindingPending:       "👋 绑定链接刚才已经发给你了，就在上方，请直接点击完成绑定。",
@@ -239,7 +242,7 @@ var copyPacks = map[Locale]copyPack{
 	LocaleEn: {
 		AgentOffline:         "⚠️ The agent is offline right now. Your message was received and will be handled once it's back.",
 		AgentArchived:        "⚠️ This agent has been archived and can't reply. Please contact your workspace admin.",
-		UnsupportedMsgType:   "Sorry, I can only read text messages for now.",
+		UnsupportedMsgType:   "Sorry, I can't read that kind of message.",
 		BindingPromptPrefix:  "👋 Link your Multica account before we can talk:\n",
 		BindingPromptSuffix:  "\n(the link is good for 15 minutes)",
 		BindingPending:       "👋 I already sent you a link — it is just above, tap it to finish linking.",
