@@ -217,18 +217,16 @@ func TestUnsupportedReceipt_DoesNotClaimTextOnly(t *testing.T) {
 	}
 }
 
-// TestVoiceStaysOnTheReceiptPath: a STANDALONE voice note is #6599's subject,
-// not this change's. It must still take the receipt path here, so the two
-// land independently. A voice RUN inside a 图文混排 is this change's, because
-// dropping it would lose a spoken sentence out of a message whose other runs
-// are read.
-func TestVoiceStaysOnTheReceiptPath(t *testing.T) {
+// TestVoiceRunInAMixedMessageIsRead: a voice RUN inside a 图文混排 has to be
+// read, because dropping it would lose a spoken sentence out of the middle of
+// a message whose other runs are read.
+//
+// The standalone half of this test is gone. It asserted that a lone voice note
+// still took the receipt path, which was true only while the transcript
+// support was on a branch of its own — it is here now, and ownText answers a
+// standalone voice note with its transcript.
+func TestVoiceRunInAMixedMessageIsRead(t *testing.T) {
 	t.Parallel()
-	standalone := mediaFrame(t, "voice", map[string]any{"voice": map[string]any{"content": "把报表发我"}})
-	if _, called, conn := dispatchOne(t, standalone); called || len(conn.frames) != 1 {
-		t.Errorf("standalone voice should still take the receipt path (called=%v, frames=%d)", called, len(conn.frames))
-	}
-
 	inMixed := mediaFrame(t, "mixed", map[string]any{"mixed": map[string]any{"msg_item": []map[string]any{
 		{"msgtype": "voice", "voice": map[string]any{"content": "把报表发我"}},
 		{"msgtype": "file", "file": map[string]any{"url": "https://cos.example.com/x", "aeskey": "k"}},

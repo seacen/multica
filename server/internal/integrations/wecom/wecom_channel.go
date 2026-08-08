@@ -381,11 +381,12 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 		msg := channelMessageFromCallback(c.botID, mc, text, env.Headers.ReqID)
 		if !ok {
 			// Nothing in this message can be read: a kind the adapter does
-			// not know (a location card, a standalone voice note until
-			// #6599), or a known kind that arrived without the one field
-			// that makes it usable. Silence reads as a broken bot, so answer
-			// the same chat with a one-line receipt and stop. Best-effort: a
-			// send failure degrades to the prior silent drop.
+			// not know (a location card), or a known kind that arrived
+			// without the one field that makes it usable — a photo with no
+			// url, a voice note whose recognition came back empty. Silence
+			// reads as a broken bot, so answer the same chat with a one-line
+			// receipt and stop. Best-effort: a send failure degrades to the
+			// prior silent drop.
 			log.Debug("wecom: unsupported message kind, replying with a receipt", "msg_type", mc.MsgType, "msg_id", mc.MsgID)
 			if err := sender.sendText(msg.Source.ChatID, aibotChatTypeFromChannel(msg.Source.ChatType), unsupportedMsgTypeReceipt); err != nil {
 				log.Debug("wecom: unsupported-kind receipt send failed", "error", err, "msg_id", mc.MsgID)
