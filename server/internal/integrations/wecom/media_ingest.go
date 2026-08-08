@@ -30,6 +30,7 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -38,13 +39,13 @@ import (
 	"github.com/multica-ai/multica/server/internal/util"
 )
 
-// mediaFailureNotice lines. WeCom deployments are China-only, so these follow
-// the Chinese product voice the rest of this adapter already writes in
-// (wecom_channel.go's receipt, router.go's session titles).
-const (
-	mediaUnreadableNotice = "抱歉，有附件没能收到，麻烦重新发一次。"
-	mediaTooLargeNotice   = "抱歉，附件太大了，我这边收不下。"
-)
+// The two failure lines are copyPack.MediaUnreadable / MediaTooLarge
+// (strings.go), read in the language of the chat they land in.
+
+// mediaNoticeLocaleTimeout bounds the profile lookup behind the failure
+// notice. Deliberately small: the notice is worth sending in the wrong
+// language, and not worth delaying.
+const mediaNoticeLocaleTimeout = 2 * time.Second
 
 // mediaStorage is the slice of storage.Storage this resolver drives.
 // ObjectURL is a pure function of configuration, which is what lets the
@@ -69,14 +70,19 @@ type wecomMediaResolver struct {
 	// sender an attachment did not make it. nil disables the notice and
 	// leaves only the log.
 	notify *sendersRegistry
-	logger *slog.Logger
+	// languages picks the failure notice's language from where it lands
+	// (language.go): a 1:1 reads the sender's profile, a room the
+	// deployment's. nil puts every notice on the deployment default.
+	languages languageLookup
+	logger    *slog.Logger
 }
 
 // NewMediaResolver builds the wecom MediaResolver. storage and ledger are
 // required — without either there is nothing durable to point an attachment
 // at, and the resolver degrades to leaving the placeholder in place. senders
-// is optional: without it a failed attachment is only logged.
-func NewMediaResolver(storage mediaStorage, ledger engine.MediaIntentLedger, senders *sendersRegistry, logger *slog.Logger) engine.MediaResolver {
+// is optional: without it a failed attachment is only logged, and so is
+// languages — without it the notice is written in the deployment's language.
+func NewMediaResolver(storage mediaStorage, ledger engine.MediaIntentLedger, senders *sendersRegistry, languages languageLookup, logger *slog.Logger) engine.MediaResolver {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -86,9 +92,10 @@ func NewMediaResolver(storage mediaStorage, ledger engine.MediaIntentLedger, sen
 		// Never a bare http.Client: the URL being fetched came off the wire,
 		// and this client refuses to connect to anything that is not public
 		// internet (media_guard.go).
-		http:   newMediaHTTPClient(mediaGuard{}),
-		notify: senders,
-		logger: logger,
+		http:      newMediaHTTPClient(mediaGuard{}),
+		notify:    senders,
+		languages: languages,
+		logger:    logger,
 	}
 }
 
@@ -394,11 +401,19 @@ func (r *wecomMediaResolver) tellTheSender(inst engine.ResolvedInstallation, wm 
 	if strings.EqualFold(wm.ChatType, "group") {
 		chatType = chatTypeGroupInt
 	}
+	// Its own context, not ResolveMedia's. The commonest reason to be here is
+	// a download that ran out of time, and on that path the caller's context
+	// is already done — reusing it would put every timed-out attachment's
+	// notice on the deployment default no matter who is reading it.
+	noticeCtx, cancel := context.WithTimeout(context.Background(), mediaNoticeLocaleTimeout)
+	defer cancel()
+	c := copyFor(localeFor(noticeCtx, r.languages, inst.ID, chatType, wm.SenderUserID))
+
 	lines := make([]string, 0, len(failures))
 	for _, f := range failures {
-		notice := mediaUnreadableNotice
+		notice := c.MediaUnreadable
 		if f == mediaFailureTooLarge {
-			notice = mediaTooLargeNotice
+			notice = c.MediaTooLarge
 		}
 		// mediaFailureBlocked lands on the unreadable wording deliberately.
 		// From the sender's side a refused address and a download that fell

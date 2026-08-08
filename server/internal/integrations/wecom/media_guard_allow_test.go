@@ -210,7 +210,7 @@ func TestAGuardRefusalNeverPutsAnAddressOrUrlInTheChat(t *testing.T) {
 	// NOT newTestResolver: that one swaps in a client which permits loopback,
 	// which is the very thing under test here. This keeps the production
 	// guard.
-	r := NewMediaResolver(storage, newFakeMediaLedger(storage), senders, testLogger()).(*wecomMediaResolver)
+	r := NewMediaResolver(storage, newFakeMediaLedger(storage), senders, nil, testLogger()).(*wecomMediaResolver)
 
 	msg := mediaMessage(t, "mixed", map[string]any{"mixed": map[string]any{"msg_item": []any{
 		map[string]any{"msgtype": "image", "image": map[string]any{"url": srv.URL, "aeskey": testAESKey}},
@@ -230,7 +230,7 @@ func TestAGuardRefusalNeverPutsAnAddressOrUrlInTheChat(t *testing.T) {
 	body := conn.sendBody(t, 0)
 	md, _ := body["markdown"].(map[string]any)
 	content, _ := md["content"].(string)
-	if content != mediaUnreadableNotice {
+	if content != copyFor(DefaultLocale).MediaUnreadable {
 		t.Errorf("notice = %q, want the plain did-not-arrive wording exactly once", content)
 	}
 	for _, secret := range []string{"127.0.0.1", "::1", srv.URL, testAESKey} {

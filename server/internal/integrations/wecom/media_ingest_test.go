@@ -180,7 +180,7 @@ func mediaInstallation() engine.ResolvedInstallation {
 
 func TestHasMediaLooksOnlyAtWhatIsAlreadyInHand(t *testing.T) {
 	t.Parallel()
-	r := NewMediaResolver(&fakeMediaStorage{}, newFakeMediaLedger(nil), nil, testLogger())
+	r := NewMediaResolver(&fakeMediaStorage{}, newFakeMediaLedger(nil), nil, nil, testLogger())
 	cases := []struct {
 		name    string
 		msgType string
@@ -211,7 +211,7 @@ func TestHasMediaLooksOnlyAtWhatIsAlreadyInHand(t *testing.T) {
 
 func TestHasMediaSaysNoWhenThereIsNoUrlToFetch(t *testing.T) {
 	t.Parallel()
-	r := NewMediaResolver(&fakeMediaStorage{}, newFakeMediaLedger(nil), nil, testLogger())
+	r := NewMediaResolver(&fakeMediaStorage{}, newFakeMediaLedger(nil), nil, nil, testLogger())
 	// A body with an aeskey and no url is not something we can download; it
 	// must not buy the message a media deadline and a deferred agent run.
 	mc := aibotMsgCallback{MsgType: "image"}
@@ -229,7 +229,7 @@ func TestHasMediaSaysNoWhenThereIsNoUrlToFetch(t *testing.T) {
 // runs is reachable while the guard's own decision stays under test in
 // media_guard_test.go.
 func newTestResolver(storage mediaStorage, ledger engine.MediaIntentLedger, senders *sendersRegistry) *wecomMediaResolver {
-	r := NewMediaResolver(storage, ledger, senders, testLogger()).(*wecomMediaResolver)
+	r := NewMediaResolver(storage, ledger, senders, nil, testLogger()).(*wecomMediaResolver)
 	r.http = testMediaClient()
 	return r
 }
@@ -434,7 +434,7 @@ func TestResolveMediaTellsTheSenderWhatWentWrong(t *testing.T) {
 			"file": map[string]any{"url": oversize.URL, "aeskey": testAESKey},
 		})
 		r.ResolveMedia(context.Background(), mediaInstallation(), engine.ResolvedIdentity{}, uuidOf(6), uuidOf(5), msg)
-		if got := noticeText(t, conn); got != mediaTooLargeNotice {
+		if got := noticeText(t, conn); got != copyFor(DefaultLocale).MediaTooLarge {
 			t.Fatalf("notice = %q, want the too-large wording", got)
 		}
 	})
@@ -448,7 +448,7 @@ func TestResolveMediaTellsTheSenderWhatWentWrong(t *testing.T) {
 			map[string]any{"msgtype": "image", "image": map[string]any{"url": expired.URL, "aeskey": testAESKey}},
 		}}})
 		r.ResolveMedia(context.Background(), mediaInstallation(), engine.ResolvedIdentity{}, uuidOf(6), uuidOf(5), msg)
-		if got := noticeText(t, conn); got != mediaUnreadableNotice {
+		if got := noticeText(t, conn); got != copyFor(DefaultLocale).MediaUnreadable {
 			t.Fatalf("notice = %q, want the unreadable wording once", got)
 		}
 	})

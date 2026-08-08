@@ -14,6 +14,8 @@ package wecom
 import (
 	"context"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -250,7 +252,43 @@ func TestInboxCardUnknownTypeUsesTheSamePacksFallback(t *testing.T) {
 	}
 }
 
-// ---- surface 3: the read loop's own receipt ----
+// ---- surface 3: the media failure notice ----
+
+// TestMediaFailureNoticeReadsTheSendersLanguage drives the whole ingest, not
+// tellTheSender directly: the notice runs after the download has already
+// failed, on a context the caller may well have let expire, and resolving the
+// language is the part of that path most likely to be skipped by accident.
+func TestMediaFailureNoticeReadsTheSendersLanguage(t *testing.T) {
+	t.Parallel()
+	expired := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer expired.Close()
+
+	for _, tc := range localeCases {
+		t.Run(tc.name, func(t *testing.T) {
+			storage := &fakeMediaStorage{}
+			senders, conn := notifierWithLiveSocket(uuidOf(1))
+			// mediaMessage sends as T-alex in a 1:1, so the notice is
+			// addressed to one person and reads their profile.
+			r := NewMediaResolver(storage, newFakeMediaLedger(storage), senders,
+				fakeLanguages{senderID: "T-alex", userID: localeTestUserID, language: tc.language},
+				testLogger()).(*wecomMediaResolver)
+			r.http = testMediaClient()
+
+			msg := mediaMessage(t, "image", map[string]any{
+				"image": map[string]any{"url": expired.URL, "aeskey": testAESKey},
+			})
+			r.ResolveMedia(context.Background(), mediaInstallation(), engine.ResolvedIdentity{}, uuidOf(6), uuidOf(5), msg)
+
+			if got, want := sentMarkdown(t, conn, 0), copyPacks[tc.locale].MediaUnreadable; got != want {
+				t.Fatalf("failure notice = %q, want the %s copy %q", got, tc.locale, want)
+			}
+		})
+	}
+}
+
+// ---- surface 4: the read loop's own receipt ----
 
 func TestUnreadableKindReceiptReadsTheSendersLanguage(t *testing.T) {
 	t.Parallel()
