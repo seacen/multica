@@ -361,6 +361,7 @@ type ChannelOutboundCardMessage struct {
 
 type ChannelOutboundQueue struct {
 	ID             pgtype.UUID        `json:"id"`
+	Seq            int64              `json:"seq"`
 	InstallationID pgtype.UUID        `json:"installation_id"`
 	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
 	ChannelType    string             `json:"channel_type"`
