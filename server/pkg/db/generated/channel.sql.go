@@ -243,6 +243,67 @@ func (q *Queries) ClaimNextChannelMediaPendingObjectForReconcile(ctx context.Con
 	return i, err
 }
 
+const clearChannelInstallationBindings = `-- name: ClearChannelInstallationBindings :exec
+WITH cleared_chat_sessions AS (
+    DELETE FROM channel_chat_session_binding
+    WHERE installation_id = $1
+    RETURNING chat_session_id
+),
+cleared_outbound_cards AS (
+    -- channel_outbound_card_message is keyed by chat_session_id (no
+    -- installation_id, no FK), so it is reached through the just-removed
+    -- chat-session bindings, exactly as the reclaim reaches it.
+    DELETE FROM channel_outbound_card_message
+    WHERE chat_session_id IN (SELECT chat_session_id FROM cleared_chat_sessions)
+),
+cleared_binding_tokens AS (
+    DELETE FROM channel_binding_token
+    WHERE installation_id = $1
+),
+cleared_user_bindings AS (
+    DELETE FROM channel_user_binding
+    WHERE installation_id = $1
+),
+cleared_inbound_dedup AS (
+    DELETE FROM channel_inbound_message_dedup
+    WHERE installation_id = $1
+)
+UPDATE channel_inbound_audit SET installation_id = NULL
+WHERE channel_inbound_audit.installation_id = $1
+`
+
+// Application-layer cleanup for a bot SWAP: the same agent keeps its
+// installation row, but the bot behind it changes.
+//
+// The row is reused — UpsertChannelInstallation conflicts on
+// (workspace_id, agent_id, channel_type) — so everything keyed on
+// installation_id survives a change that made all of it meaningless. WeCom
+// aibot userids are anonymised per (bot, user), the premise the whole binding
+// flow rests on, so a channel_user_binding written under the old bot names
+// somebody the new bot has never heard of. An inbox push then goes out
+// addressed to an old-bot userid over the new bot's connection (#6547).
+//
+// Same tables ReclaimDeadChannelInstallationByAppID clears for a dead owner;
+// this covers the reuse case that path cannot reach, because the reclaim is
+// keyed on the NEW bot's app_id and so cannot see what the CURRENT
+// installation accumulated under the old one. The installation row itself
+// stays: the caller is about to upsert over it.
+//
+// Not yet in this list, because the tables do not exist on main yet: #6581
+// adds channel_outbound_queue (migration 265) and channel_outbound_send_attempt
+// (migration 271), both keyed on installation_id NOT NULL. Queued replies would
+// otherwise survive the swap and be addressed with the previous bot's
+// anonymised ids, and stale send-attempt rows would charge the new bot's quota
+// for messages the old one sent. Whichever of the two lands second adds the
+// other's tables here.
+// The audit trail keeps its rows and only loses the reference. Losing the
+// history of what arrived is worse than a dangling installation_id, and the
+// row stays meaningful for operator triage without it.
+func (q *Queries) ClearChannelInstallationBindings(ctx context.Context, installationID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, clearChannelInstallationBindings, installationID)
+	return err
+}
+
 const consumeChannelBindingToken = `-- name: ConsumeChannelBindingToken :one
 UPDATE channel_binding_token
 SET consumed_at = now()
