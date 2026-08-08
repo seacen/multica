@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"unicode"
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
 	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
@@ -95,12 +96,16 @@ type aibotMsgCallback struct {
 	Mixed struct {
 		MsgItem []mixedItem `json:"msg_item"`
 	} `json:"mixed"`
-	// There is deliberately no Voice field here. A standalone voice message
-	// is #6599's subject; this adapter still answers it with the
-	// unsupported-kind receipt. mixedItem does carry one, because a voice
-	// run inside a 图文混排 would otherwise drop a spoken sentence out of
-	// the middle of a message whose other runs are read.
-	//
+	// Voice carries the TRANSCRIPT, not audio. WeCom runs the speech
+	// recognition on its side and delivers only the result, so a voice note
+	// needs no download, no media key and no storage — it is a sentence that
+	// happened to be spoken. Single chats only (WeCom errcode 100719 covers
+	// the group case). mixedItem carries the same field, because a voice run
+	// inside a 图文混排 would otherwise drop a spoken sentence out of the
+	// middle of a message whose other runs are read.
+	Voice struct {
+		Content string `json:"content"`
+	} `json:"voice"`
 	// Quote is the message this one is a reply to, present when the sender
 	// used 引用. It carries the quoted message's own msgtype and body and
 	// nothing else — no sender, no id, no timestamp.
@@ -316,12 +321,20 @@ func renderQuoteBlock(c copyPack, quoted string) string {
 // its runs rendered in the order they were composed, so "look at this" still
 // reads above the picture it was written about.
 //
-// Everything else — a standalone voice note, a location card, a kind WeCom
-// adds next year — answers false and takes the receipt path.
+// A standalone voice note answers with its transcript. Recognition comes back
+// empty on background noise or a half-second press, and an empty body would
+// reach the agent as a turn with nothing in it — so an empty transcript
+// reports false and takes the receipt path.
+//
+// Everything else — a location card, a kind WeCom adds next year — answers
+// false and takes the receipt path too.
 func (mc aibotMsgCallback) ownText() (string, bool) {
 	switch strings.ToLower(mc.MsgType) {
 	case "text":
 		return mc.Text.Content, true
+	case "voice":
+		transcript := strings.TrimSpace(mc.Voice.Content)
+		return transcript, transcript != ""
 	case "image", "file", "video":
 		body, kind, _ := mediaFor(mc.MsgType, mc.Image, mc.File, mc.Video)
 		if strings.TrimSpace(body.URL) == "" {
@@ -433,7 +446,11 @@ type InboundMedia struct {
 // whether the message is routable at all before it gets here. c is the
 // destination's copy pack, needed again here to recompose that body when a
 // directive is stripped off it.
-func channelMessageFromCallback(botID string, mc aibotMsgCallback, c copyPack, text, reqID string) channel.InboundMessage {
+//
+// botDisplayName is the bot's name in a chat, from the installation config. It
+// is used for one thing: recognising where the sender's @-mention ends. Empty
+// is fine and falls back to a whitespace heuristic; see stripLeadingMentions.
+func channelMessageFromCallback(botID, botDisplayName string, mc aibotMsgCallback, c copyPack, text, reqID string) channel.InboundMessage {
 	chatType := channel.ChatTypeP2P
 	if strings.EqualFold(mc.ChatType, "group") {
 		chatType = channel.ChatTypeGroup
@@ -451,6 +468,19 @@ func channelMessageFromCallback(botID string, mc aibotMsgCallback, c copyPack, t
 	// quote, would be missed entirely by anything reading the front of the
 	// stored body.
 	command, _ := mc.ownText()
+
+	// In a group the @-mention IS how you reach the bot, so it arrives glued
+	// to whatever was typed after it — "@Andrew /new" is a person asking for a
+	// fresh session, not prose that happens to contain a word — and the
+	// addressing comes off the front.
+	//
+	// Groups only. In a 1:1 nobody has to address the bot, so a leading "@" is
+	// the sender naming a colleague they are talking ABOUT: "@李雷 /issue 帮我
+	// 问问他" is a question, and stripping the name would turn it into a filed
+	// issue nobody asked for plus, via SkipAgentRun below, no answer at all.
+	if chatType == channel.ChatTypeGroup {
+		command = stripLeadingMentions(command, botDisplayName)
+	}
 
 	// `/new` under a quoted message used to throw the quote away.
 	//
@@ -500,11 +530,14 @@ func channelMessageFromCallback(botID string, mc aibotMsgCallback, c copyPack, t
 		Text:           text,
 		AddressedToBot: true,
 		// The sender's OWN words, without the quote block Text carries ahead
-		// of them. Command classification is shared (channel/message.go), and
-		// without this the shared parser falls back to Text — whose first
-		// non-empty line, when the user replied to somebody, is the rendered
-		// quote. Lark sets this from its own command body and Slack from its
-		// text; WeCom was the one adapter leaving it empty.
+		// of them and with a group's addressing removed. Command
+		// classification is shared (channel/message.go), and without this the
+		// shared parser falls back to Text — whose first non-empty line is the
+		// rendered quote when the user replied to somebody, and the @-mention
+		// when they are in a group, so every slash command read as ordinary
+		// prose. Lark sets this from its command body (feishu_channel.go:139)
+		// and Slack from its cleaned text (slack/inbound.go:131); WeCom was the
+		// one adapter leaving it empty.
 		CommandText: command,
 		// Set only when we recomposed Text above; see the comment there.
 		ForceFresh: forceFresh,
@@ -516,13 +549,19 @@ func channelMessageFromCallback(botID string, mc aibotMsgCallback, c copyPack, t
 		// alone on this — Slack/Lark keep the historical "let the agent
 		// see /issue and respond too" behaviour.
 		//
-		// Read off the sender's own line rather than mc.Text.Content: a
-		// 图文混排 whose first run is "/issue 登录坏了" and whose second is a
-		// screenshot is one issue-filing message, and the raw text field is
-		// empty on that callback. Reading it off the stored body instead
-		// would find the quote when there is one — so a /issue under a quote
-		// would run the agent as well as file the issue, and a /issue inside
-		// somebody else's quoted message would file one nobody asked for.
+		// Read off the same source the engine will parse, so a group /issue
+		// behaves like the p2p one instead of filing the issue and then also
+		// asking the agent about it.
+		//
+		// That source is the sender's own line, not mc.Text.Content: a 图文混排
+		// whose first run is "/issue 登录坏了" and whose second is a screenshot
+		// is one issue-filing message, and the raw text field is empty on that
+		// callback. Reading it off the stored body instead would find the quote
+		// when there is one — so a /issue under a quote would run the agent as
+		// well as file the issue, and a /issue inside somebody else's quoted
+		// message would file one nobody asked for. Reading it off the raw text
+		// would make a p2p "@李雷 /issue …" file an issue and stay silent,
+		// which is the whole reason the mention strip above is gated on groups.
 		SkipAgentRun: isIssueCommand(command),
 		Source: channel.Source{
 			ChannelType: TypeWecom,
@@ -531,6 +570,56 @@ func channelMessageFromCallback(botID string, mc aibotMsgCallback, c copyPack, t
 			SenderID:    senderID,
 		},
 		Raw: raw,
+	}
+}
+
+// stripLeadingMentions removes the @-mentions a message opens with, which in a
+// group chat is how the sender addresses the bot. WeCom puts them in the text
+// and sends no mention list alongside it, so there is nothing to match against
+// but the shape: an "@" at the very front, up to the next space.
+//
+// Group messages only — the caller gates it on chatType. Nobody addresses the
+// bot in a 1:1, so the same "@" at the front there is a colleague's name in the
+// sender's own sentence, and removing it would rewrite what they said.
+//
+// Only the front. A name further into the sentence is the sender talking ABOUT
+// somebody — "@Andrew ask @李雷 about yesterday" is one instruction naming one
+// colleague — and stripping that would quietly rewrite what they said.
+//
+// This feeds command classification only. The stored message keeps the text
+// exactly as it arrived, so the transcript still shows who was addressed.
+//
+// Slack does the same thing with a regex over its mention token
+// (slack/inbound.go cleanText); Feishu is handed an already-clean command body
+// by the platform. WeCom was the one adapter passing the raw text through.
+func stripLeadingMentions(s, botName string) string {
+	for {
+		trimmed := strings.TrimLeftFunc(s, unicode.IsSpace)
+		if !strings.HasPrefix(trimmed, "@") {
+			return trimmed
+		}
+		// Our own name first, matched whole. A display name may contain
+		// spaces — "Multica Bot" is the obvious one — and cutting at the
+		// first space would leave "Bot /new 重新分析", which is not a command,
+		// so every slash command in that group would still be dropped.
+		//
+		// The name is not guessed. It comes from the installation config, set
+		// when the bot was connected, because the callback carries no
+		// structured mention list to read it from. Absent, the heuristic below
+		// is what runs — correct for a one-word name, and what every
+		// installation has until somebody fills the field in.
+		if botName != "" && strings.HasPrefix(trimmed[1:], botName) {
+			s = trimmed[1+len(botName):]
+			continue
+		}
+		i := strings.IndexFunc(trimmed, unicode.IsSpace)
+		if i < 0 {
+			// The whole message is one mention and nothing else. There is no
+			// command and no words — leave it, so an empty body is decided by
+			// the caller rather than manufactured here.
+			return trimmed
+		}
+		s = trimmed[i:]
 	}
 }
 

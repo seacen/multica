@@ -76,6 +76,10 @@ type wecomChannel struct {
 	installationID pgtype.UUID
 	botID          string
 	secret         string
+	// botDisplayName is what this bot is called in a chat, from the
+	// installation config. Empty on every installation that has not filled it
+	// in; see stripLeadingMentions for what an empty name falls back to.
+	botDisplayName string
 	handler        channel.InboundHandler
 	dialer         Dialer
 	wsURL          string
@@ -289,6 +293,7 @@ func (c *wecomChannel) Connect(ctx context.Context) (err error) {
 			log.Warn("wecom: bad frame envelope", "error", err, "size", len(payload))
 			continue
 		}
+		traceIn(log, env)
 		switch env.Cmd {
 		case cmdMsgCallback, cmdEventCallback:
 			select {
@@ -361,6 +366,10 @@ func (c *wecomChannel) subscribe(ctx context.Context, conn wsConn, sender *wsSen
 		if err := json.Unmarshal(payload, &env); err != nil {
 			continue
 		}
+		// Traced before the req_id filter: a subscribe that is rejected, or
+		// answered on a req_id we never sent, is exactly the failure an
+		// operator turns tracing on to see.
+		traceIn(log, env)
 		if env.Headers.ReqID != reqID {
 			continue
 		}
@@ -407,16 +416,27 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 			log.Warn("wecom: bad aibot_msg_callback body", "error", err)
 			return nil
 		}
+		// The receipt below and the quote block routableText renders are both
+		// the destination's copy, so the pack is resolved once, up front.
 		pack := c.packFor(ctx, mc)
 		text, ok := mc.routableText(pack)
-		msg := channelMessageFromCallback(c.botID, mc, pack, text, env.Headers.ReqID)
+		// Trace the resolved body rather than mc.Text.Content: a photo or a
+		// 图文混排 carries nothing in the raw text field, so tracing that would
+		// report an empty message for one that routed fine.
+		traceInbound(log, mc, text)
+		msg := channelMessageFromCallback(c.botID, c.botDisplayName, mc, pack, text, env.Headers.ReqID)
 		if !ok {
 			// Nothing in this message can be read: a kind the adapter does
-			// not know (a location card, a standalone voice note until
-			// #6599), or a known kind that arrived without the one field
-			// that makes it usable. Silence reads as a broken bot, so answer
-			// the same chat with a one-line receipt and stop. Best-effort: a
-			// send failure degrades to the prior silent drop.
+			// not know (a location card), or a known kind that arrived
+			// without the one field that makes it usable — a photo with no
+			// url, a voice note whose recognition came back empty. Silence
+			// reads as a broken bot, so answer the same chat with a one-line
+			// receipt and stop. Best-effort: a send failure degrades to the
+			// prior silent drop.
+			//
+			// The receipt is addressed to whoever sent the unreadable message,
+			// so in a 1:1 it reads their profile language; a group has no
+			// shared profile and reads the deployment's (language.go).
 			chatType := aibotChatTypeFromChannel(msg.Source.ChatType)
 			log.Debug("wecom: unsupported message kind, replying with a receipt", "msg_type", mc.MsgType, "msg_id", mc.MsgID)
 			if err := sender.sendText(msg.Source.ChatID, chatType, pack.UnsupportedMsgType); err != nil {
@@ -598,6 +618,7 @@ func newWecomFactory(deps ChannelDeps) channel.Factory {
 			installationID: cfg.ID,
 			botID:          creds.BotID,
 			secret:         creds.Secret,
+			botDisplayName: ic.BotDisplayName,
 			handler:        cfg.Handler,
 			dialer:         deps.Dialer,
 			wsURL:          deps.WSURL,

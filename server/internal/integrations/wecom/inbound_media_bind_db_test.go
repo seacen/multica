@@ -210,7 +210,7 @@ func wecomImageCallback(t *testing.T, botID, senderID, msgID, url string) channe
 	if !ok {
 		t.Fatal("image callback is not routable; the fixture is wrong")
 	}
-	return channelMessageFromCallback(botID, mc, copyFor(DefaultLocale), text, "req-bind-1")
+	return channelMessageFromCallback(botID, "", mc, copyFor(DefaultLocale), text, "req-bind-1")
 }
 
 // stalledCOSServer accepts the request and then holds it open, so the media
