@@ -21,15 +21,11 @@ import (
 	"github.com/multica-ai/multica/server/internal/util"
 )
 
-const (
-	agentOfflineText  = "⚠️ 智能体当前不在线，你的消息已收到，等它上线后会处理。"
-	agentArchivedText = "⚠️ 该智能体已归档，无法回复。请联系工作区管理员。"
-)
-
 // OutboundReplier implements engine.OutboundReplier for WeCom.
 type OutboundReplier struct {
 	binding     binder
 	senders     *sendersRegistry
+	languages   languageLookup
 	appURL      string
 	bindingPath string
 	logger      *slog.Logger
@@ -51,6 +47,13 @@ type OutboundReplierConfig struct {
 	// Senders is the same sendersRegistry the wecom ChannelDeps was built
 	// with. The replier looks up the live wsSender by installation id.
 	Senders *sendersRegistry
+
+	// Languages resolves the notice's DESTINATION to a copy language
+	// (language.go): a 1:1 reads the sender's own Multica profile, a room
+	// reads the deployment default. Nil — and every unbound sender, which
+	// notably includes everyone the binding prompt is FOR — gets the
+	// deployment default.
+	Languages languageLookup
 
 	// AppURL is the Multica web app host the user clicks into to redeem
 	// the binding token (e.g. https://multica.example). It comes from
@@ -80,6 +83,7 @@ func NewOutboundReplier(cfg OutboundReplierConfig) *OutboundReplier {
 	}
 	r := &OutboundReplier{
 		senders:     cfg.Senders,
+		languages:   cfg.Languages,
 		appURL:      strings.TrimRight(cfg.AppURL, "/"),
 		bindingPath: bindingPath,
 		logger:      logger,
@@ -98,19 +102,28 @@ func NewOutboundReplier(cfg OutboundReplierConfig) *OutboundReplier {
 // logged, not propagated: the replier runs detached from the inbound ACK
 // path (the engine.Router owns that goroutine).
 func (r *OutboundReplier) Reply(ctx context.Context, inst engine.ResolvedInstallation, msg channel.InboundMessage, res engine.Result) {
+	// These notices land in the room the message came from, so the room
+	// decides the language — not whichever member happened to trigger them.
+	//
+	// The binding prompt is the one thing here addressed to a person rather
+	// than the room, and it needs no separate resolution: its reader is
+	// unbound by definition, so they have no profile to consult and get the
+	// same deployment default the room does.
+	c := copyFor(localeFor(ctx, r.languages, inst.ID, aibotChatTypeFromChannel(msg.Source.ChatType), msg.Source.SenderID))
+
 	switch res.Outcome {
 	case engine.OutcomeNeedsBinding:
-		if err := r.sendBindingPrompt(ctx, inst, msg, res); err != nil {
+		if err := r.sendBindingPrompt(ctx, inst, msg, res, c); err != nil {
 			r.logger.WarnContext(ctx, "wecom replier: binding prompt failed",
 				"installation_id", util.UUIDToString(inst.ID), "error", err)
 		}
 	case engine.OutcomeAgentOffline:
-		if err := r.post(ctx, inst, msg, agentOfflineText); err != nil {
+		if err := r.post(ctx, inst, msg, c.AgentOffline); err != nil {
 			r.logger.WarnContext(ctx, "wecom replier: offline notice failed",
 				"installation_id", util.UUIDToString(inst.ID), "error", err)
 		}
 	case engine.OutcomeAgentArchived:
-		if err := r.post(ctx, inst, msg, agentArchivedText); err != nil {
+		if err := r.post(ctx, inst, msg, c.AgentArchived); err != nil {
 			r.logger.WarnContext(ctx, "wecom replier: archived notice failed",
 				"installation_id", util.UUIDToString(inst.ID), "error", err)
 		}
@@ -119,15 +132,27 @@ func (r *OutboundReplier) Reply(ctx context.Context, inst engine.ResolvedInstall
 		// chat message stays silent (the agent's own reply lands via
 		// EventChatDone / Channel.Send).
 		if res.IssueID.Valid {
-			if err := r.post(ctx, inst, msg, issueCreatedText(res)); err != nil {
-				r.logger.WarnContext(ctx, "wecom replier: issue-created confirmation failed",
-					"installation_id", util.UUIDToString(inst.ID), "error", err)
+			// The engine reports a duplicate by carrying the OTHER issue's
+			// id, number and title with IssueDuplicate set. Answering both
+			// cases with the created copy told the reporter their bug was
+			// filed under a number somebody else opened, under a title they
+			// never wrote — so they stopped chasing it and the report was
+			// lost. slack/replier.go:125 and dingtalk/replier.go:125 both
+			// branch here; WeCom was the one that did not.
+			text := issueCreatedText(res, c)
+			if res.IssueDuplicate {
+				text = issueDuplicateText(res, c)
+			}
+			if err := r.post(ctx, inst, msg, text); err != nil {
+				r.logger.WarnContext(ctx, "wecom replier: issue confirmation failed",
+					"installation_id", util.UUIDToString(inst.ID),
+					"duplicate", res.IssueDuplicate, "error", err)
 			}
 		}
 	}
 }
 
-func (r *OutboundReplier) sendBindingPrompt(ctx context.Context, inst engine.ResolvedInstallation, msg channel.InboundMessage, res engine.Result) error {
+func (r *OutboundReplier) sendBindingPrompt(ctx context.Context, inst engine.ResolvedInstallation, msg channel.InboundMessage, res engine.Result, c copyPack) error {
 	sender := res.Sender
 	if sender == "" {
 		sender = msg.Source.SenderID
@@ -156,10 +181,10 @@ func (r *OutboundReplier) sendBindingPrompt(ctx context.Context, inst engine.Res
 	// telling the reader to go to a chat they are already reading. Only the
 	// group ack further down runs in the room, and it is the one that names
 	// the 1:1.
-	text := "👋 绑定链接刚才已经发给你了，就在上方，请直接点击完成绑定。"
+	text := c.BindingPending
 	if !token.Reused {
 		bindURL := r.appURL + r.bindingPath + "?token=" + url.QueryEscape(token.Raw)
-		text = "👋 请先绑定你的 Multica 账号，才能与我对话：\n" + bindURL + "\n（链接 15 分钟内有效）"
+		text = c.BindingPromptPrefix + bindURL + c.BindingPromptSuffix
 	}
 	// A binding token is a bearer credential: binding.Redeem only checks that
 	// the redeemer belongs to the token's workspace, and the bind page redeems
@@ -178,7 +203,7 @@ func (r *OutboundReplier) sendBindingPrompt(ctx context.Context, inst engine.Res
 	// send is accepted, so the room is never pointed at a message the wire
 	// refused. A 1:1 trigger already received the prompt in its only room.
 	if aibotChatTypeFromChannel(msg.Source.ChatType) == chatTypeGroupInt {
-		return r.post(ctx, inst, msg, "👋 已把绑定链接私发给你，请在与我的单聊里点击完成绑定。")
+		return r.post(ctx, inst, msg, c.BindingSentPrivately)
 	}
 	return nil
 }
@@ -226,14 +251,31 @@ func (r *OutboundReplier) post(ctx context.Context, inst engine.ResolvedInstalla
 	return sender.sendTextCtx(ctx, chatID, chatType, text)
 }
 
-func issueCreatedText(res engine.Result) string {
-	id := res.IssueIdentifier
-	if id == "" {
-		id = fmt.Sprintf("#%d", res.IssueNumber)
+// issueDuplicateText answers a /issue the engine refused because an active
+// issue already covers it. It names the OTHER issue, which is the whole point:
+// the reporter needs to know where the discussion already is, not to be handed
+// an id they will read as their own.
+//
+// That title belongs to the pre-existing issue, so it is text some other member
+// wrote, and the reply ships as markdown — which is why the pack's renderer
+// runs it through breakMemberLinks. See markdown.go.
+func issueDuplicateText(res engine.Result, c copyPack) string {
+	return c.issueDuplicate(issueRef(res), res.IssueTitle)
+}
+
+// issueCreatedText answers a /issue the engine accepted. The title is the
+// reporter's own text and this confirmation goes back into the chat that
+// triggered it — in a group, in front of the room — so the pack breaks its
+// links before it goes out. See copyPack.issueCreated.
+func issueCreatedText(res engine.Result, c copyPack) string {
+	return c.issueCreated(issueRef(res), res.IssueTitle)
+}
+
+// issueRef is how an issue is named in a confirmation: its identifier when the
+// engine produced one, its number otherwise.
+func issueRef(res engine.Result) string {
+	if res.IssueIdentifier != "" {
+		return res.IssueIdentifier
 	}
-	title := strings.TrimSpace(res.IssueTitle)
-	if title == "" {
-		return "✅ 已创建 " + id
-	}
-	return "✅ 已创建 " + id + " — " + title
+	return fmt.Sprintf("#%d", res.IssueNumber)
 }

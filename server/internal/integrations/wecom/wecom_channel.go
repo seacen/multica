@@ -89,6 +89,11 @@ type wecomChannel struct {
 	// itself on entry and clear on exit. nil in tests that don't exercise
 	// the OutboundReplier path.
 	senders *sendersRegistry
+
+	// languages resolves a destination to the language this connection's own
+	// copy is written in — here, the receipt for a message kind we cannot
+	// read. Nil means everyone reads the deployment default.
+	languages languageLookup
 }
 
 var _ channel.Channel = (*wecomChannel)(nil)
@@ -400,8 +405,14 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 			// reads as a broken bot, so answer the same chat with a one-line
 			// receipt and stop. Best-effort: a send failure degrades to the
 			// prior silent drop.
+			//
+			// The receipt is addressed to whoever sent the unreadable message,
+			// so in a 1:1 it reads their profile language; a group has no
+			// shared profile and reads the deployment's (language.go).
+			chatType := aibotChatTypeFromChannel(msg.Source.ChatType)
+			cp := copyFor(localeFor(ctx, c.languages, c.installationID, chatType, msg.Source.SenderID))
 			log.Debug("wecom: unsupported message kind, replying with a receipt", "msg_type", mc.MsgType, "msg_id", mc.MsgID)
-			if err := sender.sendText(msg.Source.ChatID, aibotChatTypeFromChannel(msg.Source.ChatType), unsupportedMsgTypeReceipt); err != nil {
+			if err := sender.sendText(msg.Source.ChatID, chatType, cp.UnsupportedMsgType); err != nil {
 				log.Debug("wecom: unsupported-kind receipt send failed", "error", err, "msg_id", mc.MsgID)
 			}
 			return nil
@@ -532,6 +543,10 @@ type ChannelDeps struct {
 	// constructor. Nil in tests that don't exercise outbound.
 	Senders *sendersRegistry
 
+	// Languages resolves a destination to its copy language (language.go).
+	// Nil puts every reader on the deployment default.
+	Languages languageLookup
+
 	// Dialer overrides the default gorilla dialer. Tests point it at an
 	// httptest server; production leaves this nil.
 	Dialer Dialer
@@ -582,6 +597,7 @@ func newWecomFactory(deps ChannelDeps) channel.Factory {
 			wsURL:          deps.WSURL,
 			logger:         logger,
 			senders:        deps.Senders,
+			languages:      deps.Languages,
 		}, nil
 	}
 }
