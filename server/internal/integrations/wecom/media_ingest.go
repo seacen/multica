@@ -153,6 +153,19 @@ func (r *wecomMediaResolver) ResolveMedia(ctx context.Context, inst engine.Resol
 		msg.MediaRefs = append(msg.MediaRefs, ref)
 	}
 
+	// When the Router's media budget ran out under us, the Router follows with
+	// NotifyMediaAbandoned — and that says the same sentence, because from
+	// where the sender is sitting it is the same event. Saying it here as well
+	// gives them the identical apology twice in a row, which reads as the bot
+	// glitching rather than as one attachment that did not make it.
+	//
+	// Only the line the Router is about to repeat is dropped. A "too big"
+	// verdict was reached on its own merits before the clock ran out, and it
+	// is the one the sender can actually act on, so it still goes.
+	if ctx.Err() != nil {
+		failures = withoutNotice(failures, mediaUnreadableNotice)
+	}
+
 	r.tellTheSender(inst, wm, failures)
 	return msg
 }
@@ -363,6 +376,53 @@ func appendFailure(list []mediaFailure, f mediaFailure) []mediaFailure {
 	return append(list, f)
 }
 
+// noticeFor is the one place a failure kind becomes a sentence. Two kinds
+// share the unreadable wording, so anything that reasons about which failures
+// would read the same to the sender — withoutNotice below, tellTheSender's own
+// dedupe — has to ask here rather than re-derive the mapping and drift from it.
+//
+// mediaFailureBlocked lands on the unreadable wording deliberately. From the
+// sender's side a refused address and a download that fell over are the same
+// event — the attachment did not arrive — and the thing that separates them is
+// what the operator must change, which belongs in the log. Neither the
+// resolved address nor the signed url goes into a chat message.
+func noticeFor(f mediaFailure) string {
+	if f == mediaFailureTooLarge {
+		return mediaTooLargeNotice
+	}
+	return mediaUnreadableNotice
+}
+
+// withoutNotice drops every kind that would say notice, leaving the rest in
+// order. It filters by the sentence rather than by the kind because the
+// sender reads sentences: dropping mediaFailureUnreadable while leaving
+// mediaFailureBlocked in the list would still print the same line twice.
+func withoutNotice(list []mediaFailure, notice string) []mediaFailure {
+	out := list[:0]
+	for _, f := range list {
+		if noticeFor(f) != notice {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// NotifyMediaAbandoned answers engine.MediaAbandonNotifier: the Router's own
+// media budget expired, so this resolver either never ran or was cut off, saw
+// no failure of its own, and would otherwise say nothing at all.
+//
+// The sender gets the same line as an attachment that could not be read,
+// because from where they are sitting it is the same event and the same
+// remedy: the picture did not get through, send it again. Which side of the
+// seam ran out of time is ours to know and theirs not to care about.
+func (r *wecomMediaResolver) NotifyMediaAbandoned(_ context.Context, inst engine.ResolvedInstallation, msg channel.InboundMessage) {
+	wm, err := wecomMsgFromRaw(msg)
+	if err != nil || len(wm.Media) == 0 {
+		return
+	}
+	r.tellTheSender(inst, wm, []mediaFailure{mediaFailureUnreadable})
+}
+
 // tellTheSender writes one short notice into the chat the attachments came
 // from, over the same live aibot socket every other wecom message uses.
 //
@@ -396,21 +456,12 @@ func (r *wecomMediaResolver) tellTheSender(inst engine.ResolvedInstallation, wm 
 	}
 	lines := make([]string, 0, len(failures))
 	for _, f := range failures {
-		notice := mediaUnreadableNotice
-		if f == mediaFailureTooLarge {
-			notice = mediaTooLargeNotice
-		}
-		// mediaFailureBlocked lands on the unreadable wording deliberately.
-		// From the sender's side a refused address and a download that fell
-		// over are the same event — the attachment did not arrive — and the
-		// thing that separates them is what the operator must change, which
-		// belongs in the log. Neither the resolved address nor the signed url
-		// goes into a chat message.
-		//
-		// Two kinds sharing one wording is why the dedupe moved here from
-		// appendFailure: a message with one blocked and one unreadable
-		// attachment is still one piece of news.
-		if !slices.Contains(lines, notice) {
+		// Deduped by sentence, not by kind: two kinds share the unreadable
+		// wording (see noticeFor), so a message with one blocked and one
+		// unreadable attachment is still one piece of news. That is why the
+		// dedupe is here rather than in appendFailure, which the operator log
+		// needs kept per-kind.
+		if notice := noticeFor(f); !slices.Contains(lines, notice) {
 			lines = append(lines, notice)
 		}
 	}

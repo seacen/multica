@@ -580,6 +580,18 @@ func (r *Router) resolveAndBindMedia(set ResolverSet, inst ResolvedInstallation,
 			"event_id", msg.EventID,
 			"message_id", msg.MessageID,
 			"error", err)
+		// The log above is the only record of this, and the person who sent
+		// the attachment cannot read it. The resolver saw no failure — it was
+		// cut off, or never started — so the notice it owns will not fire
+		// either, and the whole turn goes by without anyone saying the photo
+		// did not arrive. Tell it, on the finalize context, since the one that
+		// just expired cannot carry a message out.
+		//
+		// A resolver that does not implement the interface is left untouched:
+		// the assertion misses and nothing else on this path changes.
+		if notifier, ok := set.Media.(MediaAbandonNotifier); ok {
+			notifier.NotifyMediaAbandoned(finalizeCtx, inst, msg)
+		}
 	}
 	bindErr := set.Session.BindMedia(finalizeCtx, BindMediaParams{
 		MessageID:            chatMessageID,
