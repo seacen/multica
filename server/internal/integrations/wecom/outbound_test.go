@@ -37,6 +37,8 @@ type fakeOutboundQueries struct {
 	memberErr      error
 	workspace      db.Workspace
 	workspaceErr   error
+	attachments    []db.Attachment
+	attachmentsErr error
 
 	// userLanguage is what every user row this fake returns says its profile
 	// language is, and userBindingID the Multica user a channel user id
@@ -78,6 +80,9 @@ func (f *fakeOutboundQueries) FindChannelBindingForMember(context.Context, db.Fi
 }
 func (f *fakeOutboundQueries) GetWorkspace(context.Context, pgtype.UUID) (db.Workspace, error) {
 	return f.workspace, f.workspaceErr
+}
+func (f *fakeOutboundQueries) ListAttachmentsByChatMessage(context.Context, db.ListAttachmentsByChatMessageParams) ([]db.Attachment, error) {
+	return f.attachments, f.attachmentsErr
 }
 
 func (f *fakeOutboundQueries) GetChannelUserBindingByUserID(context.Context, db.GetChannelUserBindingByUserIDParams) (db.ChannelUserBinding, error) {
