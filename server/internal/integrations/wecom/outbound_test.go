@@ -38,6 +38,16 @@ type fakeOutboundQueries struct {
 	workspace      db.Workspace
 	workspaceErr   error
 
+	// userLanguage is what every user row this fake returns says its profile
+	// language is, and userBindingID the Multica user a channel user id
+	// resolves to. Both zero by default, which is a reader with no profile —
+	// the deployment default, and what every test that predates the copy pack
+	// expects to keep seeing.
+	userLanguage  string
+	userBindingID pgtype.UUID
+	userErr       error
+	userBindErr   error
+
 	// channelIngested is what TaskInputIsChannelIngested resolves to. The
 	// default is false — a task nobody said came from WeCom did not — so a
 	// test that expects delivery has to say so, the same way production has
@@ -68,6 +78,20 @@ func (f *fakeOutboundQueries) FindChannelBindingForMember(context.Context, db.Fi
 }
 func (f *fakeOutboundQueries) GetWorkspace(context.Context, pgtype.UUID) (db.Workspace, error) {
 	return f.workspace, f.workspaceErr
+}
+
+func (f *fakeOutboundQueries) GetChannelUserBindingByUserID(context.Context, db.GetChannelUserBindingByUserIDParams) (db.ChannelUserBinding, error) {
+	if f.userBindErr != nil {
+		return db.ChannelUserBinding{}, f.userBindErr
+	}
+	return db.ChannelUserBinding{MulticaUserID: f.userBindingID}, nil
+}
+
+func (f *fakeOutboundQueries) GetUser(_ context.Context, id pgtype.UUID) (db.User, error) {
+	if f.userErr != nil {
+		return db.User{}, f.userErr
+	}
+	return db.User{ID: id, Language: pgtype.Text{String: f.userLanguage, Valid: f.userLanguage != ""}}, nil
 }
 
 func newOutboundWithConn(t *testing.T, q outboundQueries) (*Outbound, pgtype.UUID, *recordingConn) {
