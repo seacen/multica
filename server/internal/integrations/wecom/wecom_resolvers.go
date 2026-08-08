@@ -43,16 +43,20 @@ func wecomMsgFromRaw(msg channel.InboundMessage) (InboundMessage, error) {
 }
 
 // NewResolverSet assembles the wecom ResolverSet from the store, the shared
-// chat-session service, an outbound replier and the typing indicator.
+// chat-session service, an outbound replier, the media resolver and the typing
+// indicator.
 //
-// The last two are optional: pass nil to disable outbound binding prompts or
-// the streaming bubble. Both are taken as concrete types rather than
-// interfaces so a nil argument leaves the field nil instead of a typed-nil
-// interface the Router would happily call.
+// The last three are optional. Pass nil to disable outbound binding prompts;
+// pass nil for media when no object-storage backend is configured, and inbound
+// attachments degrade to their placeholder text; pass nil for typing to
+// disable the streaming bubble. Replier and typing are taken as concrete types
+// rather than interfaces so a nil argument leaves the field nil instead of a
+// typed-nil interface the Router would happily call.
 func NewResolverSet(
 	store *Store,
 	session engineSessionBinder,
 	replier engine.OutboundReplier,
+	media engine.MediaResolver,
 	typing *TypingIndicatorManager,
 ) engine.ResolverSet {
 	set := engine.ResolverSet{
@@ -62,6 +66,13 @@ func NewResolverSet(
 		Session:      &sessionBinder{session: session},
 		Audit:        &auditor{store: store},
 		OriginType:   originWecomChat,
+		// Assigned straight through: media is already an interface, so a nil
+		// argument lands as a nil interface and the Router's `set.Media !=
+		// nil` guard holds. (DingTalk guards the same assignment with an if,
+		// which is redundant for that same reason — its media parameter is an
+		// engine.MediaResolver too. The typed-nil hazard there is on the if
+		// above it, where ack is a concrete *ackNotifier.)
+		Media: media,
 	}
 	if replier != nil {
 		set.Replier = replier
@@ -79,6 +90,7 @@ func NewResolverSet(
 type engineSessionBinder interface {
 	EnsureSession(ctx context.Context, in engine.EnsureSessionInput) (pgtype.UUID, error)
 	AppendUserMessage(ctx context.Context, in engine.AppendInput) (engine.AppendResult, error)
+	BindMediaRefs(ctx context.Context, in engine.BindMediaInput) error
 }
 
 // ---- installation routing ----
@@ -228,17 +240,35 @@ func (r *sessionBinder) AppendMessage(ctx context.Context, p engine.AppendParams
 		CommandText:    p.Message.Text, // wecom has no enrichment; command == body
 		MessageID:      p.Message.MessageID,
 		ClaimToken:     p.ClaimToken,
+		// How long the chat task waits before it runs. Without this the run
+		// fires the moment the message lands and the agent is handed the
+		// "[Image]" placeholder while the download is still going.
+		MediaPendingSeconds: p.MediaPendingSeconds,
 	})
 }
 
-// BindMedia is a no-op for wecom. The wecom ResolverSet registers no
-// MediaResolver, so the Router never resolves media for a wecom message
-// (resolveMedia stays false) and this method is never called at runtime; it
-// exists only to satisfy engine.SessionBinder. If wecom gains inbound media
-// support, wire this to a BindMediaRefs on the session store, mirroring the
-// lark binder.
+// BindMedia attaches the objects the resolver stored to the message they came
+// with. Until the media resolver existed this was correctly a no-op — there
+// was nothing to bind — and returning nil reads to the Router as "bound
+// fine", so leaving it that way once media resolves means every attachment is
+// downloaded, decrypted, stored, and then silently discarded.
+//
+// IssueID is what makes an /issue turn's attachments belong to the issue
+// rather than to the chat message that created it; the other issue fields are
+// what let the description reference them. Feishu passes all of them
+// (lark/feishu_resolvers.go:223).
 func (r *sessionBinder) BindMedia(ctx context.Context, p engine.BindMediaParams) error {
-	return nil
+	return r.session.BindMediaRefs(ctx, engine.BindMediaInput{
+		MessageID:            p.MessageID,
+		SessionID:            p.SessionID,
+		WorkspaceID:          p.WorkspaceID,
+		Sender:               p.Sender,
+		IssueID:              p.IssueID,
+		IssueDescriptionBase: p.IssueDescriptionBase,
+		IssueCommandText:     p.IssueCommandText,
+		Body:                 p.Body,
+		MediaRefs:            p.MediaRefs,
+	})
 }
 
 // ---- audit ----
