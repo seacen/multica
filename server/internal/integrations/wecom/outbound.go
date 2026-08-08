@@ -44,6 +44,10 @@ import (
 // subscriber needs. *db.Queries satisfies it.
 type outboundQueries interface {
 	GetChannelChatSessionBindingBySession(ctx context.Context, arg db.GetChannelChatSessionBindingBySessionParams) (db.ChannelChatSessionBinding, error)
+	// GetAgentTask has two readers. The origin gate loads the task to find
+	// the input batch it answers, and the round matcher resolves an auto-retry
+	// clone back to the turn that owns that batch — which is the id the round
+	// was bound under.
 	GetAgentTask(ctx context.Context, id pgtype.UUID) (db.AgentTaskQueue, error)
 	TaskHasChannelIngestedMessages(ctx context.Context, taskID pgtype.UUID) (bool, error)
 	GetChannelInstallation(ctx context.Context, arg db.GetChannelInstallationParams) (db.ChannelInstallation, error)
@@ -59,7 +63,9 @@ type outboundQueries interface {
 // event bus; sessions with no wecom binding are silently ignored.
 type Outbound struct {
 	q       outboundQueries
+	tasks   taskLookup
 	senders *sendersRegistry
+	streams *streamStore
 	logger  *slog.Logger
 }
 
@@ -68,11 +74,14 @@ type Outbound struct {
 // built with — reply delivery goes through the live wsSender for the
 // binding's installation, so a session whose Supervisor lost the lease
 // mid-flight silently drops rather than opening a second connection.
-func NewOutbound(q outboundQueries, senders *sendersRegistry, logger *slog.Logger) *Outbound {
+//
+// streams is the same store the typing indicator writes to; nil disables the
+// in-place reply and leaves every answer going out as a new message.
+func NewOutbound(q outboundQueries, senders *sendersRegistry, streams *streamStore, logger *slog.Logger) *Outbound {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Outbound{q: q, senders: senders, logger: logger}
+	return &Outbound{q: q, tasks: q, senders: senders, streams: streams, logger: logger}
 }
 
 // Register subscribes to the chat-done event on the bus.
@@ -111,24 +120,19 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 		}
 		return fmt.Errorf("wecom: lookup chat binding: %w", err)
 	}
-	content := chatDoneContent(e.Payload)
-	if content == "" {
-		return nil // nothing to say (empty completion)
-	}
-	// Only bound, non-empty completions reach here, so classify the task
-	// origin before loading credentials or sending. A question asked in the
-	// Multica web UI can reuse a session that originated in WeCom — and its
-	// answer belongs only in Multica. Without this gate that answer is pushed
-	// into the WeCom chat, which in a group means in front of everyone in the
-	// room. slack/outbound.go:118 and the lark and dingtalk equivalents all
-	// gate here; WeCom was the one that did not.
+	// Classify the task origin next. A question asked in the Multica web UI
+	// can reuse a session that originated in WeCom — and its answer belongs
+	// only in Multica. Without this gate that answer is pushed into the WeCom
+	// chat, which in a group means in front of everyone in the room.
+	// slack/outbound.go:118 and the lark and dingtalk equivalents all gate
+	// here; WeCom was the one that did not.
 	//
 	// Fails closed: an origin we cannot establish is not delivered.
 	//
-	// Everything above this point is a read. Keep it that way: the gate has to
-	// stay ahead of anything that consumes or mutates WeCom-side state for the
-	// turn, because an answer that must not reach the room must not take over
-	// the room's message either.
+	// It sits AHEAD of takeStream, and that ordering is the point rather than
+	// an accident of layout: taking the round consumes it, and an answer that
+	// must not reach the room must not take over the room's bubble either.
+	// Everything above this line is a read; keep it that way.
 	taskID, ok := chatDoneTaskID(e)
 	if !ok {
 		return nil
@@ -148,6 +152,37 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 	if !deliver {
 		return nil
 	}
+
+	content := chatDoneContent(e.Payload)
+
+	// The bubble this run's round opened, if there is one. Taken up front and
+	// unconditionally: from here on this turn owns it, and a handle left in
+	// the store after the turn ends is a handle pointing at a sealed message.
+	if handle, streaming := o.takeStream(ctx, sessionID, e); streaming {
+		// A bubble on screen has to end in words. An empty completion is a
+		// legitimate outcome — the agent had nothing to add — but an endless
+		// spinner is not, so the copy stands in for the silence. For a round
+		// that waited in line behind another, the silence has a better
+		// explanation: the reply ahead of it already covered this message.
+		text := content
+		if !hasVisibleChar(text) {
+			text = streamCopyNoReply
+			if handle.QueuedBehind {
+				text = streamCopyMerged
+			}
+		}
+		if err := o.finishStream(ctx, handle, text); err == nil {
+			return nil
+		}
+		// The frame was refused. Say it as a new message instead — and never
+		// re-send the stream frame itself, whose req_id will have expired long
+		// before another connection could carry it.
+		content = text
+	}
+	if content == "" {
+		return nil // nothing to say, no bubble to close, nothing to send
+	}
+
 	inst, err := o.q.GetChannelInstallation(ctx, db.GetChannelInstallationParams{
 		ID:          binding.InstallationID,
 		ChannelType: channelTypeWecom,
@@ -175,7 +210,55 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 		return errors.New("wecom: connection not ready on this replica")
 	}
 	chatType := aibotChatTypeFromChannel(channel.ChatType(binding.ChatType))
-	return sender.sendTextCtx(ctx, binding.ChannelChatID, chatType, content)
+	if err := sender.sendTextCtx(ctx, binding.ChannelChatID, chatType, content); err != nil {
+		return err
+	}
+	// The answer went out as an ordinary message. For a round the guard closed
+	// at five minutes that message IS the separate reply it promised, so the
+	// promise is now kept and has to come off the list — by this run's own id,
+	// leaving a promise another round is still waiting on exactly where it is.
+	// Left on the list it would be claimed by the next repeat of this run's
+	// failure, which would tell the user "这次没跑通" underneath the answer they
+	// have just read.
+	o.rounds().settle(ctx, sessionID, taskIDFromEvent(e), roundAddress{
+		InstallationID: inst.ID,
+		ChatID:         binding.ChannelChatID,
+		ChatType:       chatType,
+	})
+	return nil
+}
+
+// rounds builds the matcher that turns a task id on an event into the round it
+// belongs to — the same one the typing indicator's endings go through.
+func (o *Outbound) rounds() roundTaker {
+	return roundTaker{streams: o.streams, tasks: o.tasks, log: o.logger}
+}
+
+// takeStream claims the bubble this run's round opened, so the answer can
+// replace it in place. The task id picks it — the one the debounced flush
+// bound to the round when it created the run — so a session with several
+// rounds open never has to guess which bubble an answer belongs in, and an
+// auto-retry's answer still finds the round its first attempt opened.
+func (o *Outbound) takeStream(ctx context.Context, sessionID pgtype.UUID, e events.Event) (streamHandle, bool) {
+	if o.streams == nil || o.senders == nil {
+		return streamHandle{}, false
+	}
+	return o.rounds().take(ctx, sessionID, taskIDFromEvent(e), roundOver)
+}
+
+// finishStream writes the answer into the bubble and seals it. A failure here
+// is not fatal to the reply — it means the caller falls back to a new message —
+// so it is logged with the one detail that explains it: whether the stream is
+// beyond saving (past its window, bad req_id) or the socket simply blinked.
+func (o *Outbound) finishStream(ctx context.Context, h streamHandle, text string) error {
+	err := o.senders.stream(ctx, h, text, true)
+	if err == nil {
+		return nil
+	}
+	o.logger.WarnContext(ctx, "wecom outbound: in-place reply failed, sending a new message instead",
+		"installation_id", uuidStringPub(h.InstallationID),
+		"stream_unusable", streamUnusable(err), "error", err)
+	return err
 }
 
 // chatDoneTaskID recovers the task id an EventChatDone belongs to. The
