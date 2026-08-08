@@ -6,12 +6,6 @@ package wecom
 // msgtype normalization, and the outbound send-body shape.
 
 import (
-	// The engine package is imported ONCE, in the group below. Two open
-	// branches each add it, one right here and one down there, and a
-	// line-wise merge keeps both — a duplicate import, which does not
-	// compile and which git reports as a clean merge. This comment holds
-	// the line the other one lands on, so the pair collides as a conflict
-	// somebody reads instead of as a build failure somebody debugs.
 	"testing"
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
