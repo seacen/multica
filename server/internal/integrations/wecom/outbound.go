@@ -131,16 +131,7 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 		}
 		// The frame was refused. Say it as a new message instead — and never
 		// re-send the stream frame itself, whose req_id will have expired long
-		// before another connection could carry it.
-		//
-		// Counted, because from outside the two endings are
-		// indistinguishable: the user gets the answer either way, and nobody
-		// reports "the bubble I was watching turned into a separate message".
-		// A bubble that has stopped working at all — a WeCom-side change to
-		// the stream frame, a req_id convention that drifted — shows up as
-		// this number climbing to meet stream_finished, and nowhere else.
-		// senders is non-nil here: takeStream returns false without it.
-		o.senders.mx().RecordStreamFellBack()
+		// before another connection could carry it. finishStream counted it.
 		content = text
 	}
 	if content == "" {
@@ -226,13 +217,21 @@ func (o *Outbound) takeStream(ctx context.Context, sessionID pgtype.UUID, e even
 // beyond saving (past its window, bad req_id) or the socket simply blinked.
 //
 // The success is counted inside sendersRegistry.stream, which every bubble
-// closer goes through; the fall-back is counted at the branch below, which is
-// the only place it happens.
+// closer goes through; the fall-back is counted here, next to the attempt that
+// failed, rather than in the caller. Counted at all because from outside the
+// two endings are indistinguishable: the user gets the answer either way, and
+// nobody reports "the bubble I was watching turned into a separate message". A
+// bubble that has stopped working at all — a WeCom-side change to the stream
+// frame, a req_id convention that drifted — shows up as this number climbing
+// to meet stream_finished, and nowhere else.
+//
+// senders is non-nil here: takeStream returns false without it.
 func (o *Outbound) finishStream(ctx context.Context, h streamHandle, text string) error {
 	err := o.senders.stream(ctx, h, text, true)
 	if err == nil {
 		return nil
 	}
+	o.senders.mx().RecordStreamFellBack()
 	o.logger.WarnContext(ctx, "wecom outbound: in-place reply failed, sending a new message instead",
 		"installation_id", uuidStringPub(h.InstallationID),
 		"stream_unusable", streamUnusable(err), "error", err)
