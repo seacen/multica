@@ -287,7 +287,37 @@ func TestAttachmentSendFailureNoticeReadsTheDestinationsLanguage(t *testing.T) {
 	}
 }
 
-// ---- surface 4: the read loop's own receipt ----
+// ---- surface 4: the streaming bubble ----
+
+// TestTheBubbleClosesInTheAskersLanguage drives the real open-then-close path.
+// The language is resolved when the bubble is opened and carried on the
+// handle, because every closer runs later from an event that names a task and
+// nobody else — so a closer that reached for the deployment default instead
+// would look right in isolation and be wrong for every reader who set a
+// language.
+func TestTheBubbleClosesInTheAskersLanguage(t *testing.T) {
+	t.Parallel()
+	for _, tc := range localeCases {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newBubbleRig(t)
+			// ask() sends as USER_1 in a 1:1, so the bubble belongs to one
+			// person and reads their profile.
+			rig.typing.languages = fakeLanguages{senderID: "USER_1", userID: localeTestUserID, language: tc.language}
+			rig.ran(t, "REQ-L", 1, "task-1")
+			rig.answer(t, "   \n ", "task-1")
+
+			frames := rig.conn.streamFrames(t)
+			if len(frames) != 2 {
+				t.Fatalf("got %d stream frames, want 2 (open + seal)", len(frames))
+			}
+			if got, want := frames[1]["content"], copyPacks[tc.locale].StreamNoReply; got != want {
+				t.Fatalf("closing copy = %q, want the %s copy %q", got, tc.locale, want)
+			}
+		})
+	}
+}
+
+// ---- surface 5: the read loop's own receipt ----
 
 func TestUnreadableKindReceiptReadsTheSendersLanguage(t *testing.T) {
 	t.Parallel()

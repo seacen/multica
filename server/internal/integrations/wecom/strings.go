@@ -159,6 +159,39 @@ type copyPack struct {
 	// under a title they never wrote, for a report that was never filed.
 	IssueDuplicatePrefix string
 
+	// The ways a streaming reply ends in something other than an answer. Each
+	// one closes the loading bubble the question opened, so each one has to
+	// carry visible text — WeCom discards a closing frame it considers empty
+	// and the bubble spins on forever (see hasVisibleChar in ws_frame.go).
+	//
+	// StreamNoReply — the agent finished with nothing to say.
+	// StreamMerged — a QUEUED round's run finished with nothing of its own to
+	//   say; the reply ahead of it already covered this message. A first
+	//   round's empty finish keeps StreamNoReply, which has no earlier answer
+	//   to point at.
+	// StreamNotStarted — no run was triggered at all (agent offline or
+	//   archived, or the enqueue failed); the replier's own notice follows as
+	//   a separate message with the detail.
+	// StreamFailed — the run failed.
+	// StreamCancelled — the user stopped the run, so no answer is coming.
+	//   Separate copy from StreamFailed on purpose: inviting a retry of
+	//   something somebody just stopped on purpose reads as the bot not having
+	//   noticed.
+	// StreamStillWorking — the run outlived the protocol's stream window, so
+	//   we close the bubble ourselves and answer separately later.
+	// StreamNoReplyWithFiles — the agent finished with no words but produced
+	// files, which arrive as separate messages right after this one. Distinct
+	// from StreamNoReply because that copy says nothing is coming, and then
+	// something arrives: a bubble that contradicts the next message reads as a
+	// bug even though both halves are working.
+	StreamNoReply          string
+	StreamNoReplyWithFiles string
+	StreamMerged           string
+	StreamNotStarted       string
+	StreamFailed           string
+	StreamCancelled        string
+	StreamStillWorking     string
+
 	// InboxDetailLink is the anchor text on the inbox card's deep link;
 	// InboxTypeLabels names each notification kind, with InboxTypeFallback
 	// covering a kind this adapter has not been taught yet.
@@ -228,7 +261,16 @@ var copyPacks = map[Locale]copyPack{
 		IssueCreatedPrefix:   "✅ 已创建 ",
 		IssueTitleSeparator:  " — ",
 		IssueDuplicatePrefix: "⚠️ 未创建 —— 已存在进行中的 ",
-		InboxDetailLink:      "查看详情",
+
+		StreamNoReply:          "（这轮没有需要回复的内容）",
+		StreamNoReplyWithFiles: "（这轮没有文字回复，附件在下面）",
+		StreamMerged:           "✅ 这条已并入上一条回复一起处理了。",
+		StreamNotStarted:       "已收到，但这条暂时没能开始处理。",
+		StreamFailed:           "⚠️ 这次没跑通，请稍后再试一次。",
+		StreamCancelled:        "⏹️ 这次处理已取消。",
+		StreamStillWorking:     "还在处理，完成后我再单独回复你。",
+
+		InboxDetailLink: "查看详情",
 		InboxTypeLabels: map[string]string{
 			"issue_assigned":     "任务指派",
 			"mentioned":          "提及你",
@@ -257,7 +299,16 @@ var copyPacks = map[Locale]copyPack{
 		IssueCreatedPrefix:   "✅ Created ",
 		IssueTitleSeparator:  " — ",
 		IssueDuplicatePrefix: "⚠️ Not created — an active issue already covers this: ",
-		InboxDetailLink:      "View details",
+
+		StreamNoReply:          "(nothing to reply with this round)",
+		StreamNoReplyWithFiles: "(no text this round — the files follow)",
+		StreamMerged:           "✅ Handled together with my previous reply.",
+		StreamNotStarted:       "Got it, but this one couldn't start processing.",
+		StreamFailed:           "⚠️ That run didn't go through. Please try again.",
+		StreamCancelled:        "⏹️ That run was cancelled.",
+		StreamStillWorking:     "Still working on it — I'll reply separately when it's done.",
+
+		InboxDetailLink: "View details",
 		InboxTypeLabels: map[string]string{
 			"issue_assigned":     "Assigned",
 			"mentioned":          "Mentioned",

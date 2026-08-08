@@ -20,11 +20,12 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/events"
+	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
-// fakeOutboundQueries is an in-memory stand-in for the four queries Outbound
+// fakeOutboundQueries is an in-memory stand-in for the queries Outbound
 // uses. A nil error field returns the row; a non-nil one is returned as-is
 // (use pgx.ErrNoRows to exercise the "not a wecom session" / "no binding"
 // branches).
@@ -55,14 +56,26 @@ type fakeOutboundQueries struct {
 	// test that expects delivery has to say so, the same way production has
 	// to prove it before pushing into somebody's chat.
 	channelIngested bool
-	taskErr         error
+
+	// tasks answers the retry-clone lookup: the round is bound under the turn
+	// that owns the input batch, and a clone reaches it through
+	// chat_input_task_id. An id it does not hold resolves to a turn that owns
+	// its own batch, which is what everything that is not a retry clone looks
+	// like — and what makes the origin gate ask channelIngested about it.
+	tasks    map[string]db.AgentTaskQueue
+	taskErr  error
+	taskGets int
 }
 
-func (f *fakeOutboundQueries) GetAgentTask(context.Context, pgtype.UUID) (db.AgentTaskQueue, error) {
+func (f *fakeOutboundQueries) GetAgentTask(_ context.Context, id pgtype.UUID) (db.AgentTaskQueue, error) {
+	f.taskGets++
 	if f.taskErr != nil {
 		return db.AgentTaskQueue{}, f.taskErr
 	}
-	return db.AgentTaskQueue{ChatInputTaskID: pgtype.UUID{Bytes: [16]byte{9}, Valid: true}}, nil
+	if task, ok := f.tasks[util.UUIDToString(id)]; ok {
+		return task, nil
+	}
+	return db.AgentTaskQueue{ID: id, ChatInputTaskID: id}, nil
 }
 
 func (f *fakeOutboundQueries) TaskHasChannelIngestedMessages(context.Context, pgtype.UUID) (bool, error) {
@@ -105,7 +118,7 @@ func newOutboundWithConn(t *testing.T, q outboundQueries) (*Outbound, pgtype.UUI
 	instID := mustTestUUID(t)
 	conn := &recordingConn{}
 	reg.set(instID, conn.autoAck(newWSSender(conn, nil)))
-	return NewOutbound(q, reg, slog.Default()), instID, conn
+	return NewOutbound(q, reg, nil, slog.Default()), instID, conn
 }
 
 func TestProcessEvent_DeliversChatReplyToBoundChat(t *testing.T) {
