@@ -119,6 +119,13 @@ func TestWecomBubbleClosersAreWiredOnTheRealBootPath(t *testing.T) {
 				"or the process restarted mid-run — has no chat to speak in, so the user is told nothing and " +
 				"the guard's \"I'll reply separately\" is never answered",
 		},
+		{
+			field: "Identities",
+			wired: wiring.Identities,
+			consequence: "nobody can be recognised as the bot's principal, so every bubble falls to the tier " +
+				"that shows no steps at all — the bubble opens, spins for the length of the run and closes, " +
+				"which is exactly what the in-flight step list exists to stop",
+		},
 	} {
 		if !dep.wired {
 			t.Errorf("the WeCom boot path built its TypingIndicatorManager without %s: %s. "+

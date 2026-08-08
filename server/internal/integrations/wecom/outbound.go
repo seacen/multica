@@ -181,12 +181,19 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 				text = c.StreamMerged
 			}
 		}
-		if err := o.finishStream(ctx, handle, text); err == nil {
-			return nil
+		// A bubble the server disowned mid-run is not written to again: the
+		// typing indicator has already been told this stream takes no frame,
+		// and has already told the user the answer would arrive as a new
+		// message. This is that message.
+		if !handle.Unusable {
+			if err := o.finishStream(ctx, handle, text); err == nil {
+				return nil
+			}
 		}
-		// The frame was refused. Say it as a new message instead — and never
-		// re-send the stream frame itself, whose req_id will have expired long
-		// before another connection could carry it.
+		// The frame was refused, or was never worth attempting. Say it as a new
+		// message instead — and never re-send the stream frame itself, whose
+		// req_id will have expired long before another connection could carry
+		// it.
 		content = text
 	}
 	if content == "" {

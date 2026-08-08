@@ -180,6 +180,25 @@ type streamHandle struct {
 	// minutes after the goroutine that knew who asked is gone.
 	Locale Locale
 
+	// Level is how much of the run this bubble may show while it is still
+	// going (progress_render.go). It is settled when the bubble is opened,
+	// while who asked and where they asked is still known, and read again on
+	// every refresh — the events that drive those refreshes name a task and
+	// nothing about a person.
+	//
+	// Settled PER ROUND, never carried over from the last one: the binding it
+	// is decided from can be revoked, or re-pointed at a different person,
+	// between two questions in the same chat, and the round after that must
+	// not still be showing file paths on the strength of the round before it.
+	Level progressLevel
+
+	// Unusable says the server has disowned this stream (846605 / 846608): the
+	// bubble it painted is on the user's screen and no frame will ever touch
+	// it again, so what is left of the handle is the addressing. A caller that
+	// gets one writes its words as a plain message instead of a frame. Set by
+	// the store on the way out of takeAtLocked.
+	Unusable bool
+
 	CreatedAt time.Time
 }
 
@@ -307,6 +326,18 @@ type roundEntry struct {
 	// guard closes the bubble if nothing else does before the protocol's
 	// stream window runs out.
 	guard *time.Timer
+
+	// feed is the bubble's scrolling list of steps, created on the first one
+	// that reaches it (progress_render.go). It lives here rather than beside
+	// the store's maps so it dies exactly when the round does — a list of a
+	// finished run's tool calls has nothing left to be painted into.
+	feed *progressFeed
+
+	// unusable is the server's verdict that this stream takes no further
+	// frame, kept rather than acted on by forgetting the round. The bubble is
+	// over either way; the round is not, and the handle is the only address
+	// its ending has.
+	unusable bool
 
 	// createdAt bounds the entry for the sweep when there is no handle to read
 	// a time off.
@@ -491,6 +522,12 @@ func (s *streamStore) takeTask(sessionID pgtype.UUID, taskID string, ending roun
 // past maxAge, because the server would refuse the frame and a caller that
 // believed it had a bubble would leave the user with nothing.
 //
+// A DISOWNED handle is handed over rather than withheld, with Unusable set.
+// Its bubble cannot be sealed, but the round still has to end in words and the
+// addressing captured at ingest is what puts them in the right chat. Withholding
+// it would send the caller down the ended-notes path, where the note this call
+// has just filed reads as "already told" and the user hears nothing at all.
+//
 // ending is the caller's account of what it is about to write. Everything but
 // the guard ends the round; the guard's copy promises a separate reply, and the
 // note left behind is what makes that promise keepable — the failure that
@@ -517,7 +554,101 @@ func (s *streamStore) takeAtLocked(key string, i int, ending roundEnding) (strea
 	if !usable {
 		return streamHandle{}, false
 	}
+	entry.handle.Unusable = entry.unusable
 	return entry.handle, true
+}
+
+// feedFor hands out the bubble a run's steps go into, and the list they are
+// folded into, WITHOUT consuming either: a refresh leaves the round exactly
+// where it was, for the answer or the guard to end properly. The list is
+// created on the first step to reach the round.
+//
+// taskID is matched exactly against the run the debounced flush bound to the
+// round (bind). There is no fallback to the head, to the newest round, or to
+// "the only one open" — those are all ways of guessing, and every one of them
+// paints one run's tool calls into another run's bubble. A chat session
+// outlives its turns and the daemon flushes a transcript in arrears, so the
+// previous question's steps really do still arrive after the next question has
+// opened its own bubble.
+//
+// That exact match is also the whole of what a round past its ending gets, and
+// it is the same answer in both of the ways a round can be past it:
+//
+//   - The five-minute guard closed the bubble and the run carried on. The user
+//     has been told the reply is coming separately, so a second bubble now
+//     would put a second spinner in the conversation for a run they already
+//     have an account of — and buy a frame every 1.5s to keep it turning.
+//   - The round is over: answered, cancelled, or failed with nothing being
+//     retried. This is the rule endedRound.finished states for a late-arriving
+//     message, applied to a step for the same reason — a run that is over may
+//     not have a bubble opened later, and a step is a write into a bubble.
+//
+// Neither leaves a round on the list, so both miss here and both write nothing.
+// The recovery paths a MISSING round has — the ended note, the binding row —
+// are deliberately not reachable from a step: they exist so a run's ending is
+// never lost, and a step is not an ending.
+func (s *streamStore) feedFor(sessionID pgtype.UUID, taskID string) (streamHandle, *progressFeed, bool) {
+	if taskID == "" {
+		return streamHandle{}, nil, false
+	}
+	key := util.UUIDToString(sessionID)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.sessions[key] {
+		if r.taskID != taskID {
+			continue
+		}
+		// Three ways a round on the list still has nowhere to put a step. No
+		// bubble: the flush filed the round before the ingest goroutine
+		// painted one, or the opening frame was refused. Past the window: the
+		// server refuses the frame and the ending will fall back to a plain
+		// message. Disowned: another connection owns this conversation now,
+		// and every frame from here is a refusal counted against the whole
+		// bot's rate limit.
+		if !r.painted || r.unusable || s.expiredLocked(r.handle.CreatedAt) {
+			return streamHandle{}, nil, false
+		}
+		if r.feed == nil {
+			r.feed = newProgressFeed(s.now)
+		}
+		return r.handle, r.feed, true
+	}
+	return streamHandle{}, nil, false
+}
+
+// markUnusable records the server's verdict that a round's stream will take no
+// further frame, and reports whether THIS call is the one that recorded it.
+// Only that caller says so to the user; a refresh that raced into the same
+// refusal has nothing to add.
+//
+// This is the stop condition, and the feature is unsafe to ship without it.
+// When another replica or a reconnect takes over a conversation, WeCom refuses
+// writes to the old stream with 846605 / 846608. Refusing once at the end of a
+// run costs one refusal; refusing a refresh every 1.5s costs one per refresh —
+// roughly 400 on a ten-minute run — and the rate limit those spend (45009, api
+// freq out of limit) is per BOT, not per conversation. So one lost bubble in
+// one chat would throttle every other user of the same bot.
+//
+// What it deliberately does not do is forget the round. The bubble is over —
+// feedFor refuses it from here, so no later refresh buys another refusal — but
+// the round is not, and the entry is what the round's ending is addressed with.
+func (s *streamStore) markUnusable(sessionID pgtype.UUID, streamID string) bool {
+	if streamID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.sessions[util.UUIDToString(sessionID)] {
+		if r.painted && r.handle.StreamID == streamID {
+			if r.unusable {
+				return false
+			}
+			r.unusable = true
+			return true
+		}
+	}
+	return false
 }
 
 // remember files where a round was speaking without taking a handle for it —
@@ -642,7 +773,9 @@ func (s *streamStore) remembered() int {
 }
 
 // drop forgets a round without sending anything — used when the opening frame
-// was refused and the bubble the handle describes never existed.
+// was refused and the bubble the handle describes never existed. A bubble the
+// user can already see is never dropped: it is marked instead (markUnusable),
+// so whatever ends the round still knows which chat to say so in.
 func (s *streamStore) drop(sessionID pgtype.UUID, batch engine.RunBatchID) {
 	key := util.UUIDToString(sessionID)
 
@@ -667,7 +800,9 @@ func (s *streamStore) drop(sessionID pgtype.UUID, batch engine.RunBatchID) {
 }
 
 // depth reports how many bubbles are open across all sessions. Diagnostics,
-// tests, and the cheap rejection at the head of the failure subscriber.
+// tests, and the cheap rejection at the head of every bus subscriber — the two
+// endings, and the two transcript events that refresh a bubble, which fire
+// dozens of times per run on every deployment whether it uses WeCom or not.
 func (s *streamStore) depth() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
