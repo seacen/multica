@@ -139,6 +139,19 @@ type copyPack struct {
 	BindingPromptSuffix string
 	BindingPending      string
 
+	// WelcomeBound / WelcomeUnbound* are what a person sees the moment they
+	// open the bot's chat for the first time (welcome.go). Answering nothing
+	// leaves them looking at an empty window with no idea what the bot is for.
+	//
+	// The unbound pair wraps the same bind URL the prompt uses, and for the
+	// same reason it is only ever sent 1:1: the URL carries a bearer token.
+	// WelcomeUnboundPending replaces both when the mint was throttled and
+	// there is no URL to print.
+	WelcomeBound          string
+	WelcomeUnboundPrefix  string
+	WelcomeUnboundSuffix  string
+	WelcomeUnboundPending string
+
 	// BindingSentPrivately is what the ROOM sees when an unbound member
 	// triggers the bot in a group: the prompt itself went to that member's
 	// 1:1 chat, and without this line the group would read the bot as broken.
@@ -258,6 +271,12 @@ var copyPacks = map[Locale]copyPack{
 		BindingPromptSuffix:  "\n（链接 15 分钟内有效）",
 		BindingPending:       "👋 绑定链接刚才已经发给你了，就在上方，请直接点击完成绑定。",
 		BindingSentPrivately: "👋 已把绑定链接私发给你，请在与我的单聊里点击完成绑定。",
+
+		WelcomeBound:          "👋 你好，我是 Multica 智能助手。有事直接发消息给我，或者用 “/issue 标题” 建一条任务。（目前只能处理文字消息）",
+		WelcomeUnboundPrefix:  "👋 你好，我是 Multica 智能助手。请先绑定你的 Multica 账号，才能与我对话：\n",
+		WelcomeUnboundSuffix:  "\n（链接 15 分钟内有效）",
+		WelcomeUnboundPending: "👋 你好，我是 Multica 智能助手。绑定链接刚才已经发给你了，就在上方，请直接点击完成绑定。",
+
 		IssueCreatedPrefix:   "✅ 已创建 ",
 		IssueTitleSeparator:  " — ",
 		IssueDuplicatePrefix: "⚠️ 未创建 —— 已存在进行中的 ",
@@ -296,6 +315,12 @@ var copyPacks = map[Locale]copyPack{
 		BindingPromptSuffix:  "\n(the link is good for 15 minutes)",
 		BindingPending:       "👋 I already sent you a link — it is just above, tap it to finish linking.",
 		BindingSentPrivately: "👋 I've sent the link to your direct chat with me — tap it there to finish linking.",
+
+		WelcomeBound:          "👋 Hi, I'm the Multica assistant. Send me whatever you need, or file a task with “/issue <title>”. (I can only read text messages for now.)",
+		WelcomeUnboundPrefix:  "👋 Hi, I'm the Multica assistant. Link your Multica account before we can talk:\n",
+		WelcomeUnboundSuffix:  "\n(the link is good for 15 minutes)",
+		WelcomeUnboundPending: "👋 Hi, I'm the Multica assistant. I already sent you a link — it is just above, tap it to finish linking.",
+
 		IssueCreatedPrefix:   "✅ Created ",
 		IssueTitleSeparator:  " — ",
 		IssueDuplicatePrefix: "⚠️ Not created — an active issue already covers this: ",
