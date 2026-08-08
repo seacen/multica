@@ -174,6 +174,12 @@ func (r *identityResolver) ResolveSender(ctx context.Context, inst engine.Resolv
 // idempotency invariant is enforced uniformly across channels.
 type deduper struct{ store *Store }
 
+// NewDeduper exposes that same two-phase dedup to the adapter itself, for the
+// one reply it sends without the Router: the unsupported-kind receipt
+// (wecom_channel.go). Both go through this type, on one table and one key, so
+// a message answered by the adapter can never also be answered by the Router.
+func NewDeduper(store *Store) engine.Deduper { return &deduper{store: store} }
+
 func (d *deduper) Claim(ctx context.Context, installationID pgtype.UUID, messageID string) (pgtype.UUID, error) {
 	row, err := d.store.Queries.ClaimChannelInboundDedup(ctx, db.ClaimChannelInboundDedupParams{
 		InstallationID: installationID,

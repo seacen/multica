@@ -707,6 +707,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					Senders:     wecomSenders,
 					Languages:   queries,
 					Logger:      slog.Default(),
+					// The unsupported-kind receipt is sent from the adapter,
+					// before the Router sees the message, so it is the one
+					// reply the Router's own dedup cannot cover. Same table,
+					// same key, so the two can never both answer.
+					Dedup: wecom.NewDeduper(wecomStore),
 				})
 				// Inbound media: a callback carries a pre-signed COS url and
 				// a per-url key, so the resolver needs no WeCom credential —
