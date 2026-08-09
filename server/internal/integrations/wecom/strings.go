@@ -120,15 +120,25 @@ type copyPack struct {
 	AgentArchived string
 
 	// UnsupportedMsgType answers a message kind the adapter cannot read at
-	// all — sent from the read loop, which never reaches the Replier.
+	// all — sent from the read loop, which never reaches the Replier. It does
+	// not name text, because photos, files, videos and 图文混排 route: a person
+	// who has just watched the bot answer a screenshot and is then told it
+	// only handles text reads that as the bot being broken.
 	UnsupportedMsgType string
 
-	// MediaSendFailed says the agent produced a file and it did not reach the
-	// chat. The answer is already on screen and may well point at the file, so
-	// silence would leave the user waiting for something that is not coming.
-	// One line covers the whole turn however many files failed — the reason
-	// (too big, storage down, WeCom refused it) is a log line, not something
-	// the reader can act on.
+	// MediaTooLarge / MediaUnreadable tell the sender that an attachment did
+	// not make it. Two reasons rather than one because the fix differs: a
+	// file over the limit needs splitting or a link, whereas an expired or
+	// undecryptable download just needs sending again.
+	MediaTooLarge   string
+	MediaUnreadable string
+
+	// MediaSendFailed goes the other way: the agent produced a file and it did
+	// not reach the chat. The answer is already on screen and may well point
+	// at the file, so silence would leave the user waiting for something that
+	// is not coming. One line covers the whole turn however many files failed
+	// — the reason (too big, storage down, WeCom refused it) is a log line,
+	// not something the reader can act on.
 	MediaSendFailed string
 
 	// BindingPromptPrefix / BindingPromptSuffix wrap the bind URL.
@@ -138,6 +148,19 @@ type copyPack struct {
 	BindingPromptPrefix string
 	BindingPromptSuffix string
 	BindingPending      string
+
+	// WelcomeBound / WelcomeUnbound* are what a person sees the moment they
+	// open the bot's chat for the first time (welcome.go). Answering nothing
+	// leaves them looking at an empty window with no idea what the bot is for.
+	//
+	// The unbound pair wraps the same bind URL the prompt uses, and for the
+	// same reason it is only ever sent 1:1: the URL carries a bearer token.
+	// WelcomeUnboundPending replaces both when the mint was throttled and
+	// there is no URL to print.
+	WelcomeBound          string
+	WelcomeUnboundPrefix  string
+	WelcomeUnboundSuffix  string
+	WelcomeUnboundPending string
 
 	// BindingSentPrivately is what the ROOM sees when an unbound member
 	// triggers the bot in a group: the prompt itself went to that member's
@@ -252,12 +275,20 @@ var copyPacks = map[Locale]copyPack{
 	LocaleZhHans: {
 		AgentOffline:         "⚠️ 智能体当前不在线，你的消息已收到，等它上线后会处理。",
 		AgentArchived:        "⚠️ 该智能体已归档，无法回复。请联系工作区管理员。",
-		UnsupportedMsgType:   "抱歉，我目前只能处理文字消息。",
+		UnsupportedMsgType:   "抱歉，我暂时无法处理这类消息。",
+		MediaTooLarge:        "抱歉，附件太大了，我这边收不下。",
+		MediaUnreadable:      "抱歉，有附件没能收到，麻烦重新发一次。",
 		MediaSendFailed:      "⚠️ 有文件没能发出来，我这边保留着，需要的话我再试一次。",
 		BindingPromptPrefix:  "👋 请先绑定你的 Multica 账号，才能与我对话：\n",
 		BindingPromptSuffix:  "\n（链接 15 分钟内有效）",
 		BindingPending:       "👋 绑定链接刚才已经发给你了，就在上方，请直接点击完成绑定。",
 		BindingSentPrivately: "👋 已把绑定链接私发给你，请在与我的单聊里点击完成绑定。",
+
+		WelcomeBound:          "👋 你好，我是 Multica 智能助手。有事直接发消息给我，或者用 “/issue 标题” 建一条任务。（目前只能处理文字消息）",
+		WelcomeUnboundPrefix:  "👋 你好，我是 Multica 智能助手。请先绑定你的 Multica 账号，才能与我对话：\n",
+		WelcomeUnboundSuffix:  "\n（链接 15 分钟内有效）",
+		WelcomeUnboundPending: "👋 你好，我是 Multica 智能助手。绑定链接刚才已经发给你了，就在上方，请直接点击完成绑定。",
+
 		IssueCreatedPrefix:   "✅ 已创建 ",
 		IssueTitleSeparator:  " — ",
 		IssueDuplicatePrefix: "⚠️ 未创建 —— 已存在进行中的 ",
@@ -290,12 +321,20 @@ var copyPacks = map[Locale]copyPack{
 	LocaleEn: {
 		AgentOffline:         "⚠️ The agent is offline right now. Your message was received and will be handled once it's back.",
 		AgentArchived:        "⚠️ This agent has been archived and can't reply. Please contact your workspace admin.",
-		UnsupportedMsgType:   "Sorry, I can only read text messages for now.",
+		UnsupportedMsgType:   "Sorry, I can't read that kind of message.",
+		MediaTooLarge:        "Sorry, that attachment is too big for me to take.",
+		MediaUnreadable:      "Sorry, an attachment didn't come through — please send it again.",
 		MediaSendFailed:      "⚠️ I couldn't send one of the files. It is still here — say the word and I'll try again.",
 		BindingPromptPrefix:  "👋 Link your Multica account before we can talk:\n",
 		BindingPromptSuffix:  "\n(the link is good for 15 minutes)",
 		BindingPending:       "👋 I already sent you a link — it is just above, tap it to finish linking.",
 		BindingSentPrivately: "👋 I've sent the link to your direct chat with me — tap it there to finish linking.",
+
+		WelcomeBound:          "👋 Hi, I'm the Multica assistant. Send me whatever you need, or file a task with “/issue <title>”. (I can only read text messages for now.)",
+		WelcomeUnboundPrefix:  "👋 Hi, I'm the Multica assistant. Link your Multica account before we can talk:\n",
+		WelcomeUnboundSuffix:  "\n(the link is good for 15 minutes)",
+		WelcomeUnboundPending: "👋 Hi, I'm the Multica assistant. I already sent you a link — it is just above, tap it to finish linking.",
+
 		IssueCreatedPrefix:   "✅ Created ",
 		IssueTitleSeparator:  " — ",
 		IssueDuplicatePrefix: "⚠️ Not created — an active issue already covers this: ",

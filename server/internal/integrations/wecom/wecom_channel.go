@@ -61,13 +61,12 @@ const writeDeadline = 10 * time.Second
 // handshakeTimeout bounds the initial TCP + WS handshake dial.
 const handshakeTimeout = 15 * time.Second
 
-// unsupportedMsgTypeReceipt is the one line sent back for a message this
-// adapter cannot read at all. It used to say "我目前只能处理文字消息" — text
-// only — which stopped being true the moment photos, files, videos and
-// 图文混排 started routing: a person who has just watched the bot answer a
-// screenshot, then gets told it only handles text, reads that as the bot
-// being broken rather than as this one kind not being supported.
-const unsupportedMsgTypeReceipt = "抱歉，我暂时无法处理这类消息。"
+// The one line sent back for a message this adapter cannot read at all is
+// copyPack.UnsupportedMsgType (strings.go). It used to say "我目前只能处理文字
+// 消息" — text only — which stopped being true the moment photos, files, videos
+// and 图文混排 started routing: a person who has just watched the bot answer a
+// screenshot, then gets told it only handles text, reads that as the bot being
+// broken rather than as this one kind not being supported.
 
 // wecomChannel is one installation's aibot smart-bot WebSocket connection.
 // The engine.Supervisor builds one per active installation via the
@@ -106,8 +105,9 @@ type wecomChannel struct {
 	metrics Metrics
 
 	// languages resolves a destination to the language this connection's own
-	// copy is written in — here, the receipt for a message kind we cannot
-	// read. Nil means everyone reads the deployment default.
+	// copy is written in — the greeting (welcome.go) and the receipt for a
+	// message kind we cannot read. Nil means everyone reads the deployment
+	// default.
 	languages languageLookup
 }
 
@@ -542,9 +542,9 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 			// the same chat with a one-line receipt and stop. Best-effort: a
 			// send failure degrades to the prior silent drop.
 			//
-			// The receipt is addressed to whoever sent the unreadable message,
-			// so in a 1:1 it reads their profile language; a group has no
-			// shared profile and reads the deployment's (language.go).
+			// The receipt is addressed to whoever sent the unreadable
+			// message, so in a 1:1 it reads their profile language; a group
+			// has no shared profile and reads the deployment's (language.go).
 			chatType := aibotChatTypeFromChannel(msg.Source.ChatType)
 			cp := copyFor(localeFor(ctx, c.languages, c.installationID, chatType, msg.Source.SenderID))
 			log.Debug("wecom: unsupported message kind, replying with a receipt", "msg_type", mc.MsgType, "msg_id", mc.MsgID)

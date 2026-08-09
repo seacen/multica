@@ -239,8 +239,8 @@ func TestOwnText_MixedWithNothingReadableTakesTheReceipt(t *testing.T) {
 // handles text only.
 func TestUnsupportedReceipt_DoesNotClaimTextOnly(t *testing.T) {
 	t.Parallel()
-	if strings.Contains(unsupportedMsgTypeReceipt, "只能处理文字") {
-		t.Errorf("receipt %q still claims text-only while image/file/video/mixed route", unsupportedMsgTypeReceipt)
+	if receipt := copyFor(DefaultLocale).UnsupportedMsgType; strings.Contains(receipt, "只能处理文字") {
+		t.Errorf("receipt %q still claims text-only while image/file/video/mixed route", receipt)
 	}
 }
 

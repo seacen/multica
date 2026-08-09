@@ -722,21 +722,6 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					Binding:     wecomBinding,
 					AppURL:      appURLFromEnv(),
 				})
-				// Inbound media: a callback carries a pre-signed COS url and
-				// a per-url key, so the resolver needs no WeCom credential —
-				// only somewhere durable to put the bytes. Without an object
-				// store there is nothing to point an attachment at, so the
-				// resolver is left nil and attachments stay as their
-				// placeholder text. Same nil-guard as DingTalk above.
-				var wecomMedia engine.MediaResolver
-				if store != nil {
-					wecomMedia = wecom.NewMediaResolver(
-						store,
-						engine.NewDBMediaIntentLedger(queries),
-						wecomSenders,
-						slog.Default(),
-					)
-				}
 				// Streaming replies: WeCom's smart-bot protocol has no
 				// typing indicator, no reaction and no read receipt, so the
 				// only way to say "working on it" is to open the reply early.
@@ -776,6 +761,22 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				// without an answer.
 				wecomTyping.Register(bus)
 
+				// Inbound media: a callback carries a pre-signed COS url and
+				// a per-url key, so the resolver needs no WeCom credential —
+				// only somewhere durable to put the bytes. Without an object
+				// store there is nothing to point an attachment at, so the
+				// resolver is left nil and attachments stay as their
+				// placeholder text. Same nil-guard as DingTalk above.
+				var wecomMedia engine.MediaResolver
+				if store != nil {
+					wecomMedia = wecom.NewMediaResolver(
+						store,
+						engine.NewDBMediaIntentLedger(queries),
+						wecomSenders,
+						queries,
+						slog.Default(),
+					)
+				}
 				channelRouter.Register(wecom.TypeWecom, wecom.NewResolverSet(
 					wecomStore, wecomSession, wecomReplier, wecomMedia, wecomTyping,
 				))

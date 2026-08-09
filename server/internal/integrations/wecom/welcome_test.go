@@ -232,7 +232,7 @@ func TestNoBindingSurfaceStillGreets(t *testing.T) {
 
 	c.handleEnterChat(context.Background(), enterChatFrame(t, "req-5", "single", "T-alex"), sender, slog.Default())
 
-	if said := welcomeSaid(t, conn); said != welcomeBoundText {
+	if said := welcomeSaid(t, conn); said != copyFor(DefaultLocale).WelcomeBound {
 		t.Fatalf("said %q, want the plain greeting", said)
 	}
 }
@@ -534,29 +534,41 @@ func TestRespondWelcomeUsesThePlatformsCommandName(t *testing.T) {
 // The two greetings have jobs that differ, so they must differ. The unbound
 // one exists to hand over a link and say how long it lasts; the bound one
 // exists NOT to, and to say what to do instead.
+//
+// Read off the pack rather than off constants, because the greeting moved
+// there — and off every locale's pack, not just the default, so a translation
+// that drops the link's lifetime or the account-linking ask is caught in the
+// language it was written in rather than in the one nobody reads.
 func TestTheTwoGreetingsSayDifferentThings(t *testing.T) {
 	t.Parallel()
-	if welcomeBoundText == "" || welcomeUnboundPrefix == "" || welcomeUnboundSuffix == "" {
-		t.Fatal("a greeting is empty — opening the chat would produce the empty window this exists to fix")
+	for locale, c := range copyPacks {
+		if c.WelcomeBound == "" || c.WelcomeUnboundPrefix == "" || c.WelcomeUnboundSuffix == "" {
+			t.Fatalf("%s: a greeting is empty — opening the chat would produce the empty window this exists to fix", locale)
+		}
+		if c.WelcomeBound == c.WelcomeUnboundPrefix {
+			t.Errorf("%s: the bound and unbound greetings are the same text; one of them is not doing its job", locale)
+		}
+		if strings.Contains(c.WelcomeBound, "token=") || strings.Contains(c.WelcomeBound, "http") {
+			t.Errorf("%s: the bound greeting carries a link: %q", locale, c.WelcomeBound)
+		}
+		// A linked user has nothing to do next unless the greeting says what
+		// the bot takes. Naming the one command is the whole reason this text
+		// is longer than "hello".
+		if !strings.Contains(c.WelcomeBound, "/issue") {
+			t.Errorf("%s: the bound greeting never says what the bot can be asked to do: %q", locale, c.WelcomeBound)
+		}
+		// The suffix states the token's lifetime, which is the one fact a user
+		// needs to know whether the link in front of them is still good.
+		if !strings.Contains(c.WelcomeUnboundSuffix, "15") {
+			t.Errorf("%s: the unbound greeting does not state how long the link lasts: %q", locale, c.WelcomeUnboundSuffix)
+		}
 	}
-	if welcomeBoundText == welcomeUnboundPrefix {
-		t.Error("the bound and unbound greetings are the same text; one of them is not doing its job")
+	// The account-linking ask is worded per language, so it is checked in the
+	// language it is written in.
+	if !strings.Contains(copyPacks[LocaleZhHans].WelcomeUnboundPrefix, "绑定") {
+		t.Errorf("the unbound greeting never asks the user to link an account: %q", copyPacks[LocaleZhHans].WelcomeUnboundPrefix)
 	}
-	if strings.Contains(welcomeBoundText, "token=") || strings.Contains(welcomeBoundText, "http") {
-		t.Errorf("the bound greeting carries a link: %q", welcomeBoundText)
-	}
-	// A linked user has nothing to do next unless the greeting says what the
-	// bot takes. Naming the one command is the whole reason this text is
-	// longer than "hello".
-	if !strings.Contains(welcomeBoundText, "/issue") {
-		t.Errorf("the bound greeting never says what the bot can be asked to do: %q", welcomeBoundText)
-	}
-	if !strings.Contains(welcomeUnboundPrefix, "绑定") {
-		t.Errorf("the unbound greeting never asks the user to link an account: %q", welcomeUnboundPrefix)
-	}
-	// The suffix states the token's lifetime, which is the one fact a user
-	// needs to know whether the link in front of them is still good.
-	if !strings.Contains(welcomeUnboundSuffix, "15") {
-		t.Errorf("the unbound greeting does not state how long the link lasts: %q", welcomeUnboundSuffix)
+	if !strings.Contains(strings.ToLower(copyPacks[LocaleEn].WelcomeUnboundPrefix), "link") {
+		t.Errorf("the unbound greeting never asks the user to link an account: %q", copyPacks[LocaleEn].WelcomeUnboundPrefix)
 	}
 }
