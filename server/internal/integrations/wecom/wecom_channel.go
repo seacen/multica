@@ -125,13 +125,35 @@ func (c *wecomChannel) mx() Metrics {
 	return c.metrics
 }
 
-// Capabilities declares what the aibot adapter supports today. Inbound
-// attachments are downloaded, decrypted and bound (media_ingest.go), so
-// CapAttachment holds in the same direction it holds for DingTalk
-// (dingtalk_channel.go:52). Sending media back out is a separate matter —
-// it needs WeCom's aibot_upload_media_* handshake — and is not claimed here.
+// Capabilities declares what the aibot adapter supports today.
+//
+// CapAttachment: inbound attachments are downloaded, decrypted and bound
+// (media_ingest.go), the same direction it holds for DingTalk
+// (dingtalk_channel.go:52). Sending media back out would need WeCom's
+// aibot_upload_media_* handshake, which nothing here does, and the bit covers
+// send AND/OR receive — so receiving is enough to declare it.
+//
+// CapVoice: WeCom runs the speech recognition on its side and delivers the
+// transcript in voice.content, so a voice note is routed as the sentence it
+// already is (ws_frame.go ownText). No audio is downloaded and none is sent.
+//
+// CapTypingIndicator and CapMessageEdit are one mechanism, not two: a
+// streaming reply's opening frame is a thinking placeholder, which is the
+// indicator, and every later frame reuses the same stream id to replace the
+// bubble's body, which is the edit (ws_sender.go respondStream). Both are
+// declared because a caller asking "can this channel show it is working" and
+// one asking "can it replace what it already said" both get a true answer.
+//
+// Deliberately absent, because the adapter cannot do them and a caller reading
+// this mask will act on it: CapRichCard (replies are markdown text, not an
+// interactive card), CapThreadReply (the aibot protocol has no threads) and
+// CapQuoteReply (an inbound quote is read for context; nothing quote-replies).
 func (c *wecomChannel) Capabilities() channel.Capability {
-	return channel.CapText | channel.CapAttachment
+	return channel.CapText |
+		channel.CapVoice |
+		channel.CapAttachment |
+		channel.CapTypingIndicator |
+		channel.CapMessageEdit
 }
 
 // Disconnect is a no-op: the WS connection's whole lifetime is scoped to

@@ -244,23 +244,28 @@ func TestUnsupportedReceipt_DoesNotClaimTextOnly(t *testing.T) {
 	}
 }
 
-// TestVoiceStaysOnTheReceiptPath: a STANDALONE voice note is #6599's subject,
-// not this change's. It must still take the receipt path here, so the two
-// land independently. A voice RUN inside a 图文混排 is this change's, because
-// dropping it would lose a spoken sentence out of a message whose other runs
-// are read.
-func TestVoiceStaysOnTheReceiptPath(t *testing.T) {
+// TestVoiceIsRoutedStandaloneAndInsideMixed: a voice RUN inside a 图文混排 is
+// media ingest's own subject, because dropping it would lose a spoken sentence
+// out of a message whose other runs are read. A STANDALONE voice note was
+// deliberately left on the receipt path here so media ingest and #6599 could
+// land independently; with #6599 in the tree it is routed too, and this states
+// the combined result rather than the half either branch sees alone.
+func TestVoiceIsRoutedStandaloneAndInsideMixed(t *testing.T) {
 	t.Parallel()
 	standalone := mediaFrame(t, "voice", map[string]any{"voice": map[string]any{"content": "把报表发我"}})
-	if _, called, conn := dispatchOne(t, standalone); called || len(conn.frames) != 1 {
-		t.Errorf("standalone voice should still take the receipt path (called=%v, frames=%d)", called, len(conn.frames))
+	got, called, _ := dispatchOne(t, standalone)
+	if !called {
+		t.Error("a standalone voice note was not routed — WeCom already handed over the transcript")
+	}
+	if got.Text != "把报表发我" {
+		t.Errorf("standalone voice text = %q, want the transcript", got.Text)
 	}
 
 	inMixed := mediaFrame(t, "mixed", map[string]any{"mixed": map[string]any{"msg_item": []map[string]any{
 		{"msgtype": "voice", "voice": map[string]any{"content": "把报表发我"}},
 		{"msgtype": "file", "file": map[string]any{"url": "https://cos.example.com/x", "aeskey": "k"}},
 	}}})
-	got, called, _ := dispatchOne(t, inMixed)
+	got, called, _ = dispatchOne(t, inMixed)
 	if !called {
 		t.Fatal("a mixed message with a voice run must be routed")
 	}
