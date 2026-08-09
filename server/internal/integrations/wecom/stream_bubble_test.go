@@ -30,6 +30,15 @@ type bubbleConn struct {
 	sender *wsSender
 
 	refuseClosingCode int
+
+	// disownAfterFrames makes the connection behave like a stream another
+	// replica or a reconnect has taken over: the first n stream frames land,
+	// and every one after that is refused with 846608 — a refresh, a closing
+	// frame, the answer, all of them. Refusing only some of them would hide
+	// the whole cost of a refresh loop, which is that every attempt is a write
+	// counted against the bot's shared rate limit.
+	disownAfterFrames int
+	streamWrites      int
 }
 
 func (c *bubbleConn) WriteMessage(_ int, data []byte) error {
@@ -41,6 +50,12 @@ func (c *bubbleConn) WriteMessage(_ int, data []byte) error {
 	c.frames = append(c.frames, env)
 	s := c.sender
 	code := 0
+	if _, isStream := streamOf(env); isStream {
+		c.streamWrites++
+		if c.disownAfterFrames > 0 && c.streamWrites > c.disownAfterFrames {
+			code = errcodeStreamExpired
+		}
+	}
 	if c.refuseClosingCode != 0 && isClosingFrame(env) {
 		code = c.refuseClosingCode
 	}
@@ -69,6 +84,20 @@ func isClosingFrame(env frameEnvelope) bool {
 	}
 	stream, _ := body["stream"].(map[string]any)
 	return stream != nil && stream["finish"] == true
+}
+
+// streamOf decodes one frame's stream body, and reports whether the frame was
+// a stream frame at all.
+func streamOf(env frameEnvelope) (map[string]any, bool) {
+	if env.Cmd != cmdRespondMsg {
+		return nil, false
+	}
+	var body map[string]any
+	if json.Unmarshal(env.Body, &body) != nil {
+		return nil, false
+	}
+	stream, _ := body["stream"].(map[string]any)
+	return stream, stream != nil
 }
 
 // streamFrames returns the decoded stream bodies, in write order.
@@ -152,6 +181,11 @@ type bubbleRig struct {
 	// frames, so the log line is the only thing that separates it from a
 	// handler that returned for some unrelated reason. See failure_origin_test.
 	logs *logRecorder
+
+	// installer is whose bot this is. Left invalid by default, which is what
+	// the bubble tests want — no principal means no round shows its steps, so
+	// nothing here writes a refresh frame. progress_rounds_test.go sets it.
+	installer pgtype.UUID
 }
 
 func newBubbleRig(t *testing.T) *bubbleRig {
@@ -224,10 +258,21 @@ func bubbleSessionID(t *testing.T) pgtype.UUID {
 // them" by passing two, without touching a clock.
 func (r *bubbleRig) ask(t *testing.T, reqID string, batch engine.RunBatchID) {
 	t.Helper()
+	r.askFrom(t, reqID, batch, channel.ChatTypeP2P)
+}
+
+// askFrom is ask with the kind of chat the question came from, which is half of
+// what decides whether that round's bubble may show the run's steps.
+func (r *bubbleRig) askFrom(t *testing.T, reqID string, batch engine.RunBatchID, chatType channel.ChatType) {
+	t.Helper()
+	wire := "single"
+	if chatType == channel.ChatTypeGroup {
+		wire = "group"
+	}
 	raw, err := json.Marshal(InboundMessage{
 		BotID:        "BOT",
 		ChatID:       "CHAT_1",
-		ChatType:     "single",
+		ChatType:     wire,
 		SenderUserID: "USER_1",
 		ReqID:        reqID,
 	})
@@ -235,10 +280,10 @@ func (r *bubbleRig) ask(t *testing.T, reqID string, batch engine.RunBatchID) {
 		t.Fatalf("marshal raw: %v", err)
 	}
 	r.typing.OnIngested(context.Background(),
-		engine.ResolvedInstallation{ID: r.instID},
+		engine.ResolvedInstallation{ID: r.instID, InstallerUserID: r.installer},
 		channel.InboundMessage{
 			Text:   "a question",
-			Source: channel.Source{ChannelType: TypeWecom, ChatID: "CHAT_1", ChatType: channel.ChatTypeP2P, SenderID: "USER_1"},
+			Source: channel.Source{ChannelType: TypeWecom, ChatID: "CHAT_1", ChatType: chatType, SenderID: "USER_1"},
 			Raw:    raw,
 		},
 		bubbleSessionID(t), batch)
@@ -368,6 +413,8 @@ var testTaskUUIDs = map[string]string{
 	"task-2": "aaaaaaaa-0000-0000-0000-000000000002",
 	"task-3": "aaaaaaaa-0000-0000-0000-000000000003",
 	"retry":  "aaaaaaaa-0000-0000-0000-0000000000ff",
+	// An issue or autopilot run: the same events, no chat session at all.
+	"issue-run": "aaaaaaaa-0000-0000-0000-0000000000e1",
 }
 
 // taskUUID is the string form the event payloads carry.

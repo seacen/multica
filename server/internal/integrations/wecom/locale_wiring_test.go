@@ -16,8 +16,10 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -531,5 +533,166 @@ func TestDeploymentLocaleMovesTheCopyNobodyHasAProfileFor(t *testing.T) {
 	}
 	if got := sentMarkdown(t, conn, 1); got != en.BindingSentPrivately {
 		t.Fatalf("group line = %q, want the English %q", got, en.BindingSentPrivately)
+	}
+}
+
+// ---- the compatibility pin ----
+
+// TestZhHansPackIsTheCopyThatAlreadyShipped is the guard on the one promise
+// this change makes to the tenants already running the bot: nothing a Chinese
+// reader sees changes. Every other test in this file reads its expected text
+// off the pack, which proves the SURFACE consults the pack and proves nothing
+// at all about what the pack says — edit a zh-Hans string and they all still
+// pass. So the wording is spelled out once, here: the lines that predate the
+// pack against the literals their call sites carried, and the bubble's own
+// lines, which are new, so that changing one is a deliberate edit here rather
+// than a silent one in the pack.
+//
+// It walks the struct rather than checking a handful of fields, so a copy
+// string added later without a line in the table fails here instead of
+// shipping unreviewed. That makes the table the place a zh-Hans wording change
+// has to be argued for, which is the point.
+func TestZhHansPackIsTheCopyThatAlreadyShipped(t *testing.T) {
+	t.Parallel()
+
+	want := map[string]string{
+		"AgentOffline":         "⚠️ 智能体当前不在线，你的消息已收到，等它上线后会处理。",
+		"AgentArchived":        "⚠️ 该智能体已归档，无法回复。请联系工作区管理员。",
+		"UnsupportedMsgType":   "抱歉，我目前只能处理文字消息。",
+		"BindingPromptPrefix":  "👋 请先绑定你的 Multica 账号，才能与我对话：\n",
+		"BindingPromptSuffix":  "\n（链接 15 分钟内有效）",
+		"BindingPending":       "👋 绑定链接刚才已经发给你了，就在上方，请直接点击完成绑定。",
+		"BindingSentPrivately": "👋 已把绑定链接私发给你，请在与我的单聊里点击完成绑定。",
+		"IssueCreatedPrefix":   "✅ 已创建 ",
+		"IssueTitleSeparator":  " — ",
+		"IssueDuplicatePrefix": "⚠️ 未创建 —— 已存在进行中的 ",
+		"StreamNoReply":        "（这轮没有需要回复的内容）",
+		"StreamMerged":         "✅ 这条已并入上一条回复一起处理了。",
+		"StreamNotStarted":     "已收到，但这条暂时没能开始处理。",
+		"StreamFailed":         "⚠️ 这次没跑通，请稍后再试一次。",
+		"StreamCancelled":      "⏹️ 这次处理已取消。",
+		"StreamStillWorking":   "还在处理，完成后我再单独回复你。",
+		"StreamStuck":          "⚠️ 上面那条进度不会再更新了，这轮的结果我用新消息发你。",
+		"StreamProgressPrefix": "正在处理：",
+		"InboxDetailLink":      "查看详情",
+		"InboxTypeFallback":    "新消息",
+	}
+	wantLabels := map[string]string{
+		"issue_assigned":     "任务指派",
+		"mentioned":          "提及你",
+		"status_changed":     "状态变更",
+		"comment_added":      "新评论",
+		"new_comment":        "新评论",
+		"reaction_added":     "表情反应",
+		"task_failed":        "任务失败",
+		"unassigned":         "取消指派",
+		"assignee_changed":   "指派人变更",
+		"priority_changed":   "优先级变更",
+		"due_date_changed":   "截止日期变更",
+		"start_date_changed": "开始日期变更",
+	}
+
+	// Both packs print the token's life in words. The number is real config,
+	// so pin the pair: change the TTL and this says so rather than letting the
+	// prompt promise fifteen minutes for a link that expires in five.
+	if BindingTokenTTL != 15*time.Minute {
+		t.Errorf("BindingTokenTTL = %s, but both binding prompts spell \"15 minutes\"; update the copy or the constant", BindingTokenTTL)
+	}
+
+	zh := reflect.ValueOf(copyPacks[LocaleZhHans])
+	typ := zh.Type()
+	for i := range typ.NumField() {
+		name := typ.Field(i).Name
+		switch typ.Field(i).Type.Kind() {
+		case reflect.String:
+			expected, listed := want[name]
+			if !listed {
+				t.Errorf("copyPack.%s is a reader-visible string with no line in this table; add the text it shipped with", name)
+				continue
+			}
+			if got := zh.Field(i).String(); got != expected {
+				t.Errorf("zh-Hans %s = %q, want %q — a Chinese tenant reads this, so change it deliberately or not at all", name, got, expected)
+			}
+			delete(want, name)
+		case reflect.Map:
+			if name != "InboxTypeLabels" {
+				t.Errorf("copyPack.%s is a map this test does not know how to pin", name)
+				continue
+			}
+			got, _ := zh.Field(i).Interface().(map[string]string)
+			for key, expected := range wantLabels {
+				if got[key] != expected {
+					t.Errorf("zh-Hans label %q = %q, want %q", key, got[key], expected)
+				}
+			}
+			for key := range got {
+				if _, listed := wantLabels[key]; !listed {
+					t.Errorf("zh-Hans carries an extra label %q; add it here with the text it shipped with", key)
+				}
+			}
+		case reflect.Struct:
+			if name != "Progress" {
+				t.Errorf("copyPack.%s is a nested struct this test does not know how to pin", name)
+				continue
+			}
+			pinProgressCopy(t, zh.Field(i))
+		default:
+			t.Errorf("copyPack.%s has kind %s, which this test does not pin", name, typ.Field(i).Type.Kind())
+		}
+	}
+	for name := range want {
+		t.Errorf("this table pins copyPack.%s, which no longer exists", name)
+	}
+}
+
+// pinProgressCopy is the same table for the step lines inside the bubble.
+// They are new copy rather than something that already shipped, so what this
+// pins is that a change to any of them is made here, deliberately, and not
+// slipped into the pack — and that every line keeps the verb count its format
+// string needs, which is the half a reviewer cannot see by reading.
+func pinProgressCopy(t *testing.T, v reflect.Value) {
+	t.Helper()
+	want := map[string]string{
+		"Read":         "正在读取 %s",
+		"ReadPlain":    "正在读取文件",
+		"Edit":         "正在修改 %s",
+		"EditPlain":    "正在修改文件",
+		"Command":      "正在执行命令",
+		"CommandNamed": "正在执行 %s",
+		"Search":       "正在检索代码",
+		"SearchNamed":  "正在检索 %s",
+		"Web":          "正在查资料",
+		"WebNamed":     "正在查 %s",
+		"Subtask":      "正在派子任务",
+		"SubtaskNamed": "正在派子任务：%s",
+		"Plan":         "正在梳理计划",
+		"PlanNamed":    "正在梳理计划：%s",
+		"Service":      "正在调用 %s · %s",
+		"ServiceArgs":  "正在调用 %s · %s：%s",
+		"Skill":        "正在启用技能 %s",
+		"SkillPlain":   "正在启用技能",
+		"Tool":         "正在使用 %s",
+		"ToolArgs":     "正在使用 %s：%s",
+		"Fallback":     "正在处理",
+		"Failed":       "上一步出错了，正在继续",
+		"FailedNamed":  "上一步出错了：%s，正在继续",
+		"Thinking":     "思考：",
+		"Elapsed":      "已用时 %s",
+	}
+	typ := v.Type()
+	for i := range typ.NumField() {
+		name := typ.Field(i).Name
+		expected, listed := want[name]
+		if !listed {
+			t.Errorf("progressCopy.%s is a reader-visible string with no line in this table", name)
+			continue
+		}
+		if got := v.Field(i).String(); got != expected {
+			t.Errorf("zh-Hans progress %s = %q, want %q", name, got, expected)
+		}
+		delete(want, name)
+	}
+	for name := range want {
+		t.Errorf("this table pins progressCopy.%s, which no longer exists", name)
 	}
 }

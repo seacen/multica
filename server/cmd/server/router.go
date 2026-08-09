@@ -691,6 +691,15 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				slog.Info("wecom deployment locale",
 					"locale", wecom.SetDeploymentLocale(os.Getenv("MULTICA_WECOM_DEFAULT_LOCALE")))
 
+				// Which language the bot writes its OWN copy in for readers
+				// it cannot look a language up for — a group chat, or anyone
+				// not linked to a Multica account yet. A linked person always
+				// overrides this with their profile language. An unrecognised
+				// value leaves the default (zh-Hans) in place, which is why
+				// the resolved one is logged rather than the raw one.
+				slog.Info("wecom deployment locale",
+					"locale", wecom.SetDeploymentLocale(os.Getenv("MULTICA_WECOM_DEFAULT_LOCALE")))
+
 				wecomReplier := wecom.NewOutboundReplier(wecom.OutboundReplierConfig{
 					Binding:   wecomBinding,
 					Senders:   wecomSenders,
@@ -757,12 +766,17 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					// language, resolved when the round is opened and carried
 					// on the handle to whichever closer gets there.
 					Languages: queries,
-					Logger:    slog.Default(),
+					// Who is asking, which is what decides whether their
+					// bubble may show the run's steps. Without it every
+					// bubble falls to the closed tier and shows none.
+					Identities: queries,
+					Logger:     slog.Default(),
 				})
-				// Subscribes task:failed and task:cancelled: neither a failed
-				// nor a cancelled run publishes chat:done, so this is the
-				// sole path that stops the bubble spinning once a run ends
-				// without an answer.
+				// Subscribes task:failed and task:cancelled — neither a failed
+				// nor a cancelled run publishes chat:done, so this is the sole
+				// path that stops the bubble spinning once a run ends without
+				// an answer — plus task:progress and task:message, which fill
+				// the bubble in while the run is still going.
 				wecomTyping.Register(bus)
 
 				// Inbound media: a callback carries a pre-signed COS url and

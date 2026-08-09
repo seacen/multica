@@ -17,11 +17,18 @@ package wecom
 //     only calls it when the flush produced no task run; the answer closes the
 //     bubble from the chat-done subscriber in outbound.go, which is the only
 //     place that has the answer to close it with.
+//
+// Between those two the bubble is not left blank. The run's own transcript —
+// task:message, one event per tool call — is played into it as a scrolling list
+// of steps, refreshed in place at most every 1.5s. What may be shown, and to
+// whom, is progress_render.go's subject; this file is the wiring and the two
+// bus subscriptions that carry it.
 
 import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -78,6 +85,14 @@ type taskOrigin interface {
 	engine.ChannelProvenanceQueries
 }
 
+// identityLookup resolves the WeCom sender on an inbound message to the
+// Multica user behind them. It answers the only question the step list's
+// audience gate asks — is this person the bot's principal — and *db.Queries
+// satisfies it with the row the identity resolver already reads.
+type identityLookup interface {
+	GetChannelUserBindingByUserID(ctx context.Context, arg db.GetChannelUserBindingByUserIDParams) (db.ChannelUserBinding, error)
+}
+
 // chatBindingLookup finds which WeCom chat a session belongs to. It is the
 // address of last resort for a failure notice: the handle is gone and this
 // process has no note of the round, which is what a restart mid-run looks like.
@@ -99,6 +114,15 @@ type TypingIndicatorManager struct {
 	// in (language.go). nil closes every bubble in the deployment's.
 	languages languageLookup
 	log       *slog.Logger
+
+	// identities resolves the asker to a Multica user, which is what decides
+	// how much of a run a bubble may show. Nil puts every bubble on the
+	// closed tier, which shows no steps at all.
+	identities identityLookup
+
+	// taskSessions remembers which chat and which round a task belongs to, so
+	// a transcript arriving twice a second does not re-read the same row.
+	taskSessions *taskSessionCache
 
 	// guardAfter is when the manager closes a bubble nobody else has. Zero
 	// disables the guard (tests that drive the clock themselves).
@@ -131,6 +155,12 @@ type TypingIndicatorConfig struct {
 	// deployment's. Nil puts every bubble on the deployment's.
 	Languages languageLookup
 
+	// Identities resolves the WeCom sender to a Multica user, which is how the
+	// bubble decides whether the person reading it is the one who owns the
+	// run. Nil shows no steps to anyone — the bubble still opens and the
+	// answer still closes it, there is just nothing in between.
+	Identities identityLookup
+
 	// GuardAfter overrides streamGuardAfter. Test-only.
 	GuardAfter time.Duration
 }
@@ -148,13 +178,15 @@ func NewTypingIndicator(cfg TypingIndicatorConfig) *TypingIndicatorManager {
 		guard = streamGuardAfter
 	}
 	return &TypingIndicatorManager{
-		senders:    cfg.Senders,
-		streams:    cfg.Streams,
-		tasks:      cfg.Tasks,
-		bindings:   cfg.Bindings,
-		languages:  cfg.Languages,
-		log:        logger,
-		guardAfter: guard,
+		senders:      cfg.Senders,
+		streams:      cfg.Streams,
+		tasks:        cfg.Tasks,
+		bindings:     cfg.Bindings,
+		languages:    cfg.Languages,
+		identities:   cfg.Identities,
+		taskSessions: newTaskSessionCache(),
+		log:          logger,
+		guardAfter:   guard,
 	}
 }
 
@@ -190,16 +222,23 @@ type TypingIndicatorWiring struct {
 	// nine minutes, or the process restarted mid-run) tells the user nothing,
 	// and the guard's "I'll reply separately" is never answered.
 	Bindings bool
+
+	// Identities recognises the bot's principal, which is what decides how much
+	// of a run a bubble may show. Without it every bubble falls to the tier
+	// that shows no steps at all: it opens, spins for the length of the run and
+	// closes, which is exactly what the in-flight step list exists to stop.
+	Identities bool
 }
 
 // Wiring reports the dependencies this manager was built with. For boot-wiring
 // guards; it copies four booleans and hands out no references.
 func (m *TypingIndicatorManager) Wiring() TypingIndicatorWiring {
 	return TypingIndicatorWiring{
-		Senders:  m.senders != nil,
-		Streams:  m.streams != nil,
-		Tasks:    m.tasks != nil,
-		Bindings: m.bindings != nil,
+		Senders:    m.senders != nil,
+		Streams:    m.streams != nil,
+		Tasks:      m.tasks != nil,
+		Bindings:   m.bindings != nil,
+		Identities: m.identities != nil,
 	}
 }
 
@@ -258,6 +297,10 @@ func (m *TypingIndicatorManager) OnIngested(ctx context.Context, inst engine.Res
 		// later, from an event that names a task and nobody else — and one of
 		// them runs on a timer, minutes after this goroutine is gone.
 		Locale: localeFor(ctx, m.languages, inst.ID, chatType, msg.Source.SenderID),
+		// Same reason, and settled for THIS round only. Every later refresh
+		// reads it back off the handle rather than asking again, and the next
+		// round asks from scratch (levelFor).
+		Level: m.levelFor(ctx, inst, msg),
 	}
 	if m.streams.open(sessionID, batch, h) != roundOpened {
 		// roundJoined — the batcher folded this message into a run whose
@@ -299,6 +342,70 @@ func (m *TypingIndicatorManager) OnIngested(ctx context.Context, inst engine.Res
 		}
 	}
 	m.armGuard(sessionID, batch)
+}
+
+// levelFor decides how much of the run a new bubble may show, while the facts
+// it needs are still in hand: who asked, and where.
+//
+// One condition, stated two ways. The chat has to be a one-to-one, and the
+// person on the other end of it has to be the principal — on this branch, the
+// person who installed the bot. A group fails the first: the WeCom session key
+// for a room is the room, so every member reads the same bubble, and the person
+// who asked is one of several. A colleague's own chat fails the second:
+// private, but not to the principal.
+//
+// Everything unknown resolves to the closed tier. No lookup configured, no
+// sender id, a binding that is not there, a database that did not answer —
+// none of those prove the reader is the principal, and this is the side to be
+// wrong on. The cost of being wrong the other way is a file path in a chat
+// that cannot unsend it.
+//
+// ASKED AGAIN FOR EVERY ROUND, never once per session. Every input can change
+// between two questions in the same chat: a binding is revoked, or re-pointed
+// at a different person, and re-installing the bot moves InstallerUserID. An
+// answer cached for the session would keep showing one person's file paths and
+// search terms to whoever inherited the chat, for as long as the session
+// lasted.
+//
+// The cost is one indexed read per ingested message, beside the locale's,
+// which OnIngested already pays on the same row for the same reason. A message
+// the batcher folds into a run whose bubble is already open pays it for
+// nothing — this runs before open() says which of the two happened — and that
+// is the price of deciding while the asker is still in hand, against a feature
+// that writes a frame every 1.5s once it starts.
+func (m *TypingIndicatorManager) levelFor(ctx context.Context, inst engine.ResolvedInstallation, msg channel.InboundMessage) progressLevel {
+	// Positively a one-to-one, not merely "not a group". aibotChatTypeFromChannel
+	// answers single for anything it does not recognise, which is the right
+	// default for ADDRESSING a frame — a wire field has to be one or the other
+	// — and the wrong one for deciding who may read a run's step detail. An
+	// unrecognised chat type (a kind WeCom adds later, a field that did not
+	// survive a decode) would be treated as private, and the cost of being
+	// wrong here is a file path or a search term in a room.
+	if msg.Source.ChatType != channel.ChatTypeP2P {
+		return progressLevelNone
+	}
+	if !inst.InstallerUserID.Valid || m.identities == nil {
+		return progressLevelNone
+	}
+	senderID := strings.TrimSpace(msg.Source.SenderID)
+	if senderID == "" {
+		return progressLevelNone
+	}
+	binding, err := m.identities.GetChannelUserBindingByUserID(ctx, db.GetChannelUserBindingByUserIDParams{
+		InstallationID: inst.ID,
+		ChannelUserID:  senderID,
+	})
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			m.log.WarnContext(ctx, "wecom typing: cannot tell who is asking, showing no steps",
+				"installation_id", util.UUIDToString(inst.ID), "error", err)
+		}
+		return progressLevelNone
+	}
+	if binding.MulticaUserID != inst.InstallerUserID {
+		return progressLevelNone
+	}
+	return progressLevelDetail
 }
 
 // OnRunStarted files the task the debounced flush created for this run. It is
@@ -351,6 +458,206 @@ func (m *TypingIndicatorManager) OnSettled(ctx context.Context, sessionID pgtype
 func (m *TypingIndicatorManager) Register(bus *events.Bus) {
 	bus.Subscribe(protocol.EventTaskFailed, m.handleTaskFailed)
 	bus.Subscribe(protocol.EventTaskCancelled, m.handleTaskCancelled)
+	if m.tasks != nil {
+		bus.Subscribe(protocol.EventTaskProgress, m.handleTaskProgress)
+		bus.Subscribe(protocol.EventTaskMessage, m.handleTaskMessage)
+	}
+}
+
+// progressWriteTimeout bounds one refresh. It runs on the goroutine that
+// published the transcript event — the daemon's own HTTP request — so this is
+// a slice of somebody else's budget, not ours to spend freely. Well under the
+// socket's own ack wait, because a step nobody could write in this long is a
+// step the next one replaces anyway.
+const progressWriteTimeout = 3 * time.Second
+
+// handleTaskProgress plays the daemon's own two milestones into the bubble.
+func (m *TypingIndicatorManager) handleTaskProgress(e events.Event) {
+	if m.streams == nil || m.streams.depth() == 0 {
+		return
+	}
+	summary := safeFragment(progressSummary(e.Payload))
+	if summary == "" {
+		return
+	}
+	m.refreshFromTask(e, progressStep{kind: progressRaw, arg: summary})
+}
+
+// handleTaskMessage plays the run's transcript into the bubble — the tool
+// calls and the reasoning between them, which are the whole middle of a run.
+//
+// The order of the two cheap rejections matters. The store is checked first so
+// that a deployment with no WeCom bubble open pays nothing at all for this
+// subscription; the message is classified second, which drops tool results and
+// the answer being written — most of the event's volume — before anything
+// reaches the database.
+func (m *TypingIndicatorManager) handleTaskMessage(e events.Event) {
+	if m.streams == nil || m.streams.depth() == 0 {
+		return
+	}
+	step, ok := stepFromTaskMessage(e.Payload)
+	if !ok {
+		return
+	}
+	m.refreshFromTask(e, step)
+}
+
+// refreshFromTask resolves the bubble behind a transcript event and records the
+// step in it, under the id of the run that produced it.
+func (m *TypingIndicatorManager) refreshFromTask(e events.Event, step progressStep) {
+	sessionID, taskID, roundID, ok := m.progressTarget(e)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), progressWriteTimeout)
+	defer cancel()
+	m.recordStep(ctx, sessionID, taskID, roundID, step)
+}
+
+// progressTarget resolves a transcript event to the chat session behind the
+// run and the round the run belongs to.
+//
+// Neither task:progress nor task:message carries a chat session — both are
+// published against a task id and nothing else — so the row is the only
+// answer, and one run posts dozens of them. Hence the cache, which also
+// remembers the tasks that have NO chat session so an issue or autopilot run
+// asks once and then costs nothing. The round comes off the same row: see
+// task_sessions.go for why that column is what an auto-retry clone is resolved
+// through.
+func (m *TypingIndicatorManager) progressTarget(e events.Event) (pgtype.UUID, string, string, bool) {
+	if m.tasks == nil {
+		return pgtype.UUID{}, "", "", false
+	}
+	taskID := taskIDFromEvent(e)
+	if taskID == "" {
+		return pgtype.UUID{}, "", "", false
+	}
+	if cached, hit := m.taskSessions.get(taskID); hit {
+		return cached.session, taskID, cached.round, cached.session.Valid
+	}
+	id, err := util.ParseUUID(taskID)
+	if err != nil || !id.Valid {
+		return pgtype.UUID{}, "", "", false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), taskLookupTimeout)
+	task, err := m.tasks.GetAgentTask(ctx, id)
+	cancel()
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// A row that is not there has no chat session and never will — a run
+		// cancelled and deleted while its transcript was still flushing.
+		// Remembering that is what stops its remaining messages from putting a
+		// read behind every one.
+		m.taskSessions.put(taskID, taskRound{})
+		return pgtype.UUID{}, "", "", false
+	case err != nil:
+		// A failure is not an answer, but re-asking is worse than waiting: the
+		// rest of this batch would each put another round trip on the daemon's
+		// request, on a database that has just shown it is in no state to serve
+		// them. Remembered for seconds, not minutes.
+		m.taskSessions.putFailure(taskID)
+		return pgtype.UUID{}, "", "", false
+	}
+	round := taskRound{session: task.ChatSessionID}
+	if task.ChatInputTaskID.Valid {
+		round.round = util.UUIDToString(task.ChatInputTaskID)
+	}
+	m.taskSessions.put(taskID, round)
+	return round.session, taskID, round.round, round.session.Valid
+}
+
+// recordStep folds one step into the bubble of the round it belongs to and
+// writes the result.
+//
+// taskID is the run that published the step; roundID is the round that run
+// belongs to, which differs only for an auto-retry clone — FailTask gives the
+// clone a fresh id and the round is still filed under the id the flush bound,
+// which the clone inherited as chat_input_task_id. Both are tried, in that
+// order, for the same reason roundTaker tries both when an ending arrives.
+//
+// Three properties are deliberate. Content is a full replacement, not a delta,
+// so a frame carries the whole list and no caller has to know what the bubble
+// says now. A refresh yields when the previous frame has not been acked (the
+// backpressure the official SDK calls replyStreamNonBlocking) because progress
+// is worth less than the answer behind it, and it yields again to the feed's
+// own minimum interval, which folds a burst of tool calls into one frame. And
+// a refresh that merely fails leaves the spinner exactly as it was, for the
+// answer or the guard to finish properly.
+//
+// The one thing a refresh does end is a bubble the server has disowned; see
+// markUnusable for why that stop condition is not optional.
+func (m *TypingIndicatorManager) recordStep(ctx context.Context, sessionID pgtype.UUID, taskID, roundID string, step progressStep) {
+	if m.senders == nil || m.streams == nil || !sessionID.Valid {
+		return
+	}
+	h, feed, ok := m.streams.feedFor(sessionID, taskID)
+	if !ok && roundID != "" && roundID != taskID {
+		h, feed, ok = m.streams.feedFor(sessionID, roundID)
+	}
+	if !ok {
+		// No bubble to write into: a session that is not WeCom's, a round
+		// whose bubble is already over, or a run whose bubble belongs to
+		// somebody else. A step has no second address and asks for none —
+		// feedFor says why.
+		return
+	}
+	if h.Level == progressLevelNone {
+		// A group, or a colleague's own chat. The bubble stays as the opening
+		// frame painted it and the answer seals it; nothing in between is
+		// theirs to read. Stopping here rather than one layer down is what
+		// keeps a bubble that shows nothing from spending a socket write per
+		// tool call for the length of the run.
+		return
+	}
+	content := feed.record(step, copyFor(h.Locale), h.CreatedAt, h.Level)
+	if content == "" {
+		// Inside the refresh interval. The step is in the list and the next
+		// frame carries it; sending one per tool call would spend the bot's
+		// socket on frames nobody can read that fast.
+		return
+	}
+	err := m.senders.stream(ctx, h, content, false)
+	switch {
+	case err == nil:
+	case errors.Is(err, errStreamBusy), errors.Is(err, errStreamSuperseded):
+		// The previous frame is still in flight, or the answer got there
+		// first. Skipping is the design in both cases.
+	case streamUnusable(err):
+		if !m.streams.markUnusable(sessionID, h.StreamID) {
+			// A refresh that raced into the same refusal got here first and
+			// has already said it.
+			return
+		}
+		m.log.WarnContext(ctx, "wecom typing: bubble disowned by the server, answering as a new message",
+			"chat_session_id", util.UUIDToString(sessionID),
+			"installation_id", util.UUIDToString(h.InstallationID), "error", err)
+		// Nothing can close this bubble now — the stream takes no further
+		// frame — so the spinner turns for good and the user is owed a word
+		// about where the rest of the round is going to appear instead. Said
+		// once: the mark is what makes this the only refresh that gets here.
+		if sendErr := m.senders.sendTextCtx(ctx, h.InstallationID, h.ChatID, h.ChatType,
+			copyFor(h.Locale).StreamStuck); sendErr != nil {
+			m.log.WarnContext(ctx, "wecom typing: could not say the bubble is stuck",
+				"chat_session_id", util.UUIDToString(sessionID), "error", sendErr)
+		}
+	default:
+		m.log.DebugContext(ctx, "wecom typing: progress refresh failed",
+			"chat_session_id", util.UUIDToString(sessionID), "error", err)
+	}
+}
+
+// progressSummary reads the human-readable line off a task:progress payload,
+// typed in-process or in its map form after a serialization round trip.
+func progressSummary(payload any) string {
+	switch p := payload.(type) {
+	case protocol.TaskProgressPayload:
+		return p.Summary
+	case map[string]any:
+		if s, _ := p["summary"].(string); s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 // handleTaskFailed says a run died, in the bubble if there still is one and as
@@ -747,6 +1054,8 @@ func taskIDFromEvent(e events.Event) string {
 	case protocol.ChatDonePayload:
 		return p.TaskID
 	case protocol.TaskProgressPayload:
+		return p.TaskID
+	case protocol.TaskMessagePayload:
 		return p.TaskID
 	case map[string]any:
 		s, _ := p["task_id"].(string)

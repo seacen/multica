@@ -282,12 +282,20 @@ func (o *Outbound) deliverAnswer(ctx context.Context, sessionID pgtype.UUID, t r
 		// hand the frame a head that fits and then push it back over the cap.
 		// Defusing is idempotent, so the frame's own pass is a no-op.
 		head, rest := splitForBubble(defuseThinkTags(text))
-		if err := o.finishStream(ctx, t.Handle, head); err == nil {
-			o.sendRest(ctx, t.Handle, rest)
-			return t.Handle.address(), nil
+		// A bubble the server has disowned mid-run is not written to again: the
+		// typing indicator was told this stream takes no frame, has already
+		// said so to the reader, and every further attempt is a refusal charged
+		// against the whole bot's rate limit. This is the new message it
+		// promised.
+		if !t.Handle.Unusable {
+			if err := o.finishStream(ctx, t.Handle, head); err == nil {
+				o.sendRest(ctx, t.Handle, rest)
+				return t.Handle.address(), nil
+			}
 		}
-		// The frame was refused. Say it as a new message instead, and do not
-		// re-send the stream frame: 846608 and 846605 both mean this stream
+		// The frame was refused, or was never worth attempting. Say it as a
+		// new message instead, and do not re-send the stream frame: 846608 and
+		// 846605 both mean this stream
 		// will never take another one, and a transport error leaves it unknown
 		// whether the first frame landed — a second could print the answer
 		// twice in the same bubble. The plain message is the one route whose

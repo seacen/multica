@@ -218,6 +218,25 @@ type streamHandle struct {
 	// minutes after the goroutine that knew who asked is gone.
 	Locale Locale
 
+	// Level is how much of the run this bubble may show while it is still
+	// going (progress_render.go). It is settled when the bubble is opened,
+	// while who asked and where they asked is still known, and read again on
+	// every refresh — the events that drive those refreshes name a task and
+	// nothing about a person.
+	//
+	// Settled PER ROUND, never carried over from the last one: the binding it
+	// is decided from can be revoked, or re-pointed at a different person,
+	// between two questions in the same chat, and the round after that must
+	// not still be showing file paths on the strength of the round before it.
+	Level progressLevel
+
+	// Unusable says the server has disowned this stream (846605 / 846608): the
+	// bubble it painted is on the user's screen and no frame will ever touch
+	// it again, so what is left of the handle is the addressing. A caller that
+	// gets one writes its words as a plain message instead of a frame. Set by
+	// the store on the way out of takeAtLocked.
+	Unusable bool
+
 	CreatedAt time.Time
 }
 
@@ -585,6 +604,18 @@ type roundEntry struct {
 	// stream window runs out.
 	guard *time.Timer
 
+	// feed is the bubble's scrolling list of steps, created on the first one
+	// that reaches it (progress_render.go). It lives here rather than beside
+	// the store's maps so it dies exactly when the round does — a list of a
+	// finished run's tool calls has nothing left to be painted into.
+	feed *progressFeed
+
+	// unusable is the server's verdict that this stream takes no further
+	// frame, kept rather than acted on by forgetting the round. The bubble is
+	// over either way; the round is not, and the handle is the only address
+	// its ending has.
+	unusable bool
+
 	// createdAt bounds the entry for the sweep when there is no handle to read
 	// a time off.
 	createdAt time.Time
@@ -820,8 +851,74 @@ func (s *streamStore) takeAtLocked(key string, i int, ending roundEnding) (round
 	turn := roundTurn{Addr: addr, Promised: promised, Verdict: roundOwesAnEnding}
 	if entry.painted && !s.expiredLocked(entry.handle.CreatedAt) {
 		turn.Handle, turn.HasBubble = entry.handle, true
+		// The server's verdict travels with the handle: a stream it has
+		// disowned still names the chat, and that addressing is all a caller
+		// can use. Writing another frame to it would be one more refusal
+		// charged against the whole bot's rate limit.
+		turn.Handle.Unusable = entry.unusable
 	}
 	return turn, pending
+}
+
+// feedFor hands back the bubble a step belongs in, and the scrolling list that
+// bubble is painted from. The step is addressed by the run the debounced flush
+// bound to the round, so a session with several rounds open never has to guess.
+//
+// The feed is created lazily, on the first step that reaches a round, and lives
+// on the entry so it dies exactly when the round does — a list of a finished
+// run's tool calls has nothing left to be painted into.
+func (s *streamStore) feedFor(sessionID pgtype.UUID, taskID string) (streamHandle, *progressFeed, bool) {
+	if taskID == "" {
+		return streamHandle{}, nil, false
+	}
+	key := util.UUIDToString(sessionID)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.sessions[key] {
+		if r.taskID != taskID {
+			continue
+		}
+		// Three ways a round on the list still has nowhere to put a step. No
+		// bubble: the flush filed the round before the ingest goroutine
+		// painted one, or the opening frame was refused. Past the window: the
+		// server refuses the frame and the ending will fall back to a plain
+		// message. Disowned: another connection owns this conversation now,
+		// and every frame from here is a refusal counted against the whole
+		// bot's rate limit.
+		if !r.painted || r.unusable || s.expiredLocked(r.handle.CreatedAt) {
+			return streamHandle{}, nil, false
+		}
+		if r.feed == nil {
+			r.feed = newProgressFeed(s.now)
+		}
+		return r.handle, r.feed, true
+	}
+	return streamHandle{}, nil, false
+}
+
+// markUnusable records the server's verdict that a round's stream will take no
+// further frame. It reports whether this call is the one that learned it, so
+// the reader is told once rather than on every refusal that follows.
+//
+// The round is kept rather than forgotten: the bubble is over, the round is
+// not, and the handle is the only address its ending has.
+func (s *streamStore) markUnusable(sessionID pgtype.UUID, streamID string) bool {
+	if streamID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.sessions[util.UUIDToString(sessionID)] {
+		if r.painted && r.handle.StreamID == streamID {
+			if r.unusable {
+				return false
+			}
+			r.unusable = true
+			return true
+		}
+	}
+	return false
 }
 
 // sayEnding is the only way this store's ending ledger is written, and the
@@ -1226,6 +1323,15 @@ func (s *streamStore) depth() int {
 		}
 	}
 	return n
+}
+
+// hasRounds reports whether a session has any round on file. It gates the one
+// database read the retry-clone lookup costs, so a session with nothing open
+// never pays for it.
+func (s *streamStore) hasRounds(sessionID pgtype.UUID) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.sessions[util.UUIDToString(sessionID)]) > 0
 }
 
 func (s *streamStore) expiredLocked(createdAt time.Time) bool {
