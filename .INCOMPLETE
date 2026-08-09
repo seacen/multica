@@ -1,0 +1,25 @@
+这棵树不完整:重建中途停了,只包含停之前合进去的分支。
+别拿它当集成树看,别据此判断"某个功能在不在"。
+重跑 rebuild-integration.sh 直到这个文件消失。
+
+还没合进来的:
+  feat/wecom-stream-bubble
+  feat/wecom-voice-transcripts
+  wip/wecom-attachment-bubble-seam
+  wip/wecom-attachment-copy
+  wip/wecom-bubble-copy
+  wip/wecom-capabilities
+  wip/wecom-lint
+  wip/wecom-locale
+  wip/wecom-long-replies
+  wip/wecom-media-abandon-notice
+  wip/wecom-media-copy
+  wip/wecom-observability-features
+  wip/wecom-progress-steps
+  wip/wecom-quoted-messages
+  wip/wecom-receipt-dedup
+  wip/wecom-smoke-test
+  wip/wecom-swap-clears-bindings
+  wip/wecom-voice-receipt-seam
+  wip/wecom-welcome-copy
+  refs/ext/pr6581
