@@ -251,9 +251,12 @@ func (r *OutboundReplier) post(ctx context.Context, inst engine.ResolvedInstalla
 // the reporter needs to know where the discussion already is, not to be handed
 // an id they will read as their own.
 //
-// That title belongs to the pre-existing issue, so it is text some other member
-// wrote, and the reply ships as markdown — which is why the pack's renderer
-// runs it through breakMemberLinks. See markdown.go.
+// That title belongs to the pre-existing issue, so it is text some *other*
+// member wrote — not even the reporter's own, which is what makes this the
+// worse of the two /issue call sites — and the reply ships as markdown. The
+// pack's renderer runs it through breakMemberLinks, the same entry point
+// issueCreated uses: it breaks the inline "](" form and the link reference
+// definition a multi-line title can smuggle instead. See markdown.go.
 func issueDuplicateText(res engine.Result, c copyPack) string {
 	return c.issueDuplicate(issueRef(res), res.IssueTitle)
 }
