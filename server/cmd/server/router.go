@@ -699,15 +699,6 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				slog.Info("wecom deployment locale",
 					"locale", wecom.SetDeploymentLocale(os.Getenv("MULTICA_WECOM_DEFAULT_LOCALE")))
 
-				// Which language the bot writes its OWN copy in for readers
-				// it cannot look a language up for — a group chat, or anyone
-				// not linked to a Multica account yet. A linked person always
-				// overrides this with their profile language. An unrecognised
-				// value leaves the default (zh-Hans) in place, which is why
-				// the resolved one is logged rather than the raw one.
-				slog.Info("wecom deployment locale",
-					"locale", wecom.SetDeploymentLocale(os.Getenv("MULTICA_WECOM_DEFAULT_LOCALE")))
-
 				// Durable outbound queue. WeCom is the first channel on it,
 				// and the reason it exists: aibot has no outbound REST path,
 				// so a reply can only be written by the replica holding the
