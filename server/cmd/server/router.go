@@ -734,6 +734,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					Welcome:     queries,
 					Binding:     wecomBinding,
 					AppURL:      appURLFromEnv(),
+					// The unsupported-kind receipt is sent from the adapter,
+					// before the Router sees the message, so it is the one
+					// reply the Router's own dedup cannot cover. Same table,
+					// same key, so the two can never both answer.
+					Dedup: wecom.NewDeduper(wecomStore),
 				})
 				// Streaming replies: WeCom's smart-bot protocol has no
 				// typing indicator, no reaction and no read receipt, so the
