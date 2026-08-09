@@ -99,11 +99,26 @@ type wecomChannel struct {
 	binding  binder
 	appURL   string
 	bindPath string
+
+	// metrics is the health sink (metrics.go). Never read directly — go
+	// through mx(), which substitutes the no-op sink for a channel built
+	// without one.
+	metrics Metrics
 }
 
 var _ channel.Channel = (*wecomChannel)(nil)
 
 func (c *wecomChannel) Type() channel.Type { return TypeWecom }
+
+// mx returns a sink that is always safe to call. Tests construct
+// wecomChannel literals without one, and a deployment with /metrics off
+// wires nil deliberately.
+func (c *wecomChannel) mx() Metrics {
+	if c.metrics == nil {
+		return nopMetrics{}
+	}
+	return c.metrics
+}
 
 // Capabilities declares what the aibot adapter supports today. Inbound
 // attachments are downloaded, decrypted and bound (media_ingest.go), so
@@ -154,6 +169,7 @@ func (c *wecomChannel) Connect(ctx context.Context) (err error) {
 
 	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
+		c.mx().RecordConnectFailure()
 		return fmt.Errorf("wecom: dial %s: %w", wsURL, err)
 	}
 	defer conn.Close()
@@ -355,6 +371,18 @@ func (c *wecomChannel) Connect(ctx context.Context) (err error) {
 		case cmdMsgCallback, cmdEventCallback:
 			select {
 			case callbacks <- env:
+				c.mx().RecordCallbackQueued()
+				continue
+			default:
+				// The worker is behind. Blocking is the deliberate choice
+				// (see below), and it is also the thing an operator wants to
+				// know about — from here on the socket stops being drained,
+				// and if it lasts, WeCom replaces the connection.
+				c.mx().RecordCallbackQueueBlocked()
+			}
+			select {
+			case callbacks <- env:
+				c.mx().RecordCallbackQueued()
 			case <-cbDone:
 				// The worker has stopped, so this send has no receiver — and
 				// no closer either: the queue is closed by a defer that
@@ -408,6 +436,7 @@ func (c *wecomChannel) subscribe(ctx context.Context, conn wsConn, sender *wsSen
 		"headers": frameHeaders{ReqID: reqID},
 		"body":    subscribeBody(c.botID, c.secret),
 	}); err != nil {
+		c.mx().RecordConnectFailure()
 		return fmt.Errorf("wecom: send subscribe: %w", err)
 	}
 
@@ -423,6 +452,13 @@ func (c *wecomChannel) subscribe(ctx context.Context, conn wsConn, sender *wsSen
 		}
 		typ, payload, err := conn.ReadMessage()
 		if err != nil {
+			// The socket died, the ack never arrived inside
+			// subscribeTimeout, or our own ctx was cancelled mid-read and
+			// the watchdog closed the socket under us. Infrastructure or a
+			// shutdown — nobody has to be told either way, and the next
+			// backoff may well succeed. A rolling restart therefore adds a
+			// few counts here; the rate matters, a handful does not.
+			c.mx().RecordConnectFailure()
 			return fmt.Errorf("wecom: subscribe read: %w", err)
 		}
 		if typ != websocket.TextMessage && typ != websocket.BinaryMessage {
@@ -440,6 +476,12 @@ func (c *wecomChannel) subscribe(ctx context.Context, conn wsConn, sender *wsSen
 			continue
 		}
 		if env.ErrCode != 0 {
+			// The server refused the handshake on its merits: a wrong
+			// secret, a deleted bot, a bot whose long connection is off.
+			// Counted apart from every other connection failure because this
+			// is the only one that will repeat identically on every backoff
+			// until a person changes something.
+			c.mx().RecordAuthFailure()
 			return classifySubscribeAck(log, env.ErrCode, env.ErrMsg)
 		}
 		return nil
@@ -608,6 +650,11 @@ type ChannelDeps struct {
 	// constructor. Nil in tests that don't exercise outbound.
 	Senders *sendersRegistry
 
+	// Metrics is the health sink every built channel reports through. Nil
+	// discards every counter, which is what a deployment with /metrics
+	// turned off gets.
+	Metrics Metrics
+
 	// Dialer overrides the default gorilla dialer. Tests point it at an
 	// httptest server; production leaves this nil.
 	Dialer Dialer
@@ -671,6 +718,7 @@ func newWecomFactory(deps ChannelDeps) channel.Factory {
 			welcome:        deps.Welcome,
 			appURL:         strings.TrimRight(deps.AppURL, "/"),
 			bindPath:       normalizeBindingPath(deps.BindingPath),
+			metrics:        orNopMetrics(deps.Metrics),
 		}
 		// Assigned through the interface only when non-nil: a nil
 		// *BindingTokenService stored in a binder would be a non-nil interface
