@@ -569,7 +569,7 @@ func TestZhHansPackIsTheCopyThatAlreadyShipped(t *testing.T) {
 	want := map[string]string{
 		"AgentOffline":         "⚠️ 智能体当前不在线，你的消息已收到，等它上线后会处理。",
 		"AgentArchived":        "⚠️ 该智能体已归档，无法回复。请联系工作区管理员。",
-		"UnsupportedMsgType":   "抱歉，我目前只能处理文字消息。",
+		"UnsupportedMsgType":   "抱歉，我暂时无法处理这类消息。",
 		"BindingPromptPrefix":  "👋 请先绑定你的 Multica 账号，才能与我对话：\n",
 		"BindingPromptSuffix":  "\n（链接 15 分钟内有效）",
 		"BindingPending":       "👋 绑定链接刚才已经发给你了，就在上方，请直接点击完成绑定。",
@@ -587,6 +587,22 @@ func TestZhHansPackIsTheCopyThatAlreadyShipped(t *testing.T) {
 		"StreamProgressPrefix": "正在处理：",
 		"InboxDetailLink":      "查看详情",
 		"InboxTypeFallback":    "新消息",
+
+		"QuotePrefix":     "引用：",
+		"MediaTooLarge":   "抱歉，附件太大了，我这边收不下。",
+		"MediaUnreadable": "抱歉，有附件没能收到，麻烦重新发一次。",
+		"MediaSendFailed": "⚠️ 有文件没能发出来，我这边保留着，需要的话我再试一次。",
+
+		"WelcomeBound":          "👋 你好，我是 Multica 智能助手。有事直接发消息给我，或者用 “/issue 标题” 建一条任务。图片、文件、语音都可以发给我。",
+		"WelcomeUnboundPrefix":  "👋 你好，我是 Multica 智能助手。请先绑定你的 Multica 账号，才能与我对话：\n",
+		"WelcomeUnboundSuffix":  "\n（链接 15 分钟内有效）",
+		"WelcomeUnboundPending": "👋 你好，我是 Multica 智能助手。绑定链接刚才已经发给你了，就在上方，请直接点击完成绑定。",
+
+		"TaskFailedNotice":        "⚠️ %s处理这条消息时失败了。",
+		"TaskFailedAgentFallback": "智能体",
+		"TaskFailedReason":        "\n原因：%s",
+
+		"StreamNoReplyWithFiles": "（这轮没有文字回复，附件在下面）",
 	}
 	wantLabels := map[string]string{
 		"issue_assigned":     "任务指派",

@@ -386,7 +386,7 @@ var copyPacks = map[Locale]copyPack{
 		BindingPending:       "👋 绑定链接刚才已经发给你了，就在上方，请直接点击完成绑定。",
 		BindingSentPrivately: "👋 已把绑定链接私发给你，请在与我的单聊里点击完成绑定。",
 
-		WelcomeBound:          "👋 你好，我是 Multica 智能助手。有事直接发消息给我，或者用 “/issue 标题” 建一条任务。（目前只能处理文字消息）",
+		WelcomeBound:          "👋 你好，我是 Multica 智能助手。有事直接发消息给我，或者用 “/issue 标题” 建一条任务。图片、文件、语音都可以发给我。",
 		WelcomeUnboundPrefix:  "👋 你好，我是 Multica 智能助手。请先绑定你的 Multica 账号，才能与我对话：\n",
 		WelcomeUnboundSuffix:  "\n（链接 15 分钟内有效）",
 		WelcomeUnboundPending: "👋 你好，我是 Multica 智能助手。绑定链接刚才已经发给你了，就在上方，请直接点击完成绑定。",
@@ -467,7 +467,7 @@ var copyPacks = map[Locale]copyPack{
 		BindingPending:       "👋 I already sent you a link — it is just above, tap it to finish linking.",
 		BindingSentPrivately: "👋 I've sent the link to your direct chat with me — tap it there to finish linking.",
 
-		WelcomeBound:          "👋 Hi, I'm the Multica assistant. Send me whatever you need, or file a task with “/issue <title>”. (I can only read text messages for now.)",
+		WelcomeBound:          "👋 Hi, I'm the Multica assistant. Send me whatever you need, or file a task with “/issue <title>”. Photos, files and voice notes are fine too.",
 		WelcomeUnboundPrefix:  "👋 Hi, I'm the Multica assistant. Link your Multica account before we can talk:\n",
 		WelcomeUnboundSuffix:  "\n(the link is good for 15 minutes)",
 		WelcomeUnboundPending: "👋 Hi, I'm the Multica assistant. I already sent you a link — it is just above, tap it to finish linking.",
