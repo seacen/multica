@@ -10,15 +10,21 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
+	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 // countingMetrics records every call so a test can assert on the shape of what
@@ -48,6 +54,16 @@ func (m *countingMetrics) RecordConnectFailure()       { m.bump("connect_failure
 func (m *countingMetrics) RecordAuthFailure()          { m.bump("auth_failure") }
 func (m *countingMetrics) RecordCallbackQueued()       { m.bump("callback_queued") }
 func (m *countingMetrics) RecordCallbackQueueBlocked() { m.bump("callback_blocked") }
+func (m *countingMetrics) RecordStreamFinished()       { m.bump("stream_finished") }
+func (m *countingMetrics) RecordStreamFellBack()       { m.bump("stream_fell_back") }
+func (m *countingMetrics) RecordWelcomeSent()          { m.bump("welcome_sent") }
+func (m *countingMetrics) RecordWelcomeSkipped()       { m.bump("welcome_skipped") }
+func (m *countingMetrics) RecordWelcomeFailed()        { m.bump("welcome_failed") }
+
+// The reason is part of what is asserted, not a detail: "an attachment
+// failed" and "the guard refused the address it resolved to" send an operator
+// to two different places.
+func (m *countingMetrics) RecordMediaFailure(reason string) { m.bump("media_failure:" + reason) }
 
 var _ Metrics = (*countingMetrics)(nil)
 
@@ -346,4 +362,221 @@ type failingDialer struct{ err error }
 
 func (d failingDialer) DialContext(context.Context, string, http.Header) (wsConn, *http.Response, error) {
 	return nil, nil, d.err
+}
+
+// ---- the bubble ----
+//
+// The bubble is the one feature whose failure is invisible from the outside:
+// the answer arrives either way, just as a separate message instead of in the
+// bubble the question opened. Nobody files a ticket about that, so the ratio
+// between these two counters is the only thing that can say the bubble has
+// stopped working — after a WeCom-side change to the stream frame, say.
+
+func TestAnAnswerThatLandsInTheBubbleIsCountedAsFinished(t *testing.T) {
+	t.Parallel()
+	mx := newCountingMetrics()
+	rig := newBubbleRig(t)
+	rig.senders.WithMetrics(mx)
+
+	rig.ran(t, "REQ-M1", 1, "task-1")
+	rig.answer(t, "the agent reply", "task-1")
+
+	if got := mx.get("stream_finished"); got != 1 {
+		t.Fatalf("stream_finished = %d, want 1 — an answer sealed the bubble and nothing counted it, so a dashboard has no denominator to read fall-backs against", got)
+	}
+	if got := mx.get("stream_fell_back"); got != 0 {
+		t.Fatalf("stream_fell_back = %d, want 0 — a bubble that worked was counted as a failure", got)
+	}
+}
+
+func TestAnAnswerSentAsANewMessageIsCountedAsFallenBack(t *testing.T) {
+	t.Parallel()
+	mx := newCountingMetrics()
+	rig := newBubbleRig(t)
+	rig.senders.WithMetrics(mx)
+	rig.conn.refuseClosingCode = errcodeStreamExpired
+
+	rig.ran(t, "REQ-M2", 1, "task-1")
+	rig.answer(t, "the agent reply", "task-1")
+
+	// The answer still reaches the user, which is why nobody reports this.
+	if pushes := rig.conn.pushes(t); len(pushes) != 1 {
+		t.Fatalf("the refused bubble delivered %d messages, want 1 — this test's premise is gone", len(pushes))
+	}
+	if got := mx.get("stream_fell_back"); got != 1 {
+		t.Fatalf("stream_fell_back = %d, want 1 — every bubble on this deployment could be refusing its closing frame and nothing would say so", got)
+	}
+	if got := mx.get("stream_finished"); got != 0 {
+		t.Fatalf("stream_finished = %d, want 0 — a refused closing frame was counted as a bubble that worked", got)
+	}
+}
+
+// ---- the greeting ----
+//
+// A greeting is never retried and its failure is never told to anybody: the
+// req_id it answers is spent, and the person is left looking at an empty
+// window. The counter is the only trace.
+
+func TestAGreetingThatWentOutIsCountedAsSent(t *testing.T) {
+	t.Parallel()
+	mx := newCountingMetrics()
+	lookup := &fakeWelcomeLookup{binding: db.ChannelUserBinding{MulticaUserID: mustTestUUID(t)}}
+	c, conn, sender := welcomeRig(t, lookup, nil)
+	c.metrics = mx
+
+	c.handleEnterChat(context.Background(), enterChatFrame(t, "req-m1", "single", "T-alex"), sender, slog.Default())
+
+	if welcomeSaid(t, conn) == "" {
+		t.Fatal("no greeting was written; this test's premise is gone")
+	}
+	if got := mx.get("welcome_sent"); got != 1 {
+		t.Fatalf("welcome_sent = %d, want 1 — with nothing counted here, 'is the bot greeting people?' has no answer at all", got)
+	}
+}
+
+// A group is skipped on purpose, and it must not read as a failure — the
+// number an operator alerts on is failed, and a busy group would bury it.
+func TestAGroupIsCountedAsSkippedAndNotAsFailed(t *testing.T) {
+	t.Parallel()
+	mx := newCountingMetrics()
+	c, conn, sender := welcomeRig(t, &fakeWelcomeLookup{}, nil)
+	c.metrics = mx
+
+	c.handleEnterChat(context.Background(), enterChatFrame(t, "req-m2", "group", "T-alex"), sender, slog.Default())
+
+	if said := welcomeSaid(t, conn); said != "" {
+		t.Fatalf("the bot greeted a group: %q", said)
+	}
+	if got := mx.get("welcome_skipped"); got != 1 {
+		t.Fatalf("welcome_skipped = %d, want 1 — a deliberate skip that counts nothing is indistinguishable from the handler never running", got)
+	}
+	if got := mx.get("welcome_failed"); got != 0 {
+		t.Fatalf("welcome_failed = %d, want 0 — a deliberate skip counted as a failure makes the alert fire on group traffic", got)
+	}
+}
+
+// The window closed: the write was refused, the req_id is spent, and the
+// person who opened the chat is looking at nothing.
+func TestAGreetingThatCouldNotBeWrittenIsCountedAsFailed(t *testing.T) {
+	t.Parallel()
+	mx := newCountingMetrics()
+	lookup := &fakeWelcomeLookup{binding: db.ChannelUserBinding{MulticaUserID: mustTestUUID(t)}}
+	c, conn, _ := welcomeRig(t, lookup, nil)
+	c.metrics = mx
+	// A socket that takes the frame and never acks it. respondWelcome waits
+	// for the reply that will not come and gives up with the handler's
+	// deadline — the shape of a window that closed.
+	dead := &recordingConn{}
+	sender := newWSSender(dead, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	c.handleEnterChat(ctx, enterChatFrame(t, "req-m3", "single", "T-alex"), sender, slog.Default())
+
+	if said := welcomeSaid(t, conn); said != "" {
+		t.Fatalf("the greeting reached the wrong socket: %q", said)
+	}
+	if got := mx.get("welcome_failed"); got != 1 {
+		t.Fatalf("welcome_failed = %d, want 1 — a greeting that never landed leaves no other trace: no retry, no user-visible error, one WARN line", got)
+	}
+	if got := mx.get("welcome_sent"); got != 0 {
+		t.Fatalf("welcome_sent = %d, want 0 — a greeting that was never delivered was counted as delivered", got)
+	}
+}
+
+// ---- attachments ----
+//
+// A failed attachment leaves the message body saying "[Image]", so the agent
+// answers as though it had been shown a picture it never received. The sender
+// gets one apology; the operator gets this, and the reason is the whole point
+// of it — a blocked address is a configuration fault on this side, and it is
+// the one an apology cannot describe.
+
+func TestABlockedMediaAddressIsCountedUnderItsOwnReason(t *testing.T) {
+	t.Parallel()
+	mx := newCountingMetrics()
+	senders := newSendersRegistry().WithMetrics(mx)
+	storage := &fakeMediaStorage{}
+	r := newTestResolver(storage, newFakeMediaLedger(storage), senders)
+	// The production client, which refuses a host that resolves to a
+	// non-public address — the guard this counter is about.
+	r.http = newMediaHTTPClient(mediaGuard{})
+
+	srv := cosServer(t, []byte("never fetched"), "")
+	defer srv.Close()
+
+	r.ResolveMedia(context.Background(), mediaInstallation(), engine.ResolvedIdentity{}, pgtype.UUID{}, mustTestUUID(t),
+		mediaMessage(t, "image", map[string]any{
+			"image": map[string]any{"url": srv.URL + "/a.enc", "aeskey": testAESKey},
+		}))
+
+	if got := mx.get("media_failure:blocked_address"); got != 1 {
+		t.Fatalf("media_failure{reason=blocked_address} = %d, want 1 — the SSRF guard refusing every attachment on this deployment looks exactly like nobody sending any", got)
+	}
+	if got := mx.get("media_failure:unreadable"); got != 0 {
+		t.Fatalf("a blocked address was counted as unreadable (%d) — that sends the operator to WeCom when the fix is MULTICA_WECOM_MEDIA_ALLOW_CIDRS", got)
+	}
+}
+
+func TestAnOversizeAttachmentIsCountedApartFromAnUnreadableOne(t *testing.T) {
+	t.Parallel()
+	mx := newCountingMetrics()
+	senders := newSendersRegistry().WithMetrics(mx)
+	storage := &fakeMediaStorage{}
+	r := newTestResolver(storage, newFakeMediaLedger(storage), senders)
+
+	big := cosServer(t, make([]byte, maxMediaBytes+1), "")
+	defer big.Close()
+	r.ResolveMedia(context.Background(), mediaInstallation(), engine.ResolvedIdentity{}, pgtype.UUID{}, mustTestUUID(t),
+		mediaMessage(t, "file", map[string]any{
+			"file": map[string]any{"url": big.URL + "/big.enc", "aeskey": testAESKey},
+		}))
+
+	// A url that answers 404 — the ordinary five-minute link that lapsed.
+	gone := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer gone.Close()
+	r.ResolveMedia(context.Background(), mediaInstallation(), engine.ResolvedIdentity{}, pgtype.UUID{}, mustTestUUID(t),
+		mediaMessage(t, "file", map[string]any{
+			"file": map[string]any{"url": gone.URL + "/gone.enc", "aeskey": testAESKey},
+		}))
+
+	if got := mx.get("media_failure:too_large"); got != 1 {
+		t.Fatalf("media_failure{reason=too_large} = %d, want 1", got)
+	}
+	if got := mx.get("media_failure:unreadable"); got != 1 {
+		t.Fatalf("media_failure{reason=unreadable} = %d, want 1 — an expired link and a file over the ceiling need different answers, and one number cannot give either", got)
+	}
+}
+
+// One message, four attachments, all of them dead: the sender is told once,
+// deliberately. The operator's number is not the apology's number — "how much
+// media is this deployment losing" is four, and collapsing it would understate
+// an outage by however many files people happen to attach at a time.
+func TestEveryLostAttachmentIsCountedEvenThoughTheSenderIsToldOnce(t *testing.T) {
+	t.Parallel()
+	mx := newCountingMetrics()
+	senders := newSendersRegistry().WithMetrics(mx)
+	storage := &fakeMediaStorage{}
+	r := newTestResolver(storage, newFakeMediaLedger(storage), senders)
+
+	gone := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer gone.Close()
+
+	items := make([]any, 0, 4)
+	for i := 0; i < 4; i++ {
+		items = append(items, map[string]any{
+			"msgtype": "image",
+			"image":   map[string]any{"url": gone.URL + "/" + strconv.Itoa(i) + ".enc", "aeskey": testAESKey},
+		})
+	}
+	r.ResolveMedia(context.Background(), mediaInstallation(), engine.ResolvedIdentity{}, pgtype.UUID{}, mustTestUUID(t),
+		mediaMessage(t, "mixed", map[string]any{"mixed": map[string]any{"msg_item": items}}))
+
+	if got := mx.get("media_failure:unreadable"); got != 4 {
+		t.Fatalf("media_failure{reason=unreadable} = %d, want 4 — counting per message instead of per attachment understates an outage by however many files people attach at once", got)
+	}
 }

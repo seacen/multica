@@ -479,12 +479,9 @@ func (c *wecomChannel) subscribe(ctx context.Context, conn wsConn, sender *wsSen
 		}
 		typ, payload, err := conn.ReadMessage()
 		if err != nil {
-			// The socket died, the ack never arrived inside
-			// subscribeTimeout, or our own ctx was cancelled mid-read and
-			// the watchdog closed the socket under us. Infrastructure or a
-			// shutdown — nobody has to be told either way, and the next
-			// backoff may well succeed. A rolling restart therefore adds a
-			// few counts here; the rate matters, a handful does not.
+			// The socket died, or the ack never arrived inside
+			// subscribeTimeout. Infrastructure either way — nobody has to be
+			// told, and the next backoff may well succeed.
 			c.mx().RecordConnectFailure()
 			return fmt.Errorf("wecom: subscribe read: %w", err)
 		}

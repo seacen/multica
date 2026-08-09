@@ -96,6 +96,10 @@ type Outbound struct {
 //
 // WithAttachments is the one option: pass the deployment's object storage and
 // the files an agent produced are delivered into the chat behind the answer.
+//
+// No metrics parameter: the counters this subscriber reports reach the sink
+// through senders, which it already holds and which every outbound write goes
+// through anyway. See sendersRegistry.WithMetrics.
 func NewOutbound(q outboundQueries, senders *sendersRegistry, streams *streamStore, logger *slog.Logger, opts ...OutboundOption) *Outbound {
 	if logger == nil {
 		logger = slog.Default()
@@ -288,7 +292,8 @@ func (o *Outbound) deliverAnswer(ctx context.Context, sessionID pgtype.UUID, t r
 		// whether the first frame landed — a second could print the answer
 		// twice in the same bubble. The plain message is the one route whose
 		// outcome this process can actually observe, and the whole answer goes
-		// down it — that path splits it again on its own.
+		// down it — that path splits it again on its own. finishStream counted
+		// the refusal.
 		//
 		// Not because the handle has gone stale. A callback's req_id belongs to
 		// the turn rather than to the socket it arrived on, and a stream opened
@@ -419,11 +424,23 @@ func chatDoneTaskID(e events.Event) (pgtype.UUID, bool) {
 // is not fatal to the reply — it means the caller falls back to a new message —
 // so it is logged with the one detail that explains it: whether the stream is
 // beyond saving (past its window, bad req_id) or the socket simply blinked.
+//
+// The success is counted inside sendersRegistry.stream, which every bubble
+// closer goes through; the fall-back is counted here, next to the attempt that
+// failed, rather than in the caller. Counted at all because from outside the
+// two endings are indistinguishable: the user gets the answer either way, and
+// nobody reports "the bubble I was watching turned into a separate message". A
+// bubble that has stopped working at all — a WeCom-side change to the stream
+// frame, a req_id convention that drifted — shows up as this number climbing
+// to meet stream_finished, and nowhere else.
+//
+// senders is non-nil here: takeStream returns false without it.
 func (o *Outbound) finishStream(ctx context.Context, h streamHandle, text string) error {
 	err := o.senders.stream(ctx, h, text, true)
 	if err == nil {
 		return nil
 	}
+	o.senders.mx().RecordStreamFellBack()
 	o.logger.WarnContext(ctx, "wecom outbound: in-place reply failed, sending a new message instead",
 		"installation_id", uuidStringPub(h.InstallationID),
 		"stream_unusable", streamUnusable(err), "error", err)
