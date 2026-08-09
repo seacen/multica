@@ -501,16 +501,17 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 		}
 		text, ok := mc.ownText()
 		// Traced with the RESOLVED body, not mc.Text.Content: that field is
-		// empty for every media and 图文混排 callback, so tracing it would
-		// print len=0 for exactly the messages an operator turned tracing on
-		// to look at.
+		// empty for every media, voice and 图文混排 callback, so tracing it
+		// would print len=0 for exactly the messages an operator turned
+		// tracing on to look at.
 		traceInbound(log, mc, text)
 		msg := channelMessageFromCallback(c.botID, c.botDisplayName, mc, text, env.Headers.ReqID)
 		if !ok {
 			// Nothing in this message can be read: a kind the adapter does
-			// not know (a location card, a standalone voice note until
-			// #6599), or a known kind that arrived without the one field
-			// that makes it usable. Silence reads as a broken bot, so answer
+			// not know (a location card), or a known kind that arrived
+			// without the one field that makes it usable — a voice note
+			// whose transcript came back empty on background noise or a
+			// half-second press. Silence reads as a broken bot, so answer
 			// the same chat with a one-line receipt and stop. Best-effort: a
 			// send failure degrades to the prior silent drop.
 			log.Debug("wecom: unsupported message kind, replying with a receipt", "msg_type", mc.MsgType, "msg_id", mc.MsgID)

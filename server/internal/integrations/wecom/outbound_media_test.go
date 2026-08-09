@@ -60,7 +60,7 @@ func newOutboundWithMedia(t *testing.T, q outboundQueries, objects mediaObjectSt
 	if objects != nil {
 		opts = append(opts, WithAttachments(objects))
 	}
-	o := NewOutbound(q, reg, slog.Default(), opts...)
+	o := NewOutbound(q, reg, nil, slog.Default(), opts...)
 	o.spawn = func(f func()) { f() }
 	return o, instID, conn
 }

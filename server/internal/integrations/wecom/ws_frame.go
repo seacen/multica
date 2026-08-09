@@ -98,11 +98,17 @@ type aibotMsgCallback struct {
 	Mixed struct {
 		MsgItem []mixedItem `json:"msg_item"`
 	} `json:"mixed"`
-	// There is deliberately no Voice field here. A standalone voice message
-	// is #6599's subject; this adapter still answers it with the
-	// unsupported-kind receipt. mixedItem does carry one, because a voice
-	// run inside a 图文混排 would otherwise drop a spoken sentence out of
-	// the middle of a message whose other runs are read.
+	// Voice carries the TRANSCRIPT, not audio. WeCom runs the speech
+	// recognition on its side and delivers only the result, so a voice note
+	// needs no download, no media key and no storage — it is a sentence that
+	// happened to be spoken. Not gated on chat type: whatever chat a voice
+	// note arrives from, the transcript is read the same way. mixedItem
+	// carries the same field, because a voice run inside a 图文混排 would
+	// otherwise drop a spoken sentence out of the middle of a message whose
+	// other runs are read.
+	Voice struct {
+		Content string `json:"content"`
+	} `json:"voice"`
 }
 
 // mediaBody is the {url, aeskey} pair every downloadable kind carries. In
@@ -233,12 +239,20 @@ func (mc aibotMsgCallback) attachments() []InboundMedia {
 // its runs rendered in the order they were composed, so "look at this" still
 // reads above the picture it was written about.
 //
-// Everything else — a standalone voice note, a location card, a kind WeCom
-// adds next year — answers false and takes the receipt path.
+// A standalone voice note answers with its transcript. Recognition comes back
+// empty on background noise or a half-second press, and an empty body would
+// reach the agent as a turn with nothing in it — so an empty transcript
+// reports false and takes the receipt path.
+//
+// Everything else — a location card, a kind WeCom adds next year — answers
+// false and takes the receipt path too.
 func (mc aibotMsgCallback) ownText() (string, bool) {
 	switch strings.ToLower(mc.MsgType) {
 	case "text":
 		return mc.Text.Content, true
+	case "voice":
+		transcript := strings.TrimSpace(mc.Voice.Content)
+		return transcript, transcript != ""
 	case "image", "file", "video":
 		body, kind, _ := mediaFor(mc.MsgType, mc.Image, mc.File, mc.Video)
 		if strings.TrimSpace(body.URL) == "" {
@@ -287,6 +301,11 @@ func (mc aibotMsgCallback) ownCommandSource() string {
 	switch strings.ToLower(mc.MsgType) {
 	case "text":
 		return mc.Text.Content
+	case "voice":
+		// A transcript is the sender's own words, so a spoken "/issue 登录坏了"
+		// is a command exactly like the typed one — the same rule mixedItem
+		// applies to a voice run inside a 图文混排.
+		return strings.TrimSpace(mc.Voice.Content)
 	case "mixed":
 		var runs []string
 		for _, item := range mc.Mixed.MsgItem {
@@ -340,9 +359,11 @@ type InboundMessage struct {
 	// SenderUserID is the userid of the person who typed the message.
 	SenderUserID string `json:"sender_user_id,omitempty"`
 
-	// Content is the human-readable body: the user's words and the
-	// placeholders standing in for their attachments. The cross-platform
-	// envelope's Text field is populated from this.
+	// Content is the human-readable body: the user's words — typed for
+	// MsgType == "text", what WeCom's recognition returned for
+	// MsgType == "voice" — and the placeholders standing in for their
+	// attachments. The cross-platform envelope's Text field is populated
+	// from this.
 	Content string `json:"content,omitempty"`
 
 	// ReqID is the frame req_id the server sent this message with. We
@@ -419,7 +440,12 @@ func channelMessageFromCallback(botID, botDisplayName string, mc aibotMsgCallbac
 	// issue nobody asked for plus, via SkipAgentRun below, no answer at all.
 	//
 	// For a plain text message this is mc.Text.Content, which is what p2p was
-	// passing through before CommandText was set here.
+	// passing through before CommandText was set here. It is read off
+	// ownCommandSource rather than Text.Content because a spoken "/issue …"
+	// carries the words in voice.content: sourcing the command from the typed
+	// field would leave it empty, and the engine would then fall back to Text,
+	// file the issue and — with SkipAgentRun false — run the agent over it as
+	// well.
 	command := mc.ownCommandSource()
 	if chatType == channel.ChatTypeGroup {
 		command = stripLeadingMentions(command, botDisplayName)
@@ -579,6 +605,10 @@ func channelMsgType(wecomType string) channel.MsgType {
 		// mapping the old comment warned about.
 		return channel.MsgTypeText
 	default:
+		// A kind ownText cannot read never reaches this normalization: it
+		// is answered with the unsupported-kind receipt instead. Kept as
+		// Unknown rather than mapping "mixed" → Text, which would imply a
+		// 图文混排 is routed as plain text when it is not.
 		return channel.MsgTypeUnknown
 	}
 }
