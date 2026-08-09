@@ -212,6 +212,21 @@ type copyPack struct {
 	// from StreamNoReply because that copy says nothing is coming, and then
 	// something arrives: a bubble that contradicts the next message reads as a
 	// bug even though both halves are working.
+	// TaskFailedNotice, TaskFailedAgentFallback and TaskFailedReason are the
+	// outbound queue's own failure notice (outbox_sender.go): a run that ended
+	// without an answer, said by whichever replica drains the row rather than
+	// by the bubble that was watching it. Separate from StreamFailed because
+	// this one names the agent and can carry the platform's reason — and
+	// because it is rendered from a stored payload at send time, which is why
+	// the language it is written in travels on the row.
+	//
+	// TaskFailedNotice's %s is the agent's name; TaskFailedAgentFallback
+	// stands in when the agent row could not be read; TaskFailedReason's %s is
+	// the reason, and the whole line is omitted when there is none.
+	TaskFailedNotice        string
+	TaskFailedAgentFallback string
+	TaskFailedReason        string
+
 	StreamNoReply          string
 	StreamNoReplyWithFiles string
 	StreamMerged           string
@@ -385,9 +400,13 @@ var copyPacks = map[Locale]copyPack{
 		StreamMerged:           "✅ 这条已并入上一条回复一起处理了。",
 		StreamNotStarted:       "已收到，但这条暂时没能开始处理。",
 		StreamFailed:           "⚠️ 这次没跑通，请稍后再试一次。",
-		StreamCancelled:        "⏹️ 这次处理已取消。",
-		StreamStillWorking:     "还在处理，完成后我再单独回复你。",
-		StreamStuck:            "⚠️ 上面那条进度不会再更新了，这轮的结果我用新消息发你。",
+
+		TaskFailedNotice:        "⚠️ %s处理这条消息时失败了。",
+		TaskFailedAgentFallback: "智能体",
+		TaskFailedReason:        "\n原因：%s",
+		StreamCancelled:         "⏹️ 这次处理已取消。",
+		StreamStillWorking:      "还在处理，完成后我再单独回复你。",
+		StreamStuck:             "⚠️ 上面那条进度不会再更新了，这轮的结果我用新消息发你。",
 
 		StreamProgressPrefix: "正在处理：",
 		Progress: progressCopy{
@@ -462,9 +481,13 @@ var copyPacks = map[Locale]copyPack{
 		StreamMerged:           "✅ Handled together with my previous reply.",
 		StreamNotStarted:       "Got it, but this one couldn't start processing.",
 		StreamFailed:           "⚠️ That run didn't go through. Please try again.",
-		StreamCancelled:        "⏹️ That run was cancelled.",
-		StreamStillWorking:     "Still working on it — I'll reply separately when it's done.",
-		StreamStuck:            "⚠️ The status above won't update any further. I'll send this round's result as a new message.",
+
+		TaskFailedNotice:        "⚠️ %s couldn't handle that message.",
+		TaskFailedAgentFallback: "The agent",
+		TaskFailedReason:        "\nReason: %s",
+		StreamCancelled:         "⏹️ That run was cancelled.",
+		StreamStillWorking:      "Still working on it — I'll reply separately when it's done.",
+		StreamStuck:             "⚠️ The status above won't update any further. I'll send this round's result as a new message.",
 
 		StreamProgressPrefix: "Working on it: ",
 		Progress: progressCopy{

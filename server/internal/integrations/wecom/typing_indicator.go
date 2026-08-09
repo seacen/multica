@@ -37,6 +37,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
 	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
+	"github.com/multica-ai/multica/server/internal/integrations/channel/outbox"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
@@ -124,6 +125,11 @@ type TypingIndicatorManager struct {
 	// a transcript arriving twice a second does not re-read the same row.
 	taskSessions *taskSessionCache
 
+	// producer files a failure notice written to the socket as already
+	// delivered, so the outbound queue's reconciler does not send a second
+	// one (outbox_direct.go). nil on a deployment with no queue.
+	producer *outbox.Producer
+
 	// guardAfter is when the manager closes a bubble nobody else has. Zero
 	// disables the guard (tests that drive the clock themselves).
 	guardAfter time.Duration
@@ -161,6 +167,14 @@ type TypingIndicatorConfig struct {
 	// answer still closes it, there is just nothing in between.
 	Identities identityLookup
 
+	// Producer is the outbound queue's producer, used for one thing: filing
+	// the failure notice this manager writes to the socket as already
+	// delivered. Without it the queue's reconciler finds a failed task with no
+	// row, concludes the notice never went out, and delivers a second one
+	// about a minute behind the first (outbox_direct.go). Nil is safe on a
+	// deployment with no queue.
+	Producer *outbox.Producer
+
 	// GuardAfter overrides streamGuardAfter. Test-only.
 	GuardAfter time.Duration
 }
@@ -184,6 +198,7 @@ func NewTypingIndicator(cfg TypingIndicatorConfig) *TypingIndicatorManager {
 		bindings:     cfg.Bindings,
 		languages:    cfg.Languages,
 		identities:   cfg.Identities,
+		producer:     cfg.Producer,
 		taskSessions: newTaskSessionCache(),
 		log:          logger,
 		guardAfter:   guard,
@@ -751,8 +766,38 @@ func (m *TypingIndicatorManager) handleTaskFailed(e events.Event) {
 			if !t.HasBubble && !t.Addr.known() && bound.known() {
 				t.Addr = bound
 			}
-			return m.sayTheRunFailed(ctx, sessionID, t)
+			return m.sayTheRunFailed(ctx, sessionID, taskID, t)
 		})
+}
+
+// recordFailureDelivered files this run's failure notice on the outbound queue
+// as already sent.
+//
+// The notice goes straight to the socket, so it leaves no queue row — and the
+// reconciler reads a failed task with no row as a notice that never went out.
+// Its own task_failed row then arrives about a minute after the bubble already
+// said the run did not go through, in different words, as a separate message.
+//
+// Not called where this manager deliberately says nothing. A run whose origin
+// could not be established was never ours to announce, and the reconciler
+// applies the same channel-ingested gate before delivering anything; a round
+// that was told already has a chat_done record on the same task, and one row of
+// either kind is what the candidate scan looks for.
+func (m *TypingIndicatorManager) recordFailureDelivered(ctx context.Context, sessionID pgtype.UUID, taskID string) {
+	if m.producer == nil {
+		return
+	}
+	id, err := util.ParseUUID(taskID)
+	if err != nil || !id.Valid {
+		return
+	}
+	inst, binding, ok := resolveSocketDeliveryTarget(ctx, m.bindings, sessionID)
+	if !ok {
+		m.log.WarnContext(ctx, "wecom typing: could not record a failure notice delivered over the socket; the reconciler will send it again",
+			"chat_session_id", util.UUIDToString(sessionID), "task_id", taskID)
+		return
+	}
+	recordSocketDelivery(ctx, m.producer, m.log, inst, binding, id, sourceKindTaskFailed)
 }
 
 // failureBelongsOnWecom asks where this run's input came from: the channel, or
@@ -920,12 +965,18 @@ func retryPending(e events.Event) bool {
 // answers roundToldAlready and runs no delivery. That is the whole of the
 // not-twice rule, and it is per run, so a task:failed arriving behind this run's
 // own delivered answer stays quiet while a second run's failure is still told.
-func (m *TypingIndicatorManager) sayTheRunFailed(ctx context.Context, sessionID pgtype.UUID, t roundTurn) (roundAddress, error) {
+func (m *TypingIndicatorManager) sayTheRunFailed(ctx context.Context, sessionID pgtype.UUID, taskID string, t roundTurn) (roundAddress, error) {
 	if m.senders == nil {
 		return roundAddress{}, errNothingToSay
 	}
 	if t.HasBubble {
-		return t.Handle.address(), m.writeClosing(ctx, sessionID, t.Handle, copyFor(t.Handle.Locale).StreamFailed, "task failed")
+		err := m.writeClosing(ctx, sessionID, t.Handle, copyFor(t.Handle.Locale).StreamFailed, "task failed")
+		if err == nil {
+			// Written to the socket, so the queue has no row for it and the
+			// reconciler would deliver its own notice on top.
+			m.recordFailureDelivered(ctx, sessionID, taskID)
+		}
+		return t.Handle.address(), err
 	}
 	addr := t.Addr
 	if !addr.known() {
@@ -935,7 +986,11 @@ func (m *TypingIndicatorManager) sayTheRunFailed(ctx context.Context, sessionID 
 		}
 		addr = found
 	}
-	return addr, m.sayAsPlainMessage(ctx, sessionID, addr, m.copyForAddress(ctx, addr).StreamFailed)
+	err := m.sayAsPlainMessage(ctx, sessionID, addr, m.copyForAddress(ctx, addr).StreamFailed)
+	if err == nil {
+		m.recordFailureDelivered(ctx, sessionID, taskID)
+	}
+	return addr, err
 }
 
 // copyForAddress picks the pack for a round whose handle is gone: the words

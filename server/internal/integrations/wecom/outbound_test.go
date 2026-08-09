@@ -2,10 +2,14 @@ package wecom
 
 // outbound_test.go — the EventChatDone reply path and the inbox:new delivery
 // path, both driven through a fake outboundQueries (the interface Outbound
-// depends on) and a recording wsConn, so no database is required. These are
-// the paths that put an agent's words back in front of the WeCom user, and
-// the "deliver via bot only when bound" contract the inbox notification rests
-// on.
+// depends on) and a recording enqueue store, so no database is required.
+// These are the paths that put an agent's words back in front of the WeCom
+// user, and the "deliver via bot only when bound" contract the inbox
+// notification rests on.
+//
+// The observation point is the queue row, not a WebSocket frame: Outbound no
+// longer writes to WeCom at all. It enqueues, and the replica holding the bot's
+// socket delivers (see outbox_sender_test.go).
 //
 // Original inbox-delivery design and review: seacen (PR #5833).
 
@@ -20,12 +24,14 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/events"
+	"github.com/multica-ai/multica/server/internal/integrations/channel/outbox"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
 // fakeOutboundQueries is an in-memory stand-in for the queries Outbound
+// fakeOutboundQueries is an in-memory stand-in for the four queries Outbound
 // uses. A nil error field returns the row; a non-nil one is returned as-is
 // (use pgx.ErrNoRows to exercise the "not a wecom session" / "no binding"
 // branches).
@@ -89,9 +95,30 @@ func askedInTheWebUI() *bool { asked := false; return &asked }
 func (f *fakeOutboundQueries) GetChannelChatSessionBindingBySession(context.Context, db.GetChannelChatSessionBindingBySessionParams) (db.ChannelChatSessionBinding, error) {
 	return f.sessionBinding, f.sessionErr
 }
+
+// GetChannelInstallation answers with the fixture's row, filling in a
+// workspace id when the fixture left it unset. channel_installation.workspace_id
+// is NOT NULL, so a row without one cannot exist — and every enqueue needs it,
+// so leaving it zero would fail every delivery fixture in this package for a
+// reason that has nothing to do with what it is testing.
 func (f *fakeOutboundQueries) GetChannelInstallation(context.Context, db.GetChannelInstallationParams) (db.ChannelInstallation, error) {
-	return f.installation, f.installErr
+	inst := f.installation
+	if !inst.WorkspaceID.Valid {
+		inst.WorkspaceID = fakeWorkspaceUUID
+	}
+	return inst, f.installErr
 }
+
+// fakeWorkspaceUUID is that stand-in. Any valid uuid does: no assertion in this
+// package reads the workspace off a queue row, only that one is present.
+var fakeWorkspaceUUID = func() pgtype.UUID {
+	id, err := util.ParseUUID("77777777-7777-7777-7777-777777777777")
+	if err != nil {
+		panic(err)
+	}
+	return id
+}()
+
 func (f *fakeOutboundQueries) FindChannelBindingForMember(context.Context, db.FindChannelBindingForMemberParams) (db.ChannelUserBinding, error) {
 	return f.memberBinding, f.memberErr
 }
@@ -194,72 +221,293 @@ func mustParseTaskUUID(t testing.TB, id string) pgtype.UUID {
 // originAsked is the ids the provenance stamp was read for, in order.
 func (f *fakeOutboundQueries) originAsked() []string { return f.originAskedFor }
 
-func newOutboundWithConn(t *testing.T, q outboundQueries) (*Outbound, pgtype.UUID, *recordingConn) {
+// newOutboundRig builds a subscriber with both ways out wired: a live
+// connection registered for instID, and a producer over a recording store.
+// Both are always present because after the queue landed, an assertion that
+// reads only one of them cannot tell "not delivered" from "delivered the other
+// way".
+func newOutboundRig(t *testing.T, q outboundQueries) (*Outbound, pgtype.UUID, *recordingConn, *recordingEnqueueStore) {
 	t.Helper()
 	reg := newSendersRegistry()
 	instID := mustTestUUID(t)
 	conn := &recordingConn{}
 	reg.set(instID, conn.autoAck(newWSSender(conn, nil)))
-	return NewOutbound(q, reg, nil, slog.Default()), instID, conn
+	store := &recordingEnqueueStore{}
+	producer, err := outbox.NewProducer(channelTypeWecom, store, nil, nil)
+	if err != nil {
+		t.Fatalf("NewProducer: %v", err)
+	}
+	return NewOutbound(q, reg, nil, producer, slog.Default()), instID, conn, store
 }
 
-func TestProcessEvent_DeliversChatReplyToBoundChat(t *testing.T) {
+// newOutboundWithConn is the rig for a test that only reads frames.
+func newOutboundWithConn(t *testing.T, q outboundQueries) (*Outbound, pgtype.UUID, *recordingConn) {
+	t.Helper()
+	o, instID, conn, _ := newOutboundRig(t, q)
+	return o, instID, conn
+}
+
+// newOutboundWithQueue is the rig for a test that only reads queue rows.
+func newOutboundWithQueue(t *testing.T, q outboundQueries) (*Outbound, pgtype.UUID, *recordingEnqueueStore) {
+	t.Helper()
+	o, instID, _, store := newOutboundRig(t, q)
+	return o, instID, store
+}
+
+// recordingEnqueueStore captures every enqueue so a test can assert on the row
+// that would have been written.
+//
+// delivered is the other half: rows recorded as already sent by a path that
+// wrote to the socket instead of the queue. They are kept apart from rows
+// because they are the opposite assertion — rows is what the user is about to
+// be sent, delivered is what the user has already been sent and must not be
+// sent again.
+type recordingEnqueueStore struct {
+	rows      []db.EnqueueChannelOutboundParams
+	delivered []db.RecordChannelOutboundDeliveredParams
+	err       error
+}
+
+func (s *recordingEnqueueStore) RecordChannelOutboundDelivered(_ context.Context, arg db.RecordChannelOutboundDeliveredParams) (db.ChannelOutboundQueue, error) {
+	if s.err != nil {
+		return db.ChannelOutboundQueue{}, s.err
+	}
+	s.delivered = append(s.delivered, arg)
+	return db.ChannelOutboundQueue{
+		InstallationID: arg.InstallationID,
+		WorkspaceID:    arg.WorkspaceID,
+		ChannelType:    arg.ChannelType,
+		SourceKind:     arg.SourceKind,
+		SourceID:       arg.SourceID,
+		Status:         "sent",
+	}, nil
+}
+
+// deliveredFor reports whether a delivery was recorded under this business
+// key — the key the reconciler's candidate scan looks for before deciding a
+// terminal task never got its reply.
+func (s *recordingEnqueueStore) deliveredFor(sourceKind, sourceID string) bool {
+	for _, d := range s.delivered {
+		if d.SourceKind == sourceKind && d.SourceID == sourceID {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *recordingEnqueueStore) EnqueueChannelOutbound(_ context.Context, arg db.EnqueueChannelOutboundParams) (db.ChannelOutboundQueue, error) {
+	if s.err != nil {
+		return db.ChannelOutboundQueue{}, s.err
+	}
+	s.rows = append(s.rows, arg)
+	return db.ChannelOutboundQueue{
+		InstallationID: arg.InstallationID,
+		WorkspaceID:    arg.WorkspaceID,
+		ChannelType:    arg.ChannelType,
+		SourceKind:     arg.SourceKind,
+		SourceID:       arg.SourceID,
+	}, nil
+}
+
+// drainQueue delivers every recorded row the way the lease holder's consumer
+// does: through the WeCom queue sender, over whatever socket the registry
+// holds. It is how a test that used to watch a push watches the same message
+// now that enqueueing is only the first half of that delivery — and it keeps
+// the assertion on what the user ends up reading rather than on a row.
+// It returns the rows it could NOT deliver, which stay on the queue. That is
+// the reconnect window, and it is the whole difference the queue makes to it:
+// a socket write refused in that window is lost and the run stays owed its
+// ending, while a row simply waits for the consumer to be woken again. A drain
+// that failed the test here would be asserting the old behaviour.
+func drainQueue(t *testing.T, store *recordingEnqueueStore, senders *sendersRegistry) []db.EnqueueChannelOutboundParams {
+	t.Helper()
+	sender := newQueueSender(senders)
+	var undelivered []db.EnqueueChannelOutboundParams
+	for _, row := range store.rows {
+		disposition, err := sender.Send(context.Background(), db.ChannelOutboundQueue{
+			InstallationID: row.InstallationID,
+			ChannelType:    row.ChannelType,
+			TargetChatID:   row.TargetChatID,
+			TargetChatType: row.TargetChatType,
+			MsgType:        row.MsgType,
+			PayloadVersion: payloadVersionV1,
+			Payload:        row.Payload,
+		})
+		if err == nil && disposition == outbox.DispositionSent {
+			continue
+		}
+		undelivered = append(undelivered, row)
+	}
+	return undelivered
+}
+
+// payload decodes the queue payload of row i.
+func (s *recordingEnqueueStore) payload(t *testing.T, i int) outboundPayload {
+	t.Helper()
+	if i >= len(s.rows) {
+		t.Fatalf("no enqueued row at index %d (have %d)", i, len(s.rows))
+	}
+	var p outboundPayload
+	if err := json.Unmarshal(s.rows[i].Payload, &p); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	return p
+}
+
+func TestProcessEvent_EnqueuesChatReplyForBoundChat(t *testing.T) {
 	t.Parallel()
 	q := &fakeOutboundQueries{
 		sessionBinding:  db.ChannelChatSessionBinding{ChannelChatID: "CHAT_1", ChatType: "group"},
 		installation:    db.ChannelInstallation{Status: string(InstallationActive)},
 		channelIngested: askedOverWecom(), // the question came in over WeCom
 	}
-	q.fileTask(t, "33333333-3333-3333-3333-333333333333")
-	o, instID, conn := newOutboundWithConn(t, q)
+	q.fileTask(t, testTaskID)
+	o, instID, store := newOutboundWithQueue(t, q)
 	q.sessionBinding.InstallationID = instID
 	q.installation.ID = instID
+	q.installation.WorkspaceID = mustTestUUID(t)
 
+	if err := o.processEvent(context.Background(), chatDoneEvent("the agent reply")); err != nil {
+		t.Fatalf("processEvent: %v", err)
+	}
+	if len(store.rows) != 1 {
+		t.Fatalf("enqueued %d rows, want 1", len(store.rows))
+	}
+	row := store.rows[0]
+	if row.TargetChatID != "CHAT_1" {
+		t.Errorf("target_chat_id = %q, want CHAT_1", row.TargetChatID)
+	}
+	if row.TargetChatType != int16(chatTypeGroupInt) {
+		t.Errorf("target_chat_type = %d, want group (%d)", row.TargetChatType, chatTypeGroupInt)
+	}
+	if row.ChannelType != channelTypeWecom {
+		t.Errorf("channel_type = %q, want %q", row.ChannelType, channelTypeWecom)
+	}
+	if row.SourceKind != sourceKindChatDone {
+		t.Errorf("source_kind = %q, want %q", row.SourceKind, sourceKindChatDone)
+	}
+	// The business key must be the task, so a redelivered event dedupes
+	// against the row the first delivery wrote.
+	if row.SourceID != testTaskID {
+		t.Errorf("source_id = %q, want the task id %q", row.SourceID, testTaskID)
+	}
+	if got := store.payload(t, 0).Content; got != "the agent reply" {
+		t.Errorf("payload content = %q, want the agent reply", got)
+	}
+}
+
+// The task id lives in ChatDonePayload, not on the event envelope
+// (service.broadcastChatDone leaves Event.TaskID empty). Reading only the
+// envelope would skip every realtime enqueue and silently demote delivery to
+// the deliberately-lagged reconciler.
+func TestProcessEvent_TakesTaskIDFromPayloadNotEnvelope(t *testing.T) {
+	t.Parallel()
+	q := &fakeOutboundQueries{
+		sessionBinding: db.ChannelChatSessionBinding{ChannelChatID: "CHAT_1"},
+		installation:   db.ChannelInstallation{Status: string(InstallationActive)},
+		// The origin gate runs ahead of the enqueue, so a fixture that never
+		// says where the question was asked is refused before it reaches the
+		// queue — and this test would pass on that refusal.
+		channelIngested: askedOverWecom(),
+	}
+	q.fileTask(t, testTaskID)
+	o, instID, store := newOutboundWithQueue(t, q)
+	q.sessionBinding.InstallationID = instID
+	q.installation.ID = instID
+	q.installation.WorkspaceID = mustTestUUID(t)
+
+	event := chatDoneEvent("hi")
+	if event.TaskID != "" {
+		t.Fatal("fixture must mirror production: envelope TaskID is empty")
+	}
+	if err := o.processEvent(context.Background(), event); err != nil {
+		t.Fatalf("processEvent: %v", err)
+	}
+	if len(store.rows) != 1 {
+		t.Fatalf("enqueued %d rows, want 1 — the payload task id must be used", len(store.rows))
+	}
+}
+
+func TestProcessEvent_MapPayloadTaskIDIsUsed(t *testing.T) {
+	t.Parallel()
+	q := &fakeOutboundQueries{
+		sessionBinding: db.ChannelChatSessionBinding{ChannelChatID: "CHAT_1"},
+		installation:   db.ChannelInstallation{Status: string(InstallationActive)},
+		// The origin gate runs ahead of the enqueue, so a fixture that never
+		// says where the question was asked is refused before it reaches the
+		// queue — and this test would pass on that refusal.
+		channelIngested: askedOverWecom(),
+	}
+	q.fileTask(t, testTaskID)
+	o, instID, store := newOutboundWithQueue(t, q)
+	q.sessionBinding.InstallationID = instID
+	q.installation.ID = instID
+	q.installation.WorkspaceID = mustTestUUID(t)
+
+	// Post-serialization shape, as a Redis-relayed event arrives.
 	err := o.processEvent(context.Background(), events.Event{
 		ChatSessionID: "22222222-2222-2222-2222-222222222222",
 		Payload: protocol.ChatDonePayload{
 			Content: "the agent reply",
-			TaskID:  "33333333-3333-3333-3333-333333333333",
+			TaskID:  testTaskID,
 		},
 	})
 	if err != nil {
 		t.Fatalf("processEvent: %v", err)
 	}
-	body := conn.sendBody(t, 0)
-	if body["chatid"] != "CHAT_1" {
-		t.Errorf("reply chatid = %v, want CHAT_1", body["chatid"])
+	if len(store.rows) != 1 {
+		t.Fatalf("enqueued %d rows, want 1", len(store.rows))
 	}
-	if body["chat_type"] != float64(chatTypeGroupInt) {
-		t.Errorf("reply chat_type = %v, want group", body["chat_type"])
+	if store.rows[0].SourceID != testTaskID {
+		t.Errorf("source_id = %q, want %q", store.rows[0].SourceID, testTaskID)
 	}
-	md, _ := body["markdown"].(map[string]any)
-	if md == nil || md["content"] != "the agent reply" {
-		t.Errorf("reply content = %v, want the agent reply", body["markdown"])
+}
+
+func TestProcessEvent_MissingTaskIDIsNoop(t *testing.T) {
+	t.Parallel()
+	q := &fakeOutboundQueries{
+		sessionBinding: db.ChannelChatSessionBinding{ChannelChatID: "CHAT_1"},
+		installation:   db.ChannelInstallation{Status: string(InstallationActive)},
+	}
+	o, instID, store := newOutboundWithQueue(t, q)
+	q.sessionBinding.InstallationID = instID
+	q.installation.ID = instID
+	q.installation.WorkspaceID = mustTestUUID(t)
+
+	err := o.processEvent(context.Background(), events.Event{
+		ChatSessionID: "22222222-2222-2222-2222-222222222222",
+		Payload:       protocol.ChatDonePayload{Content: "no task id"},
+	})
+	if err != nil {
+		t.Fatalf("processEvent: %v", err)
+	}
+	if len(store.rows) != 0 {
+		t.Errorf("expected no enqueue without a business key, got %d rows", len(store.rows))
 	}
 }
 
 func TestProcessEvent_NonWecomSessionIsNoop(t *testing.T) {
 	t.Parallel()
 	q := &fakeOutboundQueries{sessionErr: pgx.ErrNoRows}
-	o, _, conn := newOutboundWithConn(t, q)
-	if err := o.processEvent(context.Background(), events.Event{ChatSessionID: "22222222-2222-2222-2222-222222222222", Payload: protocol.ChatDonePayload{Content: "x"}}); err != nil {
+	o, _, store := newOutboundWithQueue(t, q)
+	if err := o.processEvent(context.Background(), chatDoneEvent("x")); err != nil {
 		t.Fatalf("processEvent: %v", err)
 	}
-	if len(conn.frames) != 0 {
-		t.Errorf("expected no send for a non-wecom session, got %d frames", len(conn.frames))
+	if len(store.rows) != 0 {
+		t.Errorf("expected no enqueue for a non-wecom session, got %d rows", len(store.rows))
 	}
 }
 
 func TestProcessEvent_EmptyContentIsNoop(t *testing.T) {
 	t.Parallel()
 	q := &fakeOutboundQueries{sessionBinding: db.ChannelChatSessionBinding{ChannelChatID: "CHAT_1"}}
-	o, instID, conn := newOutboundWithConn(t, q)
+	o, instID, store := newOutboundWithQueue(t, q)
 	q.sessionBinding.InstallationID = instID
-	if err := o.processEvent(context.Background(), events.Event{ChatSessionID: "22222222-2222-2222-2222-222222222222", Payload: protocol.ChatDonePayload{Content: ""}}); err != nil {
+	if err := o.processEvent(context.Background(), chatDoneEvent("")); err != nil {
 		t.Fatalf("processEvent: %v", err)
 	}
-	if len(conn.frames) != 0 {
-		t.Errorf("empty completion should send nothing, got %d frames", len(conn.frames))
+	if len(store.rows) != 0 {
+		t.Errorf("empty completion should enqueue nothing, got %d rows", len(store.rows))
 	}
 }
 
@@ -274,61 +522,69 @@ func TestProcessEvent_RevokedInstallationIsNoop(t *testing.T) {
 		installation:    db.ChannelInstallation{Status: "revoked"},
 		channelIngested: askedOverWecom(), // so revocation is the only thing left to stop it
 	}
-	q.fileTask(t, "33333333-3333-3333-3333-333333333333")
-	o, instID, conn := newOutboundWithConn(t, q)
+	q.fileTask(t, testTaskID)
+	o, instID, store := newOutboundWithQueue(t, q)
 	q.sessionBinding.InstallationID = instID
 	q.installation.ID = instID
-	if err := o.processEvent(context.Background(), events.Event{
-		ChatSessionID: "22222222-2222-2222-2222-222222222222",
-		Payload: protocol.ChatDonePayload{
-			Content: "hi",
-			TaskID:  "33333333-3333-3333-3333-333333333333",
-		},
-	}); err != nil {
+	if err := o.processEvent(context.Background(), chatDoneEvent("hi")); err != nil {
 		t.Fatalf("processEvent: %v", err)
 	}
-	if len(conn.frames) != 0 {
-		t.Errorf("revoked installation should send nothing, got %d frames", len(conn.frames))
+	if len(store.rows) != 0 {
+		t.Errorf("revoked installation should enqueue nothing, got %d rows", len(store.rows))
 	}
 }
 
-func TestTryDeliverInbox_PushesToBoundMemberPrivately(t *testing.T) {
+func TestTryEnqueueInbox_TargetsBoundMemberPrivately(t *testing.T) {
 	t.Parallel()
 	q := &fakeOutboundQueries{
 		memberBinding: db.ChannelUserBinding{ChannelUserID: "T_USER_1"},
 		workspace:     db.Workspace{Slug: "acme"},
 	}
-	o, instID, conn := newOutboundWithConn(t, q)
+	o, instID, store := newOutboundWithQueue(t, q)
 	q.memberBinding.InstallationID = instID
 
+	const itemID = "66666666-6666-6666-6666-666666666666"
 	item := map[string]any{
+		"id":             itemID,
 		"recipient_type": "member",
 		"recipient_id":   "33333333-3333-3333-3333-333333333333",
 		"workspace_id":   "44444444-4444-4444-4444-444444444444",
 		"type":           "issue_assigned",
 		"title":          "New issue",
 	}
-	if !o.tryDeliverInbox(context.Background(), item, "33333333-3333-3333-3333-333333333333", "44444444-4444-4444-4444-444444444444") {
-		t.Fatal("tryDeliverInbox returned false; expected delivery to a bound member")
+	if !o.tryEnqueueInbox(context.Background(), item, itemID, "33333333-3333-3333-3333-333333333333", "44444444-4444-4444-4444-444444444444") {
+		t.Fatal("tryEnqueueInbox returned false; expected an enqueue for a bound member")
 	}
-	body := conn.sendBody(t, 0)
-	if body["chatid"] != "T_USER_1" {
-		t.Errorf("inbox push chatid = %v, want the member's bound userid", body["chatid"])
+	if len(store.rows) != 1 {
+		t.Fatalf("enqueued %d rows, want 1", len(store.rows))
 	}
-	if body["chat_type"] != float64(chatTypeSingleInt) {
-		t.Errorf("inbox push chat_type = %v, want single (1)", body["chat_type"])
+	row := store.rows[0]
+	if row.TargetChatID != "T_USER_1" {
+		t.Errorf("target_chat_id = %q, want the member's bound userid", row.TargetChatID)
+	}
+	if row.TargetChatType != int16(chatTypeSingleInt) {
+		t.Errorf("target_chat_type = %d, want single (%d)", row.TargetChatType, chatTypeSingleInt)
+	}
+	// Keyed on the inbox item so a redelivered inbox:new cannot notify twice.
+	if row.SourceKind != sourceKindInboxNotify || row.SourceID != itemID {
+		t.Errorf("business key = (%q, %q), want (%q, %q)", row.SourceKind, row.SourceID, sourceKindInboxNotify, itemID)
+	}
+	// The row must carry no chat_session_id: an inbox push is addressed to a
+	// user, not a conversation, so session fencing must not apply to it.
+	if row.ChatSessionID.Valid {
+		t.Error("inbox push must not be fenced on a chat session")
 	}
 }
 
-func TestTryDeliverInbox_NoBindingIsNoop(t *testing.T) {
+func TestTryEnqueueInbox_NoBindingIsNoop(t *testing.T) {
 	t.Parallel()
 	q := &fakeOutboundQueries{memberErr: pgx.ErrNoRows}
-	o, _, conn := newOutboundWithConn(t, q)
-	if o.tryDeliverInbox(context.Background(), map[string]any{}, "33333333-3333-3333-3333-333333333333", "44444444-4444-4444-4444-444444444444") {
+	o, _, store := newOutboundWithQueue(t, q)
+	if o.tryEnqueueInbox(context.Background(), map[string]any{}, "66666666-6666-6666-6666-666666666666", "33333333-3333-3333-3333-333333333333", "44444444-4444-4444-4444-444444444444") {
 		t.Error("expected false when the member has no wecom binding")
 	}
-	if len(conn.frames) != 0 {
-		t.Errorf("no binding should push nothing, got %d frames", len(conn.frames))
+	if len(store.rows) != 0 {
+		t.Errorf("no binding should enqueue nothing, got %d rows", len(store.rows))
 	}
 }
 
@@ -337,12 +593,12 @@ func TestHandleInboxNew_IgnoresNonMemberRecipient(t *testing.T) {
 	// memberErr set so that if it somehow reached the query it would no-op;
 	// the recipient_type guard should return before any query.
 	q := &fakeOutboundQueries{memberErr: errors.New("must not be called")}
-	o, _, conn := newOutboundWithConn(t, q)
+	o, _, store := newOutboundWithQueue(t, q)
 	o.handleInboxNew(events.Event{Payload: map[string]any{
-		"item": map[string]any{"recipient_type": "agent", "recipient_id": "x", "workspace_id": "y"},
+		"item": map[string]any{"id": "x", "recipient_type": "agent", "recipient_id": "x", "workspace_id": "y"},
 	}})
-	if len(conn.frames) != 0 {
-		t.Errorf("agent recipient should not be pushed to, got %d frames", len(conn.frames))
+	if len(store.rows) != 0 {
+		t.Errorf("agent recipient should not be enqueued for, got %d rows", len(store.rows))
 	}
 }
 

@@ -507,14 +507,21 @@ func TestAWebRunsUndeliveredAnswerDoesNotBuyItTheRoomsVoice(t *testing.T) {
 	}
 }
 
-// TestARoomRunsUndeliveredAnswerStaysOwedToItsAsker is the control, and the
-// direction that costs more to get wrong.
+// TestARoomRunsUndeliveredAnswerReachesItsAskerOffTheQueue is the control, and
+// the direction that costs more to get wrong.
 //
-// Same failed delivery, same session, same empty-handed ledger write — except
-// this round IS the room's, and the attempt cost it the bubble the asker was
-// watching. I3 leaves the run owed an ending, so the failure that follows keeps
-// it, and it keeps it while every database read the gate could make is failing.
-func TestARoomRunsUndeliveredAnswerStaysOwedToItsAsker(t *testing.T) {
+// Same dropped socket, same session — except this round IS the room's, and the
+// attempt cost it the bubble the asker was watching. Before the outbound queue
+// the answer was lost here and I3 left the run owed an ending, so the failure
+// that followed was the only thing left to tell the asker anything.
+//
+// The queue changes what the reconnect window costs, and this is where that
+// shows: the frame is refused, the answer falls back to an ordinary message,
+// and an ordinary message is a row rather than a push. The row survives the
+// window, so the run is spoken for and the ledger settles — which is why no
+// second ending speaks over it afterwards. The asker reads the answer, late,
+// instead of reading that the run did not go through.
+func TestARoomRunsUndeliveredAnswerReachesItsAskerOffTheQueue(t *testing.T) {
 	t.Parallel()
 	rig := newBoundRoomRig(t)
 	rig.askedInTheRoom(t, "task-1")
@@ -527,14 +534,19 @@ func TestARoomRunsUndeliveredAnswerStaysOwedToItsAsker(t *testing.T) {
 		ChatSessionID: bubbleSession,
 		TaskID:        taskUUID(t, "task-1"),
 		Payload:       protocol.ChatDonePayload{Content: "42"},
-	}); err == nil {
-		t.Fatalf("the answer reported itself delivered with no connection to send it on")
+	}); err != nil {
+		t.Fatalf("the answer had a queue to fall back to and still reported a failure: %v", err)
+	}
+	if len(rig.queue.rows) != 1 {
+		t.Fatalf("the answer left %d queue rows, want 1 — the frame was refused and nothing "+
+			"durable was written, so the asker's question goes unanswered", len(rig.queue.rows))
 	}
 	rig.senders.set(rig.instID, rig.conn.sender)
 
-	if !rig.streams.owesEnding(bubbleSessionID(t), taskUUID(t, "task-1")) {
-		t.Fatalf("the room's own round is owed nothing after an answer that never landed — its " +
-			"bubble is gone and the asker is watching a spinner only a later ending can seal")
+	if rig.streams.owesEnding(bubbleSessionID(t), taskUUID(t, "task-1")) {
+		t.Fatalf("the round is still owed an ending after its answer was queued — the next " +
+			"publisher will say the run did not go through, on top of the answer the consumer " +
+			"is about to deliver")
 	}
 
 	// And the database has stopped answering, so the gate has nothing but this.
@@ -543,10 +555,11 @@ func TestARoomRunsUndeliveredAnswerStaysOwedToItsAsker(t *testing.T) {
 
 	rig.failed(t, "task-1", false)
 
+	// The consumer wakes on the reconnect and delivers what it was holding.
+	rig.drainQueue(t)
 	got := pushedTexts(t, rig.conn)
-	if len(got) != 1 || got[0] != streamCopyFailed {
-		t.Fatalf("the asker read %q, want exactly [%q] — their question's bubble was taken by an "+
-			"answer that never arrived, and this notice is the only thing left to tell them",
-			got, streamCopyFailed)
+	if len(got) != 1 || got[0] != "42" {
+		t.Fatalf("the asker read %q, want exactly [\"42\"] — the answer was on the queue, so it "+
+			"is what they are owed and nothing else may speak for the run", got)
 	}
 }

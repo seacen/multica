@@ -306,6 +306,10 @@ func TestALongAnswerWithNoBubbleStillArrivesWhole(t *testing.T) {
 		t.Fatalf("processEvent: %v", err)
 	}
 
+	// The whole answer is one queue row; the split into server-sized pieces
+	// happens where the row is written to the socket, so the drain is part of
+	// what this test is checking.
+	rig.drainQueue(t)
 	var readable []string
 	for _, push := range rig.conn.pushes(t) {
 		md, _ := push["markdown"].(map[string]any)

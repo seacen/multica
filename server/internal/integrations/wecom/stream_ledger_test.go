@@ -72,11 +72,15 @@ func TestAPromiseIsNotKeptUntilTheWordsAreAccepted(t *testing.T) {
 // what a refused send does to the ledger, so the error is the subject.
 func (r *bubbleRig) answerErr(t *testing.T, content, taskName string) error {
 	t.Helper()
-	return r.out.processEvent(context.Background(), events.Event{
+	err := r.out.processEvent(context.Background(), events.Event{
 		ChatSessionID: bubbleSession,
 		TaskID:        taskUUID(t, taskName),
 		Payload:       protocol.ChatDonePayload{Content: content},
 	})
+	// An answer that missed its bubble leaves as a queue row, so what the user
+	// reads is what the consumer drains — the same step rig.answer takes.
+	r.drainQueue(t)
+	return err
 }
 
 // ---- the invariants, over every terminal path ----

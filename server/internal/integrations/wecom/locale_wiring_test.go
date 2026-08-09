@@ -270,23 +270,29 @@ func TestInboxCardReadsTheRecipientsLanguage(t *testing.T) {
 				userLanguage:  tc.language,
 				userBindingID: localeTestUserID,
 			}
-			o, instID, conn := newOutboundWithConn(t, q)
+			o, instID, store := newOutboundWithQueue(t, q)
 			q.memberBinding.InstallationID = instID
 
 			const recipient = "33333333-3333-3333-3333-333333333333"
 			const workspace = "44444444-4444-4444-4444-444444444444"
-			if !o.tryDeliverInbox(context.Background(), map[string]any{
+			const item = "66666666-6666-6666-6666-666666666666"
+			// Read off the queue row rather than a frame: an inbox card is
+			// addressed by chat id, so it is enqueued and delivered by
+			// whichever replica holds the socket. The copy is chosen here, at
+			// enqueue time, which is what this test is about.
+			if !o.tryEnqueueInbox(context.Background(), map[string]any{
+				"id":             item,
 				"recipient_type": "member",
 				"recipient_id":   recipient,
 				"workspace_id":   workspace,
 				"type":           "issue_assigned",
 				"title":          "New issue",
-			}, recipient, workspace) {
-				t.Fatal("tryDeliverInbox returned false; expected delivery to a bound member")
+			}, item, recipient, workspace) {
+				t.Fatal("tryEnqueueInbox returned false; expected an enqueue for a bound member")
 			}
 
 			want := copyPacks[tc.locale]
-			got := sentMarkdown(t, conn, 0)
+			got := store.payload(t, 0).Content
 			if !strings.HasPrefix(got, "**["+want.label("issue_assigned")+"]") {
 				t.Fatalf("inbox card = %q, want the %s label %q", got, tc.locale, want.label("issue_assigned"))
 			}
@@ -308,21 +314,23 @@ func TestInboxCardUnknownTypeUsesTheSamePacksFallback(t *testing.T) {
 		userLanguage:  "en",
 		userBindingID: localeTestUserID,
 	}
-	o, instID, conn := newOutboundWithConn(t, q)
+	o, instID, store := newOutboundWithQueue(t, q)
 	q.memberBinding.InstallationID = instID
 
 	const recipient = "33333333-3333-3333-3333-333333333333"
 	const workspace = "44444444-4444-4444-4444-444444444444"
-	if !o.tryDeliverInbox(context.Background(), map[string]any{
+	const item = "66666666-6666-6666-6666-666666666666"
+	if !o.tryEnqueueInbox(context.Background(), map[string]any{
+		"id":             item,
 		"recipient_type": "member",
 		"recipient_id":   recipient,
 		"workspace_id":   workspace,
 		"type":           "something_invented_next_year",
 		"title":          "New issue",
-	}, recipient, workspace) {
-		t.Fatal("tryDeliverInbox returned false; expected delivery to a bound member")
+	}, item, recipient, workspace) {
+		t.Fatal("tryEnqueueInbox returned false; expected an enqueue for a bound member")
 	}
-	if got, want := sentMarkdown(t, conn, 0), "**["+copyPacks[LocaleEn].InboxTypeFallback+"]"; !strings.HasPrefix(got, want) {
+	if got, want := store.payload(t, 0).Content, "**["+copyPacks[LocaleEn].InboxTypeFallback+"]"; !strings.HasPrefix(got, want) {
 		t.Fatalf("inbox card = %q, want the English fallback label %q", got, want)
 	}
 }
@@ -347,7 +355,7 @@ func TestAttachmentSendFailureNoticeReadsTheDestinationsLanguage(t *testing.T) {
 			q.userLanguage = tc.language
 			q.userBindingID = localeTestUserID
 
-			o, instID, conn := newOutboundWithMedia(t, q, &fakeObjectStore{key: "obj/bin", data: []byte("DATA")})
+			o, instID, conn, _ := newOutboundWithMedia(t, q, &fakeObjectStore{key: "obj/bin", data: []byte("DATA")})
 			q.sessionBinding.InstallationID = instID
 			q.installation.ID = instID
 			conn.refuse[cmdUploadMediaInit] = 40058 // the server will not take the file
@@ -355,10 +363,13 @@ func TestAttachmentSendFailureNoticeReadsTheDestinationsLanguage(t *testing.T) {
 			if err := o.processEvent(context.Background(), chatDoneEvent("See the attached dump.")); err != nil {
 				t.Fatalf("processEvent: %v", err)
 			}
+			// A turn that carries a file puts its answer on the socket too,
+			// ahead of the file, so the notice is the LAST thing here rather
+			// than the only thing.
 			got := markdownSends(t, conn)
 			want := copyPacks[tc.locale].MediaSendFailed
-			if len(got) != 2 || got[1] != want {
-				t.Fatalf("sends = %q, want the answer then the %s failure notice %q", got, tc.locale, want)
+			if len(got) == 0 || got[len(got)-1] != want {
+				t.Fatalf("sends = %q, want the %s failure notice %q last", got, tc.locale, want)
 			}
 		})
 	}

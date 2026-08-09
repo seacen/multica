@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -26,6 +27,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/handler"
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
 	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
+	"github.com/multica-ai/multica/server/internal/integrations/channel/outbox"
 	composiointeg "github.com/multica-ai/multica/server/internal/integrations/composio"
 	"github.com/multica-ai/multica/server/internal/integrations/dingtalk"
 	"github.com/multica-ai/multica/server/internal/integrations/lark"
@@ -285,6 +287,12 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// connection of its own outside the per-installation supervisor. The Router
 	// is the single shared inbound handler injected into every Channel.
 	channelRegistry := channel.NewRegistry()
+	// Shared metrics sink for every channel's outbound queue workers. A ref
+	// rather than the concrete sink because the Prometheus registry is built
+	// after this wiring runs; main.go points it at the real collector once it
+	// exists. See outbox.MetricsRef.
+	channelOutboxMetrics := outbox.NewMetricsRef()
+	h.ChannelOutboxMetrics = channelOutboxMetrics
 	channelRouter := engine.NewRouter(h.IssueService, h.TaskService, queries, engine.RouterConfig{Logger: slog.Default()})
 	// Debounce the per-session run trigger so a burst of messages collapses
 	// into one agent run instead of one per message (MUL-2968).
@@ -700,6 +708,28 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				slog.Info("wecom deployment locale",
 					"locale", wecom.SetDeploymentLocale(os.Getenv("MULTICA_WECOM_DEFAULT_LOCALE")))
 
+				// Durable outbound queue. WeCom is the first channel on it,
+				// and the reason it exists: aibot has no outbound REST path,
+				// so a reply can only be written by the replica holding the
+				// bot's socket, while the reply itself is produced wherever
+				// the agent task ran. The queue is the handoff — producers
+				// insert from any replica, the lease holder drains.
+				//
+				// Wake is a latency optimization on top: a producer that
+				// happens to be co-located with the socket nudges the local
+				// consumer instead of waiting for its poll tick.
+				wecomOutboxWake := outbox.NewWakeRegistry()
+				wecomProducer, producerErr := outbox.NewProducer(
+					string(wecom.TypeWecom), queries, wecomOutboxWake, channelOutboxMetrics,
+				)
+				if producerErr != nil {
+					// Only a programming error can land here (empty channel
+					// type, nil queries), so fail loudly rather than silently
+					// starting an adapter whose replies go nowhere.
+					slog.Error("wecom: outbound queue producer init failed; wecom outbound disabled", "error", producerErr)
+					wecomProducer = nil
+				}
+
 				wecomReplier := wecom.NewOutboundReplier(wecom.OutboundReplierConfig{
 					Binding:   wecomBinding,
 					Senders:   wecomSenders,
@@ -717,6 +747,53 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					Direct:   "企业微信单聊",
 					Fallback: "企业微信会话",
 				})
+
+				wecomRateGate, rateGateErr := wecom.NewRateGate(
+					func(tx pgx.Tx) outbox.RateGateQueries { return queries.WithTx(tx) },
+					pool,
+				)
+				if rateGateErr != nil {
+					// Without the gate the adapter still delivers, it just does
+					// so ungated — better than refusing to start, but say so.
+					slog.Error("wecom: outbound rate gate init failed; sends will not be quota-gated", "error", rateGateErr)
+					wecomRateGate = nil
+				}
+
+				// Scan-code install. The provider is what talks to WeCom's QR
+				// endpoints; without a source id the scan flow stays off and the
+				// endpoints return 503, but the worker still runs so any
+				// in-flight session reaches a terminal state instead of
+				// spinning forever in the admin's dialog.
+				var wecomProvider wecom.Provider
+				wecomSourceID := strings.TrimSpace(os.Getenv("MULTICA_WECOM_SOURCE_ID"))
+				if wecomSourceID == "" {
+					wecomSourceID = wecom.DefaultSourceID
+				}
+				if provider, provErr := wecom.NewHTTPProvider(wecom.HTTPProviderConfig{
+					SourceID: wecomSourceID,
+					Logger:   slog.Default(),
+				}); provErr != nil {
+					slog.Error("wecom: QR provider init failed; scan install disabled", "error", provErr)
+				} else {
+					wecomProvider = provider
+				}
+
+				// Assigned through the interface only when non-nil: a nil
+				// *InstallationService stored in botBinder would be a non-nil
+				// interface holding a typed nil, defeating InstallService's
+				// Configured() guard and panicking at finalize.
+				var wecomBotBinder wecom.BotBinder
+				if svc, instErr := wecom.NewInstallationService(queries, pool, box); instErr != nil {
+					slog.Error("wecom: InstallationService init failed; scan install disabled", "error", instErr)
+				} else {
+					wecomBotBinder = svc
+				}
+				wecomInstall := wecom.NewInstallService(queries, pool, wecomBotBinder, wecom.InstallServiceConfig{
+					Provider: wecomProvider,
+					Box:      box,
+					Logger:   slog.Default(),
+				}, nil)
+				h.WecomInstall = wecomInstall
 
 				// Welcome/Binding/AppURL are the enter_chat greeting: WeCom
 				// pushes that event the moment somebody opens the bot's chat
@@ -739,6 +816,15 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					// reply the Router's own dedup cannot cover. Same table,
 					// same key, so the two can never both answer.
 					Dedup: wecom.NewDeduper(wecomStore),
+					// Each Connect starts a consumer for its installation and
+					// stops it when the socket goes. The consumer is what makes
+					// the queue a delivery path rather than just a log.
+					Outbox: wecom.OutboxDeps{
+						Queries: queries,
+						Wake:    wecomOutboxWake,
+						Rate:    wecomRateGate,
+						Metrics: channelOutboxMetrics,
+					},
 				})
 				// Streaming replies: WeCom's smart-bot protocol has no
 				// typing indicator, no reaction and no read receipt, so the
@@ -775,7 +861,13 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					// bubble may show the run's steps. Without it every
 					// bubble falls to the closed tier and shows none.
 					Identities: queries,
-					Logger:     slog.Default(),
+					// The failure notice is written straight to the socket,
+					// so it leaves the outbound queue nothing to see — and
+					// the queue's reconciler reads a failed task with no row
+					// as a notice that never went out and sends its own. This
+					// is what tells it the news is already on screen.
+					Producer: wecomProducer,
+					Logger:   slog.Default(),
 				})
 				// Subscribes task:failed and task:cancelled — neither a failed
 				// nor a cancelled run publishes chat:done, so this is the sole
@@ -821,7 +913,27 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				if store != nil {
 					wecomOutboundOpts = append(wecomOutboundOpts, wecom.WithAttachments(store))
 				}
-				wecom.NewOutbound(queries, wecomSenders, wecomStreams, slog.Default(), wecomOutboundOpts...).Register(bus)
+				wecom.NewOutbound(queries, wecomSenders, wecomStreams, wecomProducer, slog.Default(), wecomOutboundOpts...).Register(bus)
+
+				// Reconciler: the safety net for a replica that died between
+				// finishing a task and enqueueing its reply. One runs per deployment
+				// — the cursor's lease elects it — and it also owns the retention
+				// purge. Started from main.go as its own worker.
+				if wecomProducer != nil {
+					reconciler, reconcilerErr := outbox.NewReconciler(outbox.ReconcilerConfig{
+						ChannelType: string(wecom.TypeWecom),
+						Queries:     queries,
+						Producer:    wecomProducer,
+						Builder:     wecom.NewReconcilePayloadBuilder(queries),
+						Metrics:     channelOutboxMetrics,
+						Logger:      slog.Default(),
+					})
+					if reconcilerErr != nil {
+						slog.Error("wecom: outbound reconciler init failed; missed replies will not be rescued", "error", reconcilerErr)
+					} else {
+						h.ChannelOutboxReconcilers = append(h.ChannelOutboxReconcilers, reconciler)
+					}
+				}
 
 				// Ranges the media fetcher may dial despite looking reserved.
 				// Empty by default, which leaves the SSRF guard exactly as
@@ -847,19 +959,19 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					slog.Warn("wecom: frame tracing ON — records message text; unset MULTICA_WECOM_TRACE when done")
 				}
 
+				// Worker: drives generate + poll, and nudges the supervisor when a
+				// bot lands so its connection comes up immediately.
+				wecomInstallWorker := wecom.NewInstallWorker(wecomInstall, wecom.InstallWorkerConfig{
+					Bus:        bus,
+					Supervisor: h.ChannelSupervisor,
+				})
+				// Wired after construction because the service is built before the
+				// worker that consumes it; a begin then wakes the worker instead of
+				// waiting a full poll tick.
+				wecomInstall.SetNotify(wecomInstallWorker.Notify)
+				h.WecomInstallWorker = wecomInstallWorker
+
 				slog.Info("wecom integration enabled (smart bot, long connection)")
-				// SINGLE-REPLICA CONSTRAINT: WeCom outbound (agent replies +
-				// inbox pushes) is delivered only by the replica holding each
-				// bot's in-process WebSocket lease. On a multi-replica
-				// deployment, an EventChatDone/EventInboxNew published on another
-				// replica cannot reach the lease holder, so those replies are
-				// dropped. This is stated conditionally rather than gated on a
-				// replica-count signal: the server has no reliable count here,
-				// and REDIS_URL means "Redis configured" (it also gates rate
-				// limiting), not "more than one replica". See wecom/outbound.go
-				// and SELF_HOSTING.md. Remove once outbound routes to the lease
-				// holder.
-				slog.Warn("wecom integration: WeCom agent replies and inbox pushes are delivered only by the replica holding each bot's WebSocket lease. If you run more than one backend replica, responses produced on a replica that does not hold the lease will be dropped — run the WeCom-enabled backend as a single replica until cross-replica outbound routing is implemented.")
 			}
 		}
 	} else {
@@ -1307,6 +1419,12 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Use(middleware.RequireWorkspaceMemberFromURL(queries, "id"))
 					r.Get("/slack/installations", h.ListSlackInstallations)
 					r.Get("/wecom/installations", h.ListWecomInstallations)
+					// Scan-code install. Member-level here on purpose: both
+					// handlers apply a narrower check themselves (canManageAgent
+					// for begin, initiator-or-admin for status), so an agent's
+					// owner can create its bot without being a workspace admin.
+					r.Post("/wecom/install/begin", h.BeginWecomInstall)
+					r.Get("/wecom/install/{sessionId}", h.GetWecomInstallStatus)
 				})
 				r.Group(func(r chi.Router) {
 					r.Use(middleware.RequireWorkspaceRoleFromURL(queries, "id", "owner", "admin"))
