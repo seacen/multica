@@ -217,21 +217,6 @@ func (s *InstallationService) Upsert(ctx context.Context, p InstallationParams) 
 
 	// The row this upsert is about to overwrite, read on the tx handle so it is
 	// serialized with the write. Zero when this is a first install.
-	//
-	// It is read because UpsertChannelInstallation replaces `config` wholesale
-	// while the config holds more than the install dialog collects — the chat
-	// display name, and principal_user_id saying who the bot is operated on
-	// behalf of when an admin set it up for a colleague. Rebuilding the config
-	// from the request alone drops those, so a secret rotation through the
-	// Settings dialog would silently reassign the bot to whoever clicked the
-	// button, with nothing on screen and nothing in the log to say the setting
-	// had gone.
-	//
-	// Reading after the reclaim above is safe because the reclaim cannot take
-	// this row: its revoked branch explicitly excludes the caller's own
-	// (workspace, agent) pair, and its two orphan branches only fire for a
-	// missing workspace or agent, neither of which this install could have
-	// resolved to get here.
 	carried, err := currentInstallation(ctx, qtx.Queries, p.WorkspaceID, p.AgentID)
 	if err != nil {
 		return Installation{}, err
@@ -267,15 +252,10 @@ func (s *InstallationService) Upsert(ctx context.Context, p InstallationParams) 
 		}
 	}
 
-	// The principal carries differently, and deliberately so: it is a property
-	// of the AGENT — who this agent's bot answers for — not of the credentials,
-	// so unlike the display name above it survives a re-install that swaps in a
-	// different bot as well as one that only rotates the secret.
 	cfg, err := encodeInstallConfig(Installation{
 		BotID:           p.BotID,
 		SecretEncrypted: sealed,
 		BotDisplayName:  displayName,
-		PrincipalUserID: carried.PrincipalUserID,
 	})
 	if err != nil {
 		return Installation{}, err
@@ -309,9 +289,7 @@ func (s *InstallationService) Upsert(ctx context.Context, p InstallationParams) 
 // There is no query keyed on that triple — the conflict key of the upsert is
 // not something any read path needed until now — so this filters the
 // workspace's wecom rows, of which there are a handful. Running it on the
-// caller's queries handle is what makes it serializable with the write;
-// dingtalk reads its current row inside the same transaction for the same
-// reason (dingtalk/install.go:188, GetDingTalkInstallationOwnerForUpdate).
+// caller's queries handle is what makes it serializable with the write.
 func currentInstallation(ctx context.Context, q *db.Queries, workspaceID, agentID pgtype.UUID) (Installation, error) {
 	rows, err := q.ListChannelInstallationsByWorkspace(ctx, db.ListChannelInstallationsByWorkspaceParams{
 		WorkspaceID: workspaceID,
@@ -321,14 +299,9 @@ func currentInstallation(ctx context.Context, q *db.Queries, workspaceID, agentI
 		return Installation{}, fmt.Errorf("wecom: read current installation: %w", err)
 	}
 	for _, row := range rows {
-		if row.AgentID != agentID {
-			continue
+		if row.AgentID == agentID {
+			return installationFromRow(row)
 		}
-		inst, err := installationFromRow(row)
-		if err != nil {
-			return Installation{}, fmt.Errorf("wecom: decode current installation %s: %w", row.ID.String(), err)
-		}
-		return inst, nil
 	}
 	return Installation{}, nil
 }
