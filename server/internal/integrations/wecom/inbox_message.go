@@ -12,9 +12,24 @@ import (
 	"unicode/utf8"
 )
 
-// aibot markdown size cap. WeCom rejects the whole frame if we
-// push more than ~4096 chars, so we truncate the body on that budget. We
-// use 4000 to leave headroom for the prefix + link suffix.
+// inboxMarkdownMaxLen is the budget this card is written to, in RUNES.
+//
+// It is not the platform's cap and never was. The documented cap on one
+// aibot_send_msg markdown body is 20480 utf8 bytes — sendMsgContentLimit in
+// ws_frame.go, sourced to
+// https://developer.work.weixin.qq.com/document/path/101138 — and a body past
+// it is refused whole with errcode 45002. This constant used to be justified
+// by a "~4096 chars" figure with no source behind it, which is both a
+// different number and a different unit: 4000 runes of Chinese is around
+// 12000 bytes, comfortably inside the real ceiling.
+//
+// So what this bounds is the card's length as a product choice, not as a
+// protocol limit. It stays where it is because an inbox card is a pointer to
+// the item and not the item, and truncating it here keeps the whole card —
+// prefix, body and the "view detail" link — inside the frame with room to
+// spare. Raising it would be a deliberate decision about how long a
+// notification should be, and the ceiling that decision has to respect is
+// sendMsgContentLimit measured in bytes, not this number.
 const inboxMarkdownMaxLen = 4000
 
 // The notification type labels and the deep link's anchor text live in the

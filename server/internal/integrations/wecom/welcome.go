@@ -14,10 +14,16 @@ package wecom
 //
 // Two things make this path different from every other outbound write:
 //
-//   - It is a REPLY, addressed by the req_id of the frame that triggered it.
-//     A req_id is meaningless on the next connection, so a greeting that
-//     missed its window is not late, it is void — there is nothing worth
-//     holding for a reconnect.
+//   - It is a REPLY, addressed by the req_id of the frame that triggered it,
+//     and a greeting that missed its window is void rather than late — there
+//     is nothing worth holding for a reconnect. The reason is the WINDOW, not
+//     the socket. A message callback's req_id was measured on 2026-08-09 to
+//     outlive the connection it arrived on (senders_registry.stream carries
+//     the probe), so "a req_id is meaningless on the next connection" is not
+//     a fact about req_ids generally. Whether an enter_chat event's req_id
+//     behaves the same way is UNMEASURED. What would settle it: answer an
+//     enter_chat on a second connection and read the errcode. Nothing here
+//     turns on the answer, because welcomeDeadline gives up first either way.
 //   - Its window is short — see welcomeDeadline for what that is based on.
 //     It therefore gets its own worker and its own budget rather than
 //     queueing behind message callbacks, any one of which can take longer

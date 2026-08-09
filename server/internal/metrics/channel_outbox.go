@@ -9,10 +9,15 @@ import "github.com/prometheus/client_golang/prometheus"
 // channel_type is the only identifying label: it is bounded by the number of
 // adapters, and without it a dead realtime path on one platform hides inside
 // another's traffic. Deliberately no installation_id or workspace_id anywhere
-// — that is the unbounded cardinality forbiddenMetricLabels rejects outright,
-// and every call site already carries it in the structured logs. The other
-// label values go through fixed allow-lists so a caller cannot widen the
-// series space either.
+// — that is the unbounded cardinality forbiddenMetricLabels rejects outright.
+// What that costs is worth stating rather than waving away: NO call site here
+// writes a log line beside the counter it increments. Producer carries no
+// logger at all (only a LogValue that names the channel type), and Consumer's
+// complete / terminate / retryOrFail and Reconciler's race-lost counter each
+// record and return. So a rising series says some installation on this
+// platform is affected and not which one, and the answer has to be read out of
+// the channel_outbound_queue rows themselves. The other label values go
+// through fixed allow-lists so a caller cannot widen the series space either.
 type ChannelOutboxMetrics struct {
 	Enqueued            *prometheus.CounterVec
 	Delivery            *prometheus.CounterVec

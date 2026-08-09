@@ -1054,8 +1054,14 @@ func (m *TypingIndicatorManager) addressFromBinding(ctx context.Context, session
 	}, true
 }
 
-// sessionFor finds the chat session behind a task lifecycle event. The
-// sweeper's task:failed does not carry one, so it comes off the task row.
+// sessionFor finds the chat session behind a task lifecycle event.
+//
+// It is normally on the event itself. Both publishers of task:failed stamp it
+// whenever the task row has one — service.taskEvent, and the sweeper's own
+// envelope in HandleFailedTasks — and each sets the envelope field and the
+// payload key together. The read off the task row below is a fallback for a
+// payload neither publisher produces today; see the block comment above
+// handleTaskFailed for why it is kept anyway.
 //
 // Everything here runs on the goroutine that published the event: the daemon's
 // own HTTP handler, or a sweeper tick. Hence the short deadline.
@@ -1199,8 +1205,13 @@ func (m *TypingIndicatorManager) writeClosing(ctx context.Context, sessionID pgt
 }
 
 // sessionIDFromEvent recovers the chat session from a task lifecycle event.
-// EventChatDone puts it on the envelope; EventTaskFailed carries it only in the
-// broadcast payload, and only for chat runs — so both places are checked.
+//
+// Every publisher on this path sets BOTH places for a chat run:
+// service.broadcastChatDone stamps the envelope field and ChatDonePayload,
+// service.taskEvent stamps the envelope field and the chat_session_id key, and
+// the sweeper's own envelope does the same. So the payload read is a second
+// look at the same value rather than some event type's only carrier — it costs
+// one type switch and it is what keeps a re-serialized envelope working.
 func sessionIDFromEvent(e events.Event) (pgtype.UUID, bool) {
 	if e.ChatSessionID != "" {
 		if id, err := util.ParseUUID(e.ChatSessionID); err == nil && id.Valid {

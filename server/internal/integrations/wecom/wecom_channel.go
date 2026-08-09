@@ -260,9 +260,16 @@ func (c *wecomChannel) Connect(ctx context.Context) (err error) {
 		defer stopOutbox()
 	}
 
-	// Heartbeat — WeCom kills silent sockets past ~90s. We ping every 30s
-	// via the shared writer mutex so it interleaves cleanly with other
-	// outbound frames.
+	// Heartbeat — ping every 30s (pingInterval), the cadence WeCom's docs
+	// prescribe, via the shared writer mutex so it interleaves cleanly with
+	// other outbound frames.
+	//
+	// This used to say WeCom kills silent sockets past ~90s. There is no
+	// source for that: 90s is readDeadline, our OWN patience, sized to exceed
+	// pingInterval by a comfortable margin so a late pong does not trip it.
+	// No published WeCom idle timeout is on file, and nothing here needs one —
+	// the ping cadence comes from their documented figure, and the deadline is
+	// derived from the ping.
 	pingCtx, pingCancel := context.WithCancel(ctx)
 	pingDone := make(chan struct{})
 	go func() {
@@ -752,30 +759,29 @@ func (c *wecomChannel) pingLoop(ctx context.Context, sender *wsSender, log *slog
 	}
 }
 
-// Send is the outbound Channel entry the engine calls with a normalized
-// OutboundMessage. It always uses aibot_send_msg (WeCom's "proactive push"
-// cmd) rather than aibot_respond_msg, because a normalized OutboundMessage
-// carries a chat id and no callback req_id — there is nothing here to reply
-// in-window to.
+// Send is the generic Channel outbound seam, and it is NOT implemented: every
+// call returns ErrSendNotSupported, whatever it is handed.
 //
-// An earlier version of this comment justified the choice with a 5-second
-// deadline on aibot_respond_msg. That is not a rule: 5 seconds applies to
-// aibot_respond_welcome_msg and aibot_respond_update_msg, and a reply to a
+// channel.OutboundMessage carries a chat id and no chat_type, while
+// aibot_send_msg has to know whether that id names a person or a group. The
+// stub here used to infer it from len(ChatID) > 32 — the only chat-type guess
+// in the package — and TestSend_NeverGuessesChatType now pins that it stays
+// gone: a long id must not route as a group send, a short one must not route
+// as a private send.
+//
+// Outbound for this adapter goes through OutboundReplier and Outbound
+// (EventChatDone + EventInboxNew), which read the chat type off the inbound
+// frame rather than guessing it. feishuChannel and slackChannel implement
+// their Send; this one has no honest implementation to give.
+//
+// Two protocol facts bound what any future implementation could do.
+// aibot_send_msg requires the user to have written to the bot in that
+// conversation first — an unsolicited push to a chat nobody has messaged is
+// refused. And the 5-second deadline this comment used to cite against
+// aibot_respond_msg is not a rule for it: 5 seconds applies to
+// aibot_respond_welcome_msg and aibot_respond_update_msg, while a reply to a
 // message callback is allowed for 24 hours
 // (https://developer.work.weixin.qq.com/document/path/101463).
-//
-// What aibot_send_msg does require is that the user has already written to the
-// bot in that conversation; an unsolicited push to a chat nobody has messaged
-// is refused. The other caveat is chat_type: aibot_send_msg needs to know
-// whether the ChatID is a single-user id or a group id. We piggy-back on the
-// length heuristic used by internal-customer-service (chat ids are ≥33 chars,
-// userids are shorter), which is stable in practice.
-//
-// The Channel is not the primary outbound path in the multica engine — the
-// EventChatDone subscriber and the OutboundReplier handle most sends — but
-// Channel.Send is still the contract that lets the engine deliver ad-hoc
-// replies, so we implement it here for parity with feishuChannel /
-// slackChannel.
 func (c *wecomChannel) Send(ctx context.Context, out channel.OutboundMessage) (channel.SendResult, error) {
 	// Not used. Outbound for wecom goes through OutboundReplier / Outbound
 	// (EventChatDone + EventInboxNew), which know the message's real

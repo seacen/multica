@@ -787,10 +787,13 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				h.WecomInstall = wecomInstall
 
 				// Welcome/Binding/AppURL are the enter_chat greeting: WeCom
-				// pushes that event the moment somebody opens the bot's chat
-				// and gives us about five seconds to answer, so the greeting
-				// is written by the connection itself rather than by the
-				// OutboundReplier (which only ever runs after a message).
+				// pushes that event the moment somebody opens the bot's chat,
+				// and the window to answer it is short — how short is an
+				// assumption, not a documented figure, and welcomeDeadline in
+				// wecom/welcome.go states it and what would settle it. Short
+				// enough either way that the greeting is written by the
+				// connection itself rather than by the OutboundReplier (which
+				// only ever runs after a message).
 				// Same binding service and app URL the replier gets, so both
 				// hand out the same bind link.
 				wecom.RegisterWecom(channelRegistry, wecom.ChannelDeps{

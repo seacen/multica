@@ -13,7 +13,8 @@ package wecom
 // The same is true one layer up, of the three features that answer a user
 // without the user being able to tell whether they worked: a bubble that
 // refused its closing frame still delivers the answer, as a new message; a
-// greeting that missed its five-second window is simply never sent; an
+// greeting that missed its window is simply never sent (how long that window
+// is, is welcomeDeadline's assumption, not a documented figure); an
 // attachment that could not be fetched leaves its "[Image]" placeholder in the
 // body and the agent answers as though it had seen the picture. All three read
 // as a quiet afternoon from outside.

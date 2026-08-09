@@ -115,8 +115,10 @@ func TestTypingIndicator_ClearsOnTaskFailed(t *testing.T) {
 	m := newTestTyping(q, fr)
 	m.Add(context.Background(), db.ChannelInstallation{Config: slackInstallConfigJSON()}, sessionID, "C1", freshTS())
 
-	// EventTaskFailed carries the session id only in the broadcast payload map,
-	// not on the envelope — the clear handler must read it from there.
+	// A payload-only envelope: the shape an event has after a serialization
+	// round trip, where e.ChatSessionID is gone and only the map survives. The
+	// real publishers set both fields (see chatSessionIDFromEvent), so this
+	// pins the fallback rather than the common path.
 	m.handleEvent(events.Event{
 		Type:    protocol.EventTaskFailed,
 		Payload: map[string]any{"chat_session_id": util.UUIDToString(sessionID)},
