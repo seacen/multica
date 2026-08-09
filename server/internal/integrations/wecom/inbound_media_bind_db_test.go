@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -36,6 +37,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
 	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
 	"github.com/multica-ai/multica/server/internal/service"
+	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -210,7 +212,7 @@ func wecomImageCallback(t *testing.T, botID, senderID, msgID, url string) channe
 	if !ok {
 		t.Fatal("image callback is not routable; the fixture is wrong")
 	}
-	return channelMessageFromCallback(botID, "", mc, text, "req-bind-1")
+	return channelMessageFromCallback(botID, "", mc, copyFor(DefaultLocale), text, "req-bind-1")
 }
 
 // stalledCOSServer accepts the request and then holds it open, so the media
@@ -417,49 +419,30 @@ func TestInboundImageMessageHoldsTheAgentRunUntilMediaLands(t *testing.T) {
 	}
 }
 
-// recordingIssues is an IssueCreator that answers yes and remembers what it
-// was asked to file. The issue row itself is synthetic: nothing downstream of
-// the create reads it here (an invalid IssueID skips the issue-media lock in
-// BindMediaRefs), and what these tests need to know is whether an issue was
-// filed at all and under what title.
-type recordingIssues struct {
-	mu     sync.Mutex
-	params []service.IssueCreateParams
-}
+// ---- which picture is the quoted one ----
 
-func (r *recordingIssues) Create(_ context.Context, p service.IssueCreateParams, _ service.IssueCreateOpts) (service.IssueCreateResult, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.params = append(r.params, p)
-	return service.IssueCreateResult{Issue: db.Issue{Title: p.Title}}, nil
-}
-
-func (r *recordingIssues) PublishAttachmentsChanged(context.Context, db.Issue, pgtype.UUID) {}
-
-func (r *recordingIssues) filed() []service.IssueCreateParams {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return append([]service.IssueCreateParams(nil), r.params...)
-}
-
-// wecomMixedCallback builds a 图文混排 callback whose FIRST run is the
-// screenshot and whose second is what the sender typed — the ordering that
-// filed nothing. It goes through the real frame decoder and the real
-// normalization, including the group mention strip, so nothing about the
-// command source is decided by the fixture.
-func wecomMixedCallback(t *testing.T, botID, botDisplayName, senderID, msgID, chatType, chatID, imageURL, typed string) channel.InboundMessage {
+// wecomQuotedPlusOwnCallback is the shape this file exists for: somebody
+// quotes a colleague's screenshot, types a question, and attaches a screenshot
+// of their own. Two attachments on one message, one of them referred to and
+// one of them sent, through the real frame decoder so the fixture cannot
+// drift from the wire.
+func wecomQuotedPlusOwnCallback(t *testing.T, botID, senderID, msgID, quotedURL, ownURL string) channel.InboundMessage {
 	t.Helper()
 	raw, err := json.Marshal(map[string]any{
 		"msgid":    msgID,
 		"aibotid":  botID,
-		"chattype": chatType,
-		"chatid":   chatID,
+		"chattype": "single",
+		"chatid":   senderID,
 		"from":     map[string]any{"userid": senderID},
 		"msgtype":  "mixed",
-		"mixed": map[string]any{"msg_item": []map[string]any{
-			{"msgtype": "image", "image": map[string]any{"url": imageURL, "aeskey": testAESKey}},
-			{"msgtype": "text", "text": map[string]any{"content": typed}},
+		"mixed": map[string]any{"msg_item": []any{
+			map[string]any{"msgtype": "text", "text": map[string]any{"content": "这版好一些吗"}},
+			map[string]any{"msgtype": "image", "image": map[string]any{"url": ownURL, "aeskey": testAESKey}},
 		}},
+		"quote": map[string]any{
+			"msgtype": "image",
+			"image":   map[string]any{"url": quotedURL, "aeskey": testAESKey},
+		},
 	})
 	if err != nil {
 		t.Fatalf("marshal callback: %v", err)
@@ -468,116 +451,216 @@ func wecomMixedCallback(t *testing.T, botID, botDisplayName, senderID, msgID, ch
 	if err := json.Unmarshal(raw, &mc); err != nil {
 		t.Fatalf("decode callback: %v", err)
 	}
-	text, ok := mc.ownText()
+	c := copyFor(DefaultLocale)
+	text, ok := mc.routableText(c)
 	if !ok {
-		t.Fatal("mixed callback is not routable; the fixture is wrong")
+		t.Fatal("the callback is not routable; the fixture is wrong")
 	}
-	return channelMessageFromCallback(botID, botDisplayName, mc, text, "req-mixed-1")
+	return channelMessageFromCallback(botID, "", mc, c, text, "req-quote-1")
 }
 
-// runMixedIssueThroughTheRouter drives one 图文混排 through the real Router,
-// the real ChatSession and a real Postgres, and reports what got filed and
-// what the durable message says.
-func runMixedIssueThroughTheRouter(t *testing.T, botDisplayName, chatType, chatID, typed string) (*recordingIssues, string) {
-	t.Helper()
+// TestTheQuotedPictureIsNamedWhenTwoArriveTogether is the case one attachment
+// cannot test.
+//
+// With a single attachment on the message, the quote's "[Image]" and the one
+// entry in the attachment list are obviously the same picture — you get the
+// join for free, from there being nothing else it could be, and a test built
+// on that passes whether or not anything joins them. With two the inference
+// is gone: the body holds two markers, the message holds two attachment ids,
+// and the ordering rule that pairs them ("quoted attachments come first") is
+// a rule the reader was never told.
+//
+// So the quote's marker names its attachment. What is asserted here is that
+// the id in the body is the id of THE QUOTED PICTURE and not of the one the
+// sender just attached — a body that named either one would pass a weaker
+// check, and naming the wrong one is the failure this is really guarding.
+func TestTheQuotedPictureIsNamedWhenTwoArriveTogether(t *testing.T) {
 	pool := mediaBindTestDB(t)
 	fixture := seedMediaBindFixture(t, pool)
 	ctx := context.Background()
 	queries := db.New(pool)
 
-	srv := cosServer(t, []byte("\xff\xd8\xff\xe0 a screenshot"), `attachment; filename="shot.jpg"`)
-	defer srv.Close()
+	// Different bytes and different names, so the attachment rows can be told
+	// apart by something other than the order they were inserted in.
+	theirs := cosServer(t, []byte("\xff\xd8\xff\xe0 the picture being quoted"), `attachment; filename="theirs.jpg"`)
+	defer theirs.Close()
+	mine := cosServer(t, []byte("\xff\xd8\xff\xe0 the picture just attached"), `attachment; filename="mine.jpg"`)
+	defer mine.Close()
 
 	storage := &fakeMediaStorage{}
 	resolver := newTestResolver(storage, engine.NewDBMediaIntentLedger(queries), nil)
 	session := engine.NewChatSession(queries, pool, TypeWecom, engine.SessionTitles{
 		Group: "群聊", Direct: "单聊", Fallback: "会话",
 	})
-	issues := &recordingIssues{}
-	router := engine.NewRouter(issues, &bindTestTasks{}, queries, engine.RouterConfig{
+	tasks := &bindTestTasks{}
+	router := engine.NewRouter(bindTestIssues{}, tasks, queries, engine.RouterConfig{
 		MediaTimeout: 20 * time.Second,
 		Logger:       testLogger(),
 	})
 	router.Register(TypeWecom, NewResolverSet(NewStore(queries), session, nil, resolver, nil))
 
-	if chatID == "" {
-		chatID = fixture.senderID
-	}
-	msgID := fmt.Sprintf("MSGID-MIXED-%d", time.Now().UnixNano())
-	msg := wecomMixedCallback(t, fixture.botID, botDisplayName, fixture.senderID, msgID, chatType, chatID, srv.URL, typed)
-	if err := router.Handle(ctx, msg); err != nil {
+	msgID := fmt.Sprintf("MSGID-QUOTE2-%d", time.Now().UnixNano())
+	if err := router.Handle(ctx, wecomQuotedPlusOwnCallback(t, fixture.botID, fixture.senderID, msgID, theirs.URL, mine.URL)); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 
+	// Binding is detached from the ACK path, so poll for it. Both the rows and
+	// the promotion, for the reason the test above documents: the promotion is
+	// the call after the bind transaction, and the body rewrite rides in that
+	// transaction.
+	var chatMessageID pgtype.UUID
 	var body string
+	var attachments int
 	deadline := time.Now().Add(15 * time.Second)
 	for {
-		err := pool.QueryRow(ctx, `
-			SELECT cm.content
+		if err := pool.QueryRow(ctx, `
+			SELECT cm.id, cm.content
 			FROM chat_message cm
 			JOIN chat_session cs ON cs.id = cm.chat_session_id
 			WHERE cs.workspace_id = $1 AND cm.role = 'user'
-			ORDER BY cm.created_at DESC LIMIT 1`, fixture.workspaceID).Scan(&body)
-		if err == nil {
-			break
+			ORDER BY cm.created_at DESC LIMIT 1`,
+			fixture.workspaceID).Scan(&chatMessageID, &body); err != nil {
+			if time.Now().After(deadline) {
+				t.Fatalf("no durable chat_message was ever written: %v", err)
+			}
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("no durable chat_message was ever written: %v", err)
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM attachment WHERE chat_message_id = $1`, chatMessageID).Scan(&attachments); err != nil {
+			t.Fatalf("count attachments: %v", err)
+		}
+		if (attachments == 2 && tasks.promotions() > 0) || time.Now().After(deadline) {
+			break
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return issues, body
+
+	// The precondition. Both pictures have to land, or there is no ambiguity
+	// left to resolve and the rest of this proves nothing.
+	if attachments != 2 {
+		t.Fatalf("attachment rows = %d, want 2 (the quoted picture and the sender's own) — with fewer than two "+
+			"this test cannot tell a body that names the right one from a body that names the only one", attachments)
+	}
+
+	ids := map[string]string{} // filename -> attachment id
+	rows, err := pool.Query(ctx,
+		`SELECT id, filename FROM attachment WHERE chat_message_id = $1`, chatMessageID)
+	if err != nil {
+		t.Fatalf("load attachments: %v", err)
+	}
+	for rows.Next() {
+		var id pgtype.UUID
+		var filename string
+		if err := rows.Scan(&id, &filename); err != nil {
+			t.Fatalf("scan attachment: %v", err)
+		}
+		ids[filename] = util.UUIDToString(id)
+	}
+	rows.Close()
+	quotedID, ok := ids["theirs.jpg"]
+	if !ok {
+		t.Fatalf("no attachment came from the quoted picture; rows = %v", ids)
+	}
+	ownID, ok := ids["mine.jpg"]
+	if !ok {
+		t.Fatalf("no attachment came from the sender's own picture; rows = %v", ids)
+	}
+
+	// The whole point, stated as the body the agent is handed.
+	c := copyFor(DefaultLocale)
+	want := "> " + c.QuotePrefix + "[Image: " + quotedID + "]\n这版好一些吗\n[Image]"
+	if body != want {
+		t.Fatalf("durable body = %q\nwant %q\n\n"+
+			"the message carries two attachments — %s (the quoted picture) and %s (the one just sent) — and the "+
+			"body has to say which of them the quote refers to. Two markers spelled the same way and two ids in a "+
+			"separate list leave the reader guessing, and it can only guess right by knowing an ordering rule "+
+			"nobody told it.",
+			body, want, quotedID, ownID)
+	}
+	// Stated the other way round, because a body that named BOTH pictures
+	// would satisfy the check above if the sender's own marker were ever
+	// rewritten too: only the quote's marker carries an id.
+	if strings.Contains(body, ownID) {
+		t.Errorf("durable body = %q names the sender's own picture %s; its placeholder must stay the bare %q",
+			body, ownID, "[Image]")
+	}
 }
 
-// TestIssueAfterAnImageIsStillFiled is the user-visible half of the ordering
-// defect, checked where the user would check it: was an issue created.
+// TestAQuotedPictureThatNeverArrivesSaysSo is the other half of naming the
+// quoted attachment: what the marker says when there is no attachment to
+// name.
 //
-// The sender attaches the screenshot, types "/issue 登录坏了", and sends one
-// 图文混排. ownText renders it "[Image]\n/issue 登录坏了", the engine's parser
-// reads the first non-empty line and only the first, and on the shipped code
-// that line was "[Image]" — no issue, no error, no reply saying why. Typing
-// the same two things the other way round worked, which is the part that makes
-// it impossible to report.
-func TestIssueAfterAnImageIsStillFiled(t *testing.T) {
-	issues, body := runMixedIssueThroughTheRouter(t, "", "single", "", "/issue 登录坏了")
+// Both ways of not arriving end in the same place — a download that fails and
+// a host the media address guard refuses both leave ingestOne without a ref,
+// so nothing rewrites the marker — and what it has to leave behind is a body
+// an agent can read correctly. It must not silently look like a picture that
+// did arrive, and it must not look like no picture was ever quoted.
+func TestAQuotedPictureThatNeverArrivesSaysSo(t *testing.T) {
+	pool := mediaBindTestDB(t)
+	fixture := seedMediaBindFixture(t, pool)
+	ctx := context.Background()
+	queries := db.New(pool)
 
-	filed := issues.filed()
-	if len(filed) != 1 {
-		t.Fatalf("issues created = %d, want 1 — the sender attached a screenshot, typed /issue 登录坏了, and nothing was filed and nothing said why", len(filed))
-	}
-	if filed[0].Title != "登录坏了" {
-		t.Errorf("issue title = %q, want 登录坏了", filed[0].Title)
-	}
-	// The transcript still shows the attachment and where it sat. Cutting the
-	// placeholder out of the body is the other way to break this, and it costs
-	// the agent the one signal that a picture was sent.
-	if want := "[Image]\n/issue 登录坏了"; body != want {
-		t.Errorf("durable body = %q, want %q", body, want)
-	}
-}
+	// The quoted url is dead; the sender's own picture is fine. One of each,
+	// so the body has to distinguish them rather than merely fail everywhere.
+	gone := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer gone.Close()
+	mine := cosServer(t, []byte("\xff\xd8\xff\xe0 the picture just attached"), `attachment; filename="mine.jpg"`)
+	defer mine.Close()
 
-// TestGroupMentionedIssueAfterAnImageIsStillFiled is the conflict-resolution
-// test. It fails if EITHER half is lost.
-//
-// In a group the @-mention is how the bot is reached, so it arrives glued to
-// the front of the text run: "@Multica Bot /issue 登录坏了". main strips that
-// (stripLeadingMentions, #6603) and this PR keeps the placeholders out of the
-// command source, and the parser needs both to see "/issue" on the line it
-// reads. Take main's version of ws_frame.go wholesale and the strip goes and
-// the parser sees "@Multica Bot"; derive the command from the resolved body
-// and it sees "[Image]". Either way no issue is filed, and this is the
-// assertion that says so.
-func TestGroupMentionedIssueAfterAnImageIsStillFiled(t *testing.T) {
-	issues, body := runMixedIssueThroughTheRouter(t, "Multica Bot", "group", "GROUP-BIND-1", "@Multica Bot /issue 登录坏了")
+	storage := &fakeMediaStorage{}
+	resolver := newTestResolver(storage, engine.NewDBMediaIntentLedger(queries), nil)
+	session := engine.NewChatSession(queries, pool, TypeWecom, engine.SessionTitles{})
+	tasks := &bindTestTasks{}
+	router := engine.NewRouter(bindTestIssues{}, tasks, queries, engine.RouterConfig{
+		MediaTimeout: 20 * time.Second,
+		Logger:       testLogger(),
+	})
+	router.Register(TypeWecom, NewResolverSet(NewStore(queries), session, nil, resolver, nil))
 
-	filed := issues.filed()
-	if len(filed) != 1 {
-		t.Fatalf("issues created = %d, want 1 — an @-mentioned /issue with a screenshot in a group filed nothing", len(filed))
+	msgID := fmt.Sprintf("MSGID-QUOTEFAIL-%d", time.Now().UnixNano())
+	if err := router.Handle(ctx, wecomQuotedPlusOwnCallback(t, fixture.botID, fixture.senderID, msgID, gone.URL, mine.URL)); err != nil {
+		t.Fatalf("Handle: %v", err)
 	}
-	if filed[0].Title != "登录坏了" {
-		t.Errorf("issue title = %q, want 登录坏了 (a title carrying the bot's own name means the mention strip was lost)", filed[0].Title)
+
+	var chatMessageID pgtype.UUID
+	var body string
+	var attachments int
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if err := pool.QueryRow(ctx, `
+			SELECT cm.id, cm.content
+			FROM chat_message cm
+			JOIN chat_session cs ON cs.id = cm.chat_session_id
+			WHERE cs.workspace_id = $1 AND cm.role = 'user'
+			ORDER BY cm.created_at DESC LIMIT 1`,
+			fixture.workspaceID).Scan(&chatMessageID, &body); err != nil {
+			if time.Now().After(deadline) {
+				t.Fatalf("no durable chat_message was ever written: %v", err)
+			}
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM attachment WHERE chat_message_id = $1`, chatMessageID).Scan(&attachments); err != nil {
+			t.Fatalf("count attachments: %v", err)
+		}
+		if (attachments == 1 && tasks.promotions() > 0) || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	if want := "[Image]\n@Multica Bot /issue 登录坏了"; body != want {
-		t.Errorf("durable body = %q, want %q — the transcript keeps who was addressed", body, want)
+
+	if attachments != 1 {
+		t.Fatalf("attachment rows = %d, want 1 — only the sender's own picture can land, the quoted url returns 500", attachments)
+	}
+	c := copyFor(DefaultLocale)
+	if want := "> " + c.QuotePrefix + "[Image: unavailable]\n这版好一些吗\n[Image]"; body != want {
+		t.Fatalf("durable body = %q, want %q — a marker with no id is how the agent reads "+
+			"\"there was a picture here and it did not arrive\"; no marker at all is how it reads \"there was no picture\"",
+			body, want)
 	}
 }

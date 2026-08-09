@@ -252,14 +252,14 @@ func (r *wecomMediaResolver) ingestOne(ctx context.Context, inst engine.Resolved
 		// reorder with it. The intent row covers the object either way.
 		return channel.MediaRef{}, fmt.Errorf("upload media: %w", err)
 	}
-	return channel.MediaRef{
+	return m.inline(channel.MediaRef{
 		Type:       m.Kind,
 		StorageKey: key,
 		StorageURL: link,
 		Filename:   filename,
 		MimeType:   contentType,
 		SizeBytes:  int64(len(plain)),
-	}, nil
+	}), nil
 }
 
 // mediaObjectKey names the object. It is derived from the CHAT message rather
@@ -584,12 +584,12 @@ func (r *wecomMediaResolver) ingestStreaming(
 	if _, err := streamer.UploadStream(ctx, key, plain, size, contentType, filename); err != nil {
 		return channel.MediaRef{}, fmt.Errorf("upload media: %w", err)
 	}
-	return channel.MediaRef{
+	return m.inline(channel.MediaRef{
 		Type:       m.Kind,
 		StorageKey: key,
 		StorageURL: link,
 		Filename:   filename,
 		MimeType:   contentType,
 		SizeBytes:  size,
-	}, nil
+	}), nil
 }

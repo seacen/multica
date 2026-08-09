@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -699,5 +700,96 @@ func TestAppendUserMessage_ClaimLost(t *testing.T) {
 	})
 	if err != ErrClaimLost {
 		t.Errorf("zero Mark rows must return ErrClaimLost, got %v", err)
+	}
+}
+
+// TestBindMediaRefs_InlineIDOnlyNamesTheAttachmentInsteadOfEmbeddingIt covers
+// the second replacement style: a marker that REFERS to an attachment rather
+// than carrying one.
+//
+// The two are not interchangeable. Embedding the object states this sender
+// attached it, which is wrong for a picture their message merely quotes; and
+// the reason the marker is rewritten at all is that an agent reading a body
+// with two markers and an attachment list with two ids has nothing joining
+// them, which an id inside the marker fixes and a link to a download path
+// does not do as legibly.
+func TestBindMediaRefs_InlineIDOnlyNamesTheAttachmentInsteadOfEmbeddingIt(t *testing.T) {
+	f := newFake()
+	s := newTestSession(f)
+	body := "> Quoted: [Image: unavailable]\nis this the same one\n[Image]"
+	err := s.BindMediaRefs(context.Background(), BindMediaInput{
+		MessageID:   uid(42),
+		SessionID:   uid(1),
+		WorkspaceID: uid(9),
+		Sender:      uid(7),
+		Body:        body,
+		MediaRefs: []channel.MediaRef{
+			{
+				Type: channel.MsgTypeImage, StorageKey: "wecom/quoted", StorageURL: "https://cdn.test/quoted",
+				Filename: "theirs.png", MimeType: "image/png",
+				InlinePlaceholder: "[Image: unavailable]", InlineIndex: 0, InlineIDOnly: true,
+			},
+			{
+				Type: channel.MsgTypeImage, StorageKey: "wecom/own", StorageURL: "https://cdn.test/own",
+				Filename: "mine.png", MimeType: "image/png",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("BindMediaRefs: %v", err)
+	}
+	if len(f.attachments) != 2 {
+		t.Fatalf("attachments created = %d, want 2", len(f.attachments))
+	}
+	quotedID := uuidString(f.attachments[0].ID)
+	want := "> Quoted: [Image: " + quotedID + "]\nis this the same one\n[Image]"
+	if f.updatedMediaContent != want {
+		t.Fatalf("body = %q, want %q", f.updatedMediaContent, want)
+	}
+	// The label ahead of the colon comes from the marker the adapter rendered,
+	// so the before and after spellings cannot drift into being two different
+	// things to the reader.
+	if strings.Contains(f.updatedMediaContent, "/api/attachments/") {
+		t.Errorf("body = %q embeds the object; a quoted picture is referred to, not attached again", f.updatedMediaContent)
+	}
+	if strings.Contains(f.updatedMediaContent, uuidString(f.attachments[1].ID)) {
+		t.Errorf("body = %q names the ref that asked for no marker at all", f.updatedMediaContent)
+	}
+}
+
+// TestBindMediaRefs_InlineIDOnlyStaysOutOfAnIssueDescription: an /issue turn
+// still gets both attachments, and the issue description still excludes the
+// adapter's quoted context. Materializing the marker there would put somebody
+// else's picture into the issue body as if the reporter had attached it.
+func TestBindMediaRefs_InlineIDOnlyStaysOutOfAnIssueDescription(t *testing.T) {
+	f := newFake()
+	s := newTestSession(f)
+	body := "> Quoted: [Image: unavailable]\n/issue fix the chart"
+	commandText := "/issue fix the chart"
+	base := issueDescriptionFromCommandBody(body, commandText, "")
+	err := s.BindMediaRefs(context.Background(), BindMediaInput{
+		MessageID:            uid(42),
+		SessionID:            uid(1),
+		WorkspaceID:          uid(9),
+		Sender:               uid(7),
+		IssueID:              uid(8),
+		IssueDescriptionBase: pgtype.Text{String: base, Valid: true},
+		IssueCommandText:     commandText,
+		Body:                 body,
+		MediaRefs: []channel.MediaRef{{
+			Type: channel.MsgTypeImage, StorageKey: "wecom/quoted", StorageURL: "https://cdn.test/quoted",
+			Filename: "theirs.png", MimeType: "image/png",
+			InlinePlaceholder: "[Image: unavailable]", InlineIndex: 0, InlineIDOnly: true,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("BindMediaRefs: %v", err)
+	}
+	if len(f.attachments) != 1 {
+		t.Fatalf("attachments created = %d, want 1 — the attachment is still the issue's", len(f.attachments))
+	}
+	if f.issueMediaDescription != "" {
+		t.Fatalf("issue description = %q, want it left alone: the quoted picture is context, not something the reporter attached",
+			f.issueMediaDescription)
 	}
 }

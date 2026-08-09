@@ -126,6 +126,11 @@ type copyPack struct {
 	// only handles text reads that as the bot being broken.
 	UnsupportedMsgType string
 
+	// QuotePrefix heads the block a quoted message is rendered as. Every
+	// line of the quote is marked, not just the first — an unmarked second
+	// paragraph reads as the sender's own words.
+	QuotePrefix string
+
 	// MediaTooLarge / MediaUnreadable tell the sender that an attachment did
 	// not make it. Two reasons rather than one because the fix differs: a
 	// file over the limit needs splitting or a link, whereas an expired or
@@ -357,6 +362,7 @@ var copyPacks = map[Locale]copyPack{
 		AgentOffline:         "⚠️ 智能体当前不在线，你的消息已收到，等它上线后会处理。",
 		AgentArchived:        "⚠️ 该智能体已归档，无法回复。请联系工作区管理员。",
 		UnsupportedMsgType:   "抱歉，我暂时无法处理这类消息。",
+		QuotePrefix:          "引用：",
 		MediaTooLarge:        "抱歉，附件太大了，我这边收不下。",
 		MediaUnreadable:      "抱歉，有附件没能收到，麻烦重新发一次。",
 		MediaSendFailed:      "⚠️ 有文件没能发出来，我这边保留着，需要的话我再试一次。",
@@ -433,6 +439,7 @@ var copyPacks = map[Locale]copyPack{
 		AgentOffline:         "⚠️ The agent is offline right now. Your message was received and will be handled once it's back.",
 		AgentArchived:        "⚠️ This agent has been archived and can't reply. Please contact your workspace admin.",
 		UnsupportedMsgType:   "Sorry, I can't read that kind of message.",
+		QuotePrefix:          "Quoted: ",
 		MediaTooLarge:        "Sorry, that attachment is too big for me to take.",
 		MediaUnreadable:      "Sorry, an attachment didn't come through — please send it again.",
 		MediaSendFailed:      "⚠️ I couldn't send one of the files. It is still here — say the word and I'll try again.",

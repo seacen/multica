@@ -233,9 +233,10 @@ func (r *sessionBinder) EnsureSession(ctx context.Context, p engine.EnsureSessio
 
 func (r *sessionBinder) AppendMessage(ctx context.Context, p engine.AppendParams) (engine.AppendResult, error) {
 	// The adapter's own command source wins, and Text is only the fallback.
-	// Overwriting it with Text — which this used to do — threw away the
-	// mention-stripped line the adapter had already worked out, so in a group
-	// the /issue parser was handed "@Multica Bot /issue …" and saw prose.
+	// Overwriting it with Text — which this used to do — threw away the line
+	// the adapter had already worked out: in a group the /issue parser was
+	// handed "@Multica Bot /issue …" and saw prose, and under a 引用 it was
+	// handed somebody else's quoted text and missed the command below it.
 	// Same two lines as lark/feishu_resolvers.go:206 and slack/resolvers.go:337.
 	commandText := p.Message.CommandText
 	if commandText == "" {

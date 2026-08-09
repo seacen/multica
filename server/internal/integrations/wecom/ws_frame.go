@@ -109,6 +109,96 @@ type aibotMsgCallback struct {
 	Voice struct {
 		Content string `json:"content"`
 	} `json:"voice"`
+	// Quote is the message this one is a reply to, present when the sender
+	// used 引用. Only a text or 图文混排 message carries one.
+	//
+	// It is the quoted message's CONTENT and nothing about its provenance.
+	// The documented fields are msgtype plus the typed body that goes with it
+	// — text.content, voice.content (already transcribed), image/file/video
+	// as the same {url, aeskey} pair a standalone attachment carries in
+	// long-connection mode, and mixed.msg_item for a quoted 图文混排. There is
+	// no from.userid, no msgid, no create_time: who said it and when are not
+	// on the wire, and no amount of rendering can put them there.
+	//
+	// Which is why the media reference matters. It is the only field that can
+	// tell a quote of a picture the agent has already read from a quote of one
+	// it has never seen — see attachments.
+	Quote *quotedMessage `json:"quote"`
+}
+
+// quotedMessage is the 引用 payload: any message kind, nested. It reuses
+// mixedItem because the shape is the same one — a msgtype and the typed body
+// that goes with it — and a quoted 图文混排 nests its own runs inside.
+type quotedMessage struct {
+	mixedItem
+	Mixed struct {
+		MsgItem []mixedItem `json:"msg_item"`
+	} `json:"mixed"`
+}
+
+// render turns the quoted message into the text it contributes. An attachment
+// renders as quotedMediaPlaceholder, which is the ordinary placeholder with
+// room in it to name the attachment; the bytes behind it arrive through
+// media, on the same detached path an inbound attachment takes.
+func (q *quotedMessage) render() string {
+	if q == nil {
+		return ""
+	}
+	if strings.EqualFold(q.MsgType, "mixed") {
+		var runs []string
+		for _, item := range q.Mixed.MsgItem {
+			if s := item.renderQuoted(); s != "" {
+				runs = append(runs, s)
+			}
+		}
+		return strings.Join(runs, "\n")
+	}
+	return q.mixedItem.renderQuoted()
+}
+
+// media lists the quoted message's downloadable attachments, in the order
+// render lays their placeholders out, each stamped with the marker it stands
+// for.
+//
+// Fetching them is the whole of the fix for a quoted picture. `> Quoted:
+// [Image]` is all a quote of an image can be rendered as — the payload carries
+// no sender, no message id and no timestamp to say WHICH image — so an agent
+// reading that line cannot tell a screenshot it read a minute ago from one it
+// has never seen, and answers "左下角那块看不清" about a picture it does not
+// have. The url and key on the quote are the only thing that resolves it, and
+// they are handed over in this callback like any other attachment's.
+//
+// The stamp is what closes the last half of that. Fetching the bytes puts the
+// picture in the attachment list; the marker's occurrence number is what says
+// WHICH entry of that list the quote's placeholder is, and without it a
+// message carrying two attachments — one quoted, one just sent — hands the
+// agent two markers and two ids with nothing joining them.
+func (q *quotedMessage) media() []InboundMedia {
+	if q == nil {
+		return nil
+	}
+	var out []InboundMedia
+	if strings.EqualFold(q.MsgType, "mixed") {
+		for _, item := range q.Mixed.MsgItem {
+			out = append(out, item.media()...)
+		}
+	} else {
+		out = q.mixedItem.media()
+	}
+	// Counted per marker, not over the whole list: "[Image: unavailable]" and
+	// "[File: unavailable]" are different strings, so the second picture in a
+	// quote that also carried a document is still that marker's first
+	// occurrence. Counting them together would send the binder looking for a
+	// second "[Image: unavailable]" that is not there and leave the picture
+	// unnamed.
+	seen := make(map[string]int, len(out))
+	for i := range out {
+		marker := quotedMediaPlaceholder(out[i].Kind)
+		out[i].InlinePlaceholder = marker
+		out[i].InlineIndex = seen[marker]
+		seen[marker]++
+	}
+	return out
 }
 
 // mediaBody is the {url, aeskey} pair every downloadable kind carries. In
@@ -156,6 +246,17 @@ func (item mixedItem) words() string {
 // body. An item of a kind this adapter does not know contributes nothing
 // rather than a stray placeholder.
 func (item mixedItem) render() string {
+	return item.renderWith(mediaPlaceholder)
+}
+
+// renderQuoted is render for a run inside a 引用 block: same line, but an
+// attachment gets the marker that can be joined to the attachment it stands
+// for. See quotedMediaPlaceholder.
+func (item mixedItem) renderQuoted() string {
+	return item.renderWith(quotedMediaPlaceholder)
+}
+
+func (item mixedItem) renderWith(placeholder func(channel.MsgType) string) string {
 	if s := item.words(); s != "" {
 		return s
 	}
@@ -163,7 +264,19 @@ func (item mixedItem) render() string {
 	if !ok || strings.TrimSpace(body.URL) == "" {
 		return ""
 	}
-	return mediaPlaceholder(kind)
+	return placeholder(kind)
+}
+
+// media is the downloadable attachment behind this run's placeholder, if it
+// has one. Paired with render on purpose: a run that renders a placeholder
+// must produce an attachment here and a run that renders nothing must produce
+// none, or the positional correspondence the body relies on slips by one.
+func (item mixedItem) media() []InboundMedia {
+	body, kind, ok := mediaFor(item.MsgType, item.Image, item.File, item.Video)
+	if !ok || strings.TrimSpace(body.URL) == "" {
+		return nil
+	}
+	return []InboundMedia{{Kind: kind, URL: body.URL, AESKey: body.AESKey}}
 }
 
 // mediaPlaceholder is the marker that stands in for an attachment in the
@@ -187,6 +300,47 @@ func mediaPlaceholder(kind channel.MsgType) string {
 	}
 }
 
+// mediaUnavailable is what a quoted attachment's marker says while there is
+// no attachment to name. English, like the placeholders it goes inside, and
+// for the same reason: an agent reads every channel through one prompt, so
+// this vocabulary is the agent's rather than the chat's, and putting it in
+// the copy pack would make the same picture read differently to the same
+// agent depending on whose chat it came from.
+const mediaUnavailable = "unavailable"
+
+// quotedMediaPlaceholder is the marker a QUOTED attachment renders as. It
+// carries a word inside the brackets where the sender's own "[Image]" carries
+// nothing, because the quote's placeholder is the one that has to be joined
+// to an attachment.
+//
+// Fetching the quoted picture (see quotedMessage.media) put it in the
+// attachment list and stopped there. The list is a separate block of text
+// from the body, so with one attachment the reader infers the join and with
+// two — one quoted, one just sent — there is nothing to infer from: two bare
+// "[Image]" markers, two ids, no correspondence beyond an ordering rule
+// nobody stated. So the marker names its attachment, "[Image: 019fe1d3-…]",
+// and the join stops being an inference.
+//
+// The word is what the marker says BEFORE there is an id, and it is written
+// so that it stays true if no id ever arrives: a download that fails, a host
+// the media address guard refuses, no storage configured, an intent the
+// reconciler already owns and a bind that never commits all leave it reading
+// "unavailable", and only an attachment row the agent can actually fetch
+// replaces it. Which is the distinction that matters to a reader — "there was
+// a picture here and it did not arrive" is a marker with no id, "there was no
+// picture" is no marker at all.
+func quotedMediaPlaceholder(kind channel.MsgType) string {
+	return namedMediaPlaceholder(kind, mediaUnavailable)
+}
+
+// namedMediaPlaceholder writes a name inside the bracketed placeholder:
+// "[Image]" becomes "[Image: <name>]". engine.bindMediaRefs rewrites the same
+// shape when it swaps the attachment's id in, and keeps the label ahead of
+// the colon, so the two spellings cannot drift apart.
+func namedMediaPlaceholder(kind channel.MsgType, name string) string {
+	return strings.TrimSuffix(mediaPlaceholder(kind), "]") + ": " + name + "]"
+}
+
 // mediaFor returns the body and normalized kind for a raw wecom msgtype, and
 // whether that type is one we download at all.
 func mediaFor(msgType string, image, file, video mediaBody) (mediaBody, channel.MsgType, bool) {
@@ -207,26 +361,85 @@ func mediaFor(msgType string, image, file, video mediaBody) (mediaBody, channel.
 // carrying it forward would only produce an intent-ledger row for an object
 // that can never exist.
 func (mc aibotMsgCallback) attachments() []InboundMedia {
-	var out []InboundMedia
-	add := func(body mediaBody, kind channel.MsgType) {
-		if strings.TrimSpace(body.URL) == "" {
-			return
-		}
-		out = append(out, InboundMedia{Kind: kind, URL: body.URL, AESKey: body.AESKey})
-	}
+	// The quoted message's attachments come FIRST, because that is where its
+	// placeholders are: routableText renders the quote block above the
+	// sender's own words. The Nth placeholder in the body is the Nth
+	// attachment here, and that correspondence is the only thing an agent has
+	// to work out which picture is which — 图文混排 already depends on it.
+	out := mc.Quote.media()
 	if body, kind, ok := mediaFor(mc.MsgType, mc.Image, mc.File, mc.Video); ok {
-		add(body, kind)
+		if strings.TrimSpace(body.URL) != "" {
+			out = append(out, InboundMedia{Kind: kind, URL: body.URL, AESKey: body.AESKey})
+		}
 		return out
 	}
 	if !strings.EqualFold(mc.MsgType, "mixed") {
-		return nil
+		return out
 	}
 	for _, item := range mc.Mixed.MsgItem {
-		if body, kind, ok := mediaFor(item.MsgType, item.Image, item.File, item.Video); ok {
-			add(body, kind)
-		}
+		out = append(out, item.media()...)
 	}
 	return out
+}
+
+// needsCopy reports whether routing this callback will read anything off the
+// copy pack — a quote prefix, or (for a kind we cannot read) the
+// unsupported-type receipt. Plain text with nothing quoted does not, which is
+// what lets the read loop skip the per-destination language lookup for the
+// overwhelmingly common case.
+func (mc aibotMsgCallback) needsCopy() bool {
+	if strings.EqualFold(mc.MsgType, "text") {
+		return mc.Quote.render() != ""
+	}
+	return true
+}
+
+// routableText returns the text this callback is stored and read as, and
+// whether there is any. It is the message's own body with any quoted message
+// rendered above it — see ownText for the body and quotedMessage.render for
+// the quote.
+//
+// Quoting is how a person asks about one specific thing in a busy room: they
+// long-press the message, hit 引用, and type their question under it. Without
+// the quote the agent is handed the question with its subject removed — "这个
+// 数对吗" about nothing — and answers into the void.
+//
+// A quote decorates a message that was readable on its own; it does not
+// rescue one that was not. Ingesting the quote off the back of a kind we
+// cannot read would put somebody else's words in as this person's message.
+func (mc aibotMsgCallback) routableText(c copyPack) (string, bool) {
+	own, ok := mc.ownText()
+	quoted := mc.Quote.render()
+	if quoted == "" {
+		return own, ok
+	}
+	if !ok {
+		return "", false
+	}
+	block := renderQuoteBlock(c, quoted)
+	if strings.TrimSpace(own) == "" {
+		// Quoting something and saying nothing is "look at this", which is a
+		// message worth answering.
+		return block, true
+	}
+	return block + "\n" + own, true
+}
+
+// renderQuoteBlock marks every line of the quote, not only the first: an
+// unmarked second paragraph reads as the sender's own words.
+func renderQuoteBlock(c copyPack, quoted string) string {
+	var b strings.Builder
+	for i, line := range strings.Split(quoted, "\n") {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString("> ")
+		if i == 0 {
+			b.WriteString(c.QuotePrefix)
+		}
+		b.WriteString(line)
+	}
+	return b.String()
 }
 
 // ownText is the agent-readable body of this callback, and whether there is
@@ -389,6 +602,33 @@ type InboundMedia struct {
 	// AESKey unlocks what comes back from URL. Long-connection mode mints one
 	// per url; see media_crypt.go.
 	AESKey string `json:"aeskey"`
+	// InlinePlaceholder is the exact marker in the stored body this attachment
+	// stands for, and InlineIndex is which occurrence of that marker it is.
+	// They travel onto channel.MediaRef, and the binder rewrites that one
+	// occurrence to name the attachment once a row exists (engine/session.go).
+	//
+	// Set for a QUOTED attachment only. The sender's own "[Image]" keeps the
+	// bare marker it has always had: it is already unambiguous, being the
+	// attachment on the message the reader is looking at, and rewriting it
+	// would change what every existing wecom message body says.
+	InlinePlaceholder string `json:"inline_placeholder,omitempty"`
+	InlineIndex       int    `json:"inline_index,omitempty"`
+}
+
+// inline copies the marker this attachment stands for onto the ref the binder
+// will rewrite. A ref with no marker is left exactly as it was, which is what
+// keeps the sender's own attachments on the path they were already on.
+func (m InboundMedia) inline(ref channel.MediaRef) channel.MediaRef {
+	if m.InlinePlaceholder == "" {
+		return ref
+	}
+	ref.InlinePlaceholder = m.InlinePlaceholder
+	ref.InlineIndex = m.InlineIndex
+	// The marker refers to the attachment, it does not carry it: the picture
+	// belongs to a message somebody else sent, and replacing the marker with
+	// an inline image would state this sender attached it again.
+	ref.InlineIDOnly = true
+	return ref
 }
 
 // channelMessageFromCallback converts a wecom-side aibot_msg_callback into
@@ -404,7 +644,10 @@ type InboundMedia struct {
 // group message on the wire — WeCom only forwards to the bot when it was
 // addressed, so any received group message counts as addressed.
 //
-// text is the agent-readable body the caller already resolved via ownText.
+// c is the destination's copy pack, needed again here to recompose the body
+// when a directive is stripped off it — see forceFresh below.
+//
+// text is the agent-readable body the caller already resolved via routableText.
 // It is passed in rather than recomputed because the caller has to know
 // whether the message is routable at all before it gets here. The command
 // source is a different string and is derived here from mc — see
@@ -413,7 +656,7 @@ type InboundMedia struct {
 // botDisplayName is the bot's name in a chat, from the installation config. It
 // is used for one thing: recognising where the sender's @-mention ends. Empty
 // is fine and falls back to a whitespace heuristic; see stripLeadingMentions.
-func channelMessageFromCallback(botID, botDisplayName string, mc aibotMsgCallback, text, reqID string) channel.InboundMessage {
+func channelMessageFromCallback(botID, botDisplayName string, mc aibotMsgCallback, c copyPack, text, reqID string) channel.InboundMessage {
 	chatType := channel.ChatTypeP2P
 	if strings.EqualFold(mc.ChatType, "group") {
 		chatType = channel.ChatTypeGroup
@@ -451,6 +694,33 @@ func channelMessageFromCallback(botID, botDisplayName string, mc aibotMsgCallbac
 		command = stripLeadingMentions(command, botDisplayName)
 	}
 
+	// A fresh-session directive behind a quote loses its subject.
+	// The shape is ordinary: somebody quotes a colleague's line — "Q3 毛利率
+	// 42.1%" — and types "/new 重新分析这个数" under it. The router strips the
+	// directive off CommandText and puts what is left into Text, and what is
+	// left is the sender's own words WITHOUT the quote block routableText had
+	// rendered above them. So a fresh session opened and the agent was asked
+	// to re-analyse a number it was never shown, in a session that by
+	// construction holds no earlier context to find it in.
+	//
+	// Recomposing here — quote block, then the stripped body — and declaring
+	// ForceFresh tells the router the adapter has already stripped, so it
+	// leaves Text alone. Same arrangement Feishu uses for its enriched
+	// bodies. CommandText stays unstripped so the shared parser still
+	// classifies the command the same way on every platform.
+	//
+	// A bare "/new" behind a quote is deliberately left alone: the router
+	// returns before storing anything, so recomposing would be inert, and
+	// claiming ForceFresh for a message that is never written is a lie about
+	// state.
+	forceFresh := false
+	if body, ok := engine.ParseFreshSessionCommand(command); ok && strings.TrimSpace(body) != "" {
+		if quoted := mc.Quote.render(); quoted != "" {
+			text = renderQuoteBlock(c, quoted) + "\n" + body
+			forceFresh = true
+		}
+	}
+
 	wm := InboundMessage{
 		BotID:        botID,
 		MsgID:        mc.MsgID,
@@ -479,6 +749,8 @@ func channelMessageFromCallback(botID, botDisplayName string, mc aibotMsgCallbac
 		// (feishu_channel.go:139) and Slack from its cleaned text
 		// (slack/inbound.go:131); WeCom was the one adapter leaving it empty.
 		CommandText: command,
+		// Set only when we recomposed Text above; see the comment there.
+		ForceFresh: forceFresh,
 		// A pure /issue command in WeCom should NOT trigger the
 		// agent — the engine already creates the issue and the
 		// OutboundReplier already sends "✅ 已创建 #N". Letting the agent

@@ -23,7 +23,7 @@ func TestChannelMessageFromCallback_GroupKeepsSenderDistinctFromChat(t *testing.
 	mc.From.UserID = "SENDER_USERID"
 	mc.Text.Content = "hello"
 
-	msg := channelMessageFromCallback("bot-1", "", mc, "hello", "req-1")
+	msg := channelMessageFromCallback("bot-1", "", mc, copyFor(DefaultLocale), "hello", "req-1")
 
 	if msg.Source.ChatType != channel.ChatTypeGroup {
 		t.Errorf("chat type = %v, want group", msg.Source.ChatType)
@@ -43,7 +43,7 @@ func TestChannelMessageFromCallback_P2PFallsBackChatIDToSender(t *testing.T) {
 	mc := aibotMsgCallback{MsgID: "m2", ChatID: "", ChatType: "single", MsgType: "text"}
 	mc.From.UserID = "USER_A"
 
-	msg := channelMessageFromCallback("bot-1", "", mc, "", "req-2")
+	msg := channelMessageFromCallback("bot-1", "", mc, copyFor(DefaultLocale), "", "req-2")
 
 	if msg.Source.ChatType != channel.ChatTypeP2P {
 		t.Errorf("chat type = %v, want p2p", msg.Source.ChatType)
@@ -77,7 +77,7 @@ func TestChannelMessageFromCallback_P2PMentionIsProseNotACommand(t *testing.T) {
 
 			// A configured display name must not change this either: it is the
 			// chat type that decides, not whose name is at the front.
-			msg := channelMessageFromCallback("bot-1", "Multica Bot", mc, tc.content, "req-p2p")
+			msg := channelMessageFromCallback("bot-1", "Multica Bot", mc, copyFor(DefaultLocale), tc.content, "req-p2p")
 
 			if msg.CommandText != tc.content {
 				t.Errorf("CommandText = %q, want %q untouched — in a 1:1 the leading @ is a colleague's "+
@@ -107,7 +107,7 @@ func TestChannelMessageFromCallback_P2PCommandStillWorks(t *testing.T) {
 	mc.From.UserID = "USER_A"
 	mc.Text.Content = "/issue 登录失败"
 
-	msg := channelMessageFromCallback("bot-1", "Multica Bot", mc, mc.Text.Content, "req-p2p-cmd")
+	msg := channelMessageFromCallback("bot-1", "Multica Bot", mc, copyFor(DefaultLocale), mc.Text.Content, "req-p2p-cmd")
 
 	cmd, ok := engine.ParseIssueCommand(msg.CommandText)
 	if !ok {
