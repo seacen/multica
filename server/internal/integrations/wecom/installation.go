@@ -246,6 +246,27 @@ func (s *InstallationService) Upsert(ctx context.Context, p InstallationParams) 
 	if displayName == "" && carried.BotID == p.BotID {
 		displayName = carried.BotDisplayName
 	}
+	// Swapping the bot on an agent that already has one REUSES this row, so
+	// everything keyed on installation_id survives a change that made all of
+	// it meaningless. WeCom aibot userids are anonymised per (bot, user) — the
+	// premise the whole binding flow rests on — so a binding written under the
+	// old bot names somebody the new bot has never heard of, and an inbox push
+	// goes out addressed to an old-bot userid over the new bot's connection
+	// (#6547).
+	//
+	// The reclaim above cannot cover this. It is keyed on the NEW bot's
+	// app_id, so it can only ever see rows that already belonged to that bot —
+	// never what the CURRENT installation accumulated under the old one. That
+	// blind spot is the whole mechanism behind the issue.
+	//
+	// Inside the transaction and before the upsert, so the cleanup and the
+	// swap either both land or neither does.
+	if carried.ID.Valid && carried.BotID != "" && carried.BotID != p.BotID {
+		if err := qtx.Queries.ClearChannelInstallationBindings(ctx, carried.ID); err != nil {
+			return Installation{}, fmt.Errorf("wecom: clear bindings for the previous bot: %w", err)
+		}
+	}
+
 	// The principal carries differently, and deliberately so: it is a property
 	// of the AGENT — who this agent's bot answers for — not of the credentials,
 	// so unlike the display name above it survives a re-install that swaps in a
