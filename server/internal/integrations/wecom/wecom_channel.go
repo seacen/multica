@@ -557,9 +557,12 @@ func (c *wecomChannel) subscribe(ctx context.Context, conn wsConn, sender *wsSen
 		}
 		typ, payload, err := conn.ReadMessage()
 		if err != nil {
-			// The socket died, or the ack never arrived inside
-			// subscribeTimeout. Infrastructure either way — nobody has to be
-			// told, and the next backoff may well succeed.
+			// The socket died, the ack never arrived inside
+			// subscribeTimeout, or our own ctx was cancelled mid-read and
+			// the watchdog closed the socket under us. Infrastructure or a
+			// shutdown — nobody has to be told either way, and the next
+			// backoff may well succeed. A rolling restart therefore adds a
+			// few counts here; the rate matters, a handful does not.
 			c.mx().RecordConnectFailure()
 			return fmt.Errorf("wecom: subscribe read: %w", err)
 		}
@@ -578,13 +581,28 @@ func (c *wecomChannel) subscribe(ctx context.Context, conn wsConn, sender *wsSen
 			continue
 		}
 		if env.ErrCode != 0 {
-			// The server refused the handshake on its merits: a wrong
-			// secret, a deleted bot, a bot whose long connection is off.
-			// Counted apart from every other connection failure because this
-			// is the only one that will repeat identically on every backoff
-			// until a person changes something.
-			c.mx().RecordAuthFailure()
-			return classifySubscribeAck(log, env.ErrCode, env.ErrMsg)
+			// Which of the two counters this is depends on what the ack
+			// means, and classifySubscribeAck already decides that — the
+			// same verdict the install-time credential probe gets. Branch on
+			// its answer rather than testing the errcode again here: a
+			// second copy of rejectionErrCodes would be free to drift from
+			// the probe's, and then the dashboard and the install screen
+			// would disagree about the same code.
+			err := classifySubscribeAck(log, env.ErrCode, env.ErrMsg)
+			if errors.Is(err, ErrCredentialsRejected) {
+				// Refused on its merits: a wrong secret, a deleted bot.
+				// Counted apart from every other connection failure because
+				// it is the only one that repeats identically on every
+				// backoff until a person changes something.
+				c.mx().RecordAuthFailure()
+			} else {
+				// Unverifiable — a throttle, or a platform-side failure.
+				// It clears on its own, exactly like a dial that did not
+				// land, so it belongs on that counter and not on the one an
+				// operator reads as "go rotate a credential".
+				c.mx().RecordConnectFailure()
+			}
+			return err
 		}
 		return nil
 	}

@@ -5,12 +5,13 @@ import "github.com/prometheus/client_golang/prometheus"
 // WecomMetrics is the production sink behind the WeCom adapter's Metrics
 // interface (server/internal/integrations/wecom/metrics.go).
 //
-// The adapter is built to degrade quietly. A dial that fails, a handshake the
-// server refuses, an ingest queue the read loop has to wait on — each of them
-// yields the connection back to the Supervisor, which backs off and tries
-// again, and none of them changes anything an operator can see. A bot that has
-// been down since Tuesday and a bot nobody happened to message today produce
-// the same silence.
+// The adapter is built to degrade quietly. A dial that fails and a handshake
+// the server refuses both yield the connection back to the Supervisor, which
+// backs off and tries again; an ingest queue the read loop has to wait on
+// yields nothing and simply stops draining the socket until the worker
+// catches up. None of the three changes anything an operator can see. A bot
+// that has been down since Tuesday and a bot nobody happened to message today
+// produce the same silence.
 //
 // The two connection counters are deliberately separate. A dial or a read that
 // fails is infrastructure and usually recovers on its own; a handshake the
@@ -19,10 +20,19 @@ import "github.com/prometheus/client_golang/prometheus"
 // Summed into one number the operator cannot tell "wait" from "rotate the
 // credential".
 //
+// Which side of that line an ack falls on is classifySubscribeAck's call, in
+// the adapter, and this package only counts the verdict. An ack it cannot
+// verify — a throttle, a platform-side failure — is a connect failure, on the
+// "wait" side, because rotating a credential that was fine costs a second
+// outage.
+//
 // No installation_id label anywhere. It is the same class of unbounded
 // identifier as workspace_id and session_id, which forbiddenMetricLabels
-// rejects outright; per-installation attribution is in the structured logs,
-// which carry it at every one of these call sites.
+// rejects outright. Attribution falls to the structured logs and is uneven
+// there: the two connection failures reach the Supervisor as a returned error
+// and are logged with installation_id, while a blocked ingest queue is
+// counted and nothing else — the counter says some bot is behind, not which.
+//
 // The three feature counters below follow the same rule as the connection
 // pair: each one is a ratio against something already counted, never a lone
 // number. A bubble that finished is only interesting beside one that fell
@@ -53,9 +63,9 @@ func NewWecomMetrics() *WecomMetrics {
 	}
 	return &WecomMetrics{
 		ConnectFailures: counter("connect_failures_total",
-			"Long-connection dials and handshakes that did not complete for an infrastructure reason. Excludes credential rejections, which are counted apart."),
+			"Long-connection attempts that failed for a reason nobody has to act on: the socket never came up, or the server answered the handshake with a code that only means it could not verify the bot (a throttle, a platform-side failure). Excludes credential rejections, which are counted apart."),
 		AuthFailures: counter("auth_failures_total",
-			"aibot_subscribe answered with a non-zero errcode. The bot stays down until somebody fixes the installation."),
+			"Long-connection handshakes the server refused on the credentials themselves (WeCom errcode 40001 / 40013). The bot stays down until somebody fixes the installation."),
 		CallbacksQueued: counter("inbound_callbacks_total",
 			"Inbound callbacks handed to the ingest worker. The baseline every other inbound number is read against."),
 		CallbackQueueBlocked: counter("inbound_queue_blocked_total",

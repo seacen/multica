@@ -139,8 +139,11 @@ func TestAuthAndConnectFailuresAreSeparateSeries(t *testing.T) {
 
 // No metric here may carry an unbounded identifier as a label — the same rule
 // labels.go enforces for the rest of the codebase. installation_id is the one
-// that would be tempting to add and it belongs in the logs, which already
-// carry it at every one of these call sites.
+// that would be tempting to add, and it belongs in the logs instead. Those
+// carry it for the two connection failures, which reach the Supervisor as a
+// returned error; the two inbound counters have no log line beside them, so
+// leaving the label off really does cost the answer to "which bot" on those
+// two. That is the trade this test pins, not a free win.
 func TestWecomMetricsCarryNoUnboundedLabels(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewWecomMetrics()

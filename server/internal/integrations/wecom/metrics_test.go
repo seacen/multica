@@ -96,21 +96,66 @@ func TestARefusedHandshakeIsNotCountedAsAConnectFailure(t *testing.T) {
 		botID:          "bot-1",
 		secret:         "secret-1",
 		handler:        func(context.Context, channel.InboundMessage) error { return nil },
-		dialer:         scriptedDialer{conn: &rejectingSubscribeConn{}},
+		dialer:         scriptedDialer{conn: refusingConn(40001, "invalid credential")},
 		wsURL:          "wss://example.test/ws",
 		metrics:        mx,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := c.Connect(ctx); err == nil {
+	err := c.Connect(ctx)
+	if err == nil {
 		t.Fatal("Connect succeeded against a server that refused the handshake")
+	}
+	// The counter and the error the Supervisor receives have to agree about
+	// what happened; a counter that says "credentials" while the error says
+	// something else is the drift this whole split exists to prevent.
+	if !errors.Is(err, ErrCredentialsRejected) {
+		t.Fatalf("Connect error = %v, want it to carry ErrCredentialsRejected", err)
 	}
 	if got := mx.get("auth_failure"); got != 1 {
 		t.Fatalf("auth_failure = %d, want the rejection reported as a credential problem", got)
 	}
 	if got := mx.get("connect_failure"); got != 0 {
 		t.Fatalf("connect_failure = %d for a socket that dialled and answered fine", got)
+	}
+}
+
+// The other half of that verdict. 45009 is a throttle: the bot is fine, WeCom
+// is rate-limiting, and classifySubscribeAck answers ErrCredentialsUnverifiable
+// rather than ErrCredentialsRejected. The counter has to follow that answer
+// instead of testing the errcode itself — an operator paged to rotate a
+// perfectly good secret because of a throttle has been sent to cause a second
+// outage. This is the case that would regress if somebody re-derived the
+// classification beside the counter.
+func TestAnUnverifiableHandshakeIsNotCountedAsACredentialFailure(t *testing.T) {
+	t.Parallel()
+
+	mx := newCountingMetrics()
+	c := &wecomChannel{
+		installationID: mustTestUUID(t),
+		botID:          "bot-1",
+		secret:         "secret-1",
+		handler:        func(context.Context, channel.InboundMessage) error { return nil },
+		dialer:         scriptedDialer{conn: refusingConn(45009, "api freq out of limit")},
+		wsURL:          "wss://example.test/ws",
+		metrics:        mx,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := c.Connect(ctx)
+	if err == nil {
+		t.Fatal("Connect succeeded against a server that refused the handshake")
+	}
+	if !errors.Is(err, ErrCredentialsUnverifiable) {
+		t.Fatalf("Connect error = %v, want it to carry ErrCredentialsUnverifiable", err)
+	}
+	if got := mx.get("auth_failure"); got != 0 {
+		t.Fatalf("auth_failure = %d for a throttle; nobody's credentials are wrong", got)
+	}
+	if got := mx.get("connect_failure"); got != 1 {
+		t.Fatalf("connect_failure = %d, want the unverifiable ack counted on the side that clears on its own", got)
 	}
 }
 
@@ -258,7 +303,7 @@ func TestAChannelWithNoSinkStillRuns(t *testing.T) {
 		botID:          "bot-1",
 		secret:         "secret-1",
 		handler:        func(context.Context, channel.InboundMessage) error { return nil },
-		dialer:         scriptedDialer{conn: &rejectingSubscribeConn{}},
+		dialer:         scriptedDialer{conn: refusingConn(40001, "invalid credential")},
 		wsURL:          "wss://example.test/ws",
 	}
 	if err := c.Connect(context.Background()); err == nil {
@@ -298,13 +343,22 @@ func (fixedCredentials) Credentials(inst Installation) (InstallationCredentials,
 	return InstallationCredentials{BotID: inst.BotID, Secret: "secret-1"}, nil
 }
 
-// rejectingSubscribeConn completes the handshake exchange and answers it with a
-// non-zero errcode — a bot whose secret was rotated, or one that was deleted.
+// rejectingSubscribeConn completes the handshake exchange and answers it with
+// the errcode it was built with.
 type rejectingSubscribeConn struct {
+	errCode  int
+	errMsg   string
 	mu       sync.Mutex
 	ack      []byte
 	unblock  chan struct{}
 	closeOne sync.Once
+}
+
+// refusingConn answers the handshake with one WeCom errcode. Which counter
+// that lands on is classifySubscribeAck's decision, which is the whole point
+// of driving these tests through a real code rather than a bool.
+func refusingConn(code int, msg string) *rejectingSubscribeConn {
+	return &rejectingSubscribeConn{errCode: code, errMsg: msg}
 }
 
 func (c *rejectingSubscribeConn) WriteMessage(_ int, data []byte) error {
@@ -312,8 +366,8 @@ func (c *rejectingSubscribeConn) WriteMessage(_ int, data []byte) error {
 	if err := json.Unmarshal(data, &env); err == nil && env.Cmd == cmdSubscribe {
 		ack, _ := json.Marshal(frameEnvelope{
 			Headers: frameHeaders{ReqID: env.Headers.ReqID},
-			ErrCode: 40001,
-			ErrMsg:  "invalid credential",
+			ErrCode: c.errCode,
+			ErrMsg:  c.errMsg,
 		})
 		c.mu.Lock()
 		c.ack = ack
