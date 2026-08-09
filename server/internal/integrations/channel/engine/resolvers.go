@@ -227,6 +227,25 @@ type MediaResolver interface {
 	ResolveMedia(ctx context.Context, inst ResolvedInstallation, sender ResolvedIdentity, sessionID, chatMessageID pgtype.UUID, msg channel.InboundMessage) channel.InboundMessage
 }
 
+// MediaAbandonNotifier is an optional extra a MediaResolver may implement, for
+// the one failure it cannot see for itself.
+//
+// ResolveMedia owns telling the sender about the attachments it tried and
+// could not fetch. But the Router wraps the whole call in a media budget of
+// its own, and when THAT expires the resolver either never ran or was cut off
+// mid-way — so it observed no failure, and the notice it owns cannot fire. The
+// user is left with the bot answering the line they typed beside the picture
+// as if there were no picture, and nothing telling them to send it again.
+//
+// The Router calls this on that path, on a fresh context: the one that expired
+// cannot carry a message out. Implementing it is optional, and a resolver that
+// does not is left exactly as it was — the type assertion simply misses, which
+// is what keeps the budget path unchanged for every channel that has not opted
+// in.
+type MediaAbandonNotifier interface {
+	NotifyMediaAbandoned(ctx context.Context, inst ResolvedInstallation, msg channel.InboundMessage)
+}
+
 // MediaIntentLedger persists upload intent BEFORE the object is written. The
 // row is the only artifact any failure path leaves behind: upload error,
 // resolve deadline, bind failure, ambiguous commit, or a crash all simply
