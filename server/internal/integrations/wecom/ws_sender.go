@@ -691,7 +691,33 @@ func (s *wsSender) sendText(chatID string, chatTypeInt int, content string) erro
 // Safe to block here only because inbound callbacks no longer run on the read
 // loop (wecom_channel.go): the read loop is the sole deliverer of acks, so a
 // send that waited for one from inside a callback would have waited on itself.
+// It is also where a long answer is cut into pieces the server will accept.
+// That belongs here rather than at any one call site because a body past the
+// cap is refused whole: every caller that pushes plain text — the agent's
+// answer, a binding prompt, a failure notice — has the same 20480-byte
+// ceiling and the same all-or-nothing outcome, and a split anywhere higher
+// would leave the ones that did not know about it silently losing messages.
+//
+// A piece that fails stops the rest: the pieces after it are the tail of an
+// answer whose head did not arrive, and sending them alone would read as the
+// bot replying to nothing.
 func (s *wsSender) sendTextCtx(ctx context.Context, chatID string, chatTypeInt int, content string) error {
+	pieces := splitForWire(content)
+	if len(pieces) == 1 {
+		return s.sendOneTextCtx(ctx, chatID, chatTypeInt, pieces[0])
+	}
+	for _, piece := range pieces {
+		if err := s.sendOneTextCtx(ctx, chatID, chatTypeInt, piece); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// sendOneTextCtx writes exactly one aibot_send_msg frame and reads its ack.
+// Nothing here may exceed the cap: splitForWire is the only thing standing
+// between an agent's answer and a 45002 refusal.
+func (s *wsSender) sendOneTextCtx(ctx context.Context, chatID string, chatTypeInt int, content string) error {
 	body, err := sendMsgTextBody(chatID, chatTypeInt, content)
 	if err != nil {
 		return err
