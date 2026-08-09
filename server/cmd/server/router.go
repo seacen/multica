@@ -678,11 +678,21 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				// entry and clears on exit.
 				wecomSenders := wecom.NewSendersRegistry()
 
+				// Which language the bot writes its OWN copy in for readers
+				// it cannot look a language up for — a group chat, or anyone
+				// not linked to a Multica account yet. A linked person always
+				// overrides this with their profile language. An unrecognised
+				// value leaves the default (zh-Hans) in place, which is why
+				// the resolved one is logged rather than the raw one.
+				slog.Info("wecom deployment locale",
+					"locale", wecom.SetDeploymentLocale(os.Getenv("MULTICA_WECOM_DEFAULT_LOCALE")))
+
 				wecomReplier := wecom.NewOutboundReplier(wecom.OutboundReplierConfig{
-					Binding: wecomBinding,
-					Senders: wecomSenders,
-					AppURL:  appURLFromEnv(),
-					Logger:  slog.Default(),
+					Binding:   wecomBinding,
+					Senders:   wecomSenders,
+					Languages: queries,
+					AppURL:    appURLFromEnv(),
+					Logger:    slog.Default(),
 				})
 
 				// Wecom shares the engine.ChatSession (channel_type-keyed) so
@@ -706,6 +716,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					Credentials: credsResolver,
 					Senders:     wecomSenders,
 					Metrics:     wecomMetricsOrNil(opts.WecomMetrics),
+					Languages:   queries,
 					Logger:      slog.Default(),
 					Welcome:     queries,
 					Binding:     wecomBinding,
@@ -753,7 +764,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					// mid-run — still owes the user the news, and the binding
 					// row is where the chat is found when no handle is left.
 					Bindings: queries,
-					Logger:   slog.Default(),
+					// The bubble's own words are written in the reader's
+					// language, resolved when the round is opened and carried
+					// on the handle to whichever closer gets there.
+					Languages: queries,
+					Logger:    slog.Default(),
 				})
 				// Subscribes task:failed and task:cancelled: neither a failed
 				// nor a cancelled run publishes chat:done, so this is the

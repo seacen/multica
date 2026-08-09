@@ -55,6 +55,10 @@ type outboundQueries interface {
 	FindChannelBindingForMember(ctx context.Context, arg db.FindChannelBindingForMemberParams) (db.ChannelUserBinding, error)
 	GetWorkspace(ctx context.Context, id pgtype.UUID) (db.Workspace, error)
 	ListAttachmentsByChatMessage(ctx context.Context, arg db.ListAttachmentsByChatMessageParams) ([]db.Attachment, error)
+	// Which language this subscriber's messages are written in: the inbox
+	// card reads the recipient's own profile, the file-failure notice reads
+	// the destination's (language.go).
+	languageLookup
 }
 
 // Outbound delivers an agent's chat reply back to WeCom over the same
@@ -150,7 +154,7 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 	// Asked BEFORE sayEnding, which is the line that consumes the round. Every
 	// way a web run could touch this room is on the far side of it: sayEnding
 	// takes the bubble the room's own question opened, and deliverAnswer seals
-	// it — with the answer, or with streamCopyNoReply when the completion is
+	// it — with the answer, or with the copy pack's StreamNoReply when the completion is
 	// empty. Sealing is not sending, so a gate placed inside deliverAnswer
 	// would still cost the asker in the room the bubble they were waiting on,
 	// and they would read a web run's ending in it. An answer that must not
@@ -182,6 +186,11 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 		return nil
 	}
 
+	// Whether the agent produced files for this turn, decided before the seal
+	// because what the seal has to do depends on it. Everything it reads is
+	// already in hand, so a deployment with no storage costs no query.
+	carriesFiles := o.mayCarryAttachments(e)
+
 	// Every way this answer can reach the user runs inside deliverAnswer, and
 	// the ledger records the ending only from what deliverAnswer reports. There
 	// is no path here that sends without recording, and none that records
@@ -189,7 +198,7 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 	var spokeAt roundAddress
 	_, err = o.rounds().sayEnding(ctx, sessionID, byTask(taskIDFromEvent(e)), roundOver,
 		func(t roundTurn) (roundAddress, error) {
-			addr, err := o.deliverAnswer(ctx, sessionID, t, content)
+			addr, err := o.deliverAnswer(ctx, sessionID, t, content, carriesFiles)
 			spokeAt = addr
 			return addr, err
 		})
@@ -208,6 +217,11 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 		InstallationID: spokeAt.InstallationID,
 		ChatID:         spokeAt.ChatID,
 		ChatType:       spokeAt.ChatType,
+		// Resolved here rather than at the failure, which happens on a detached
+		// goroutine with no context left to read a profile with. In a 1:1 the
+		// bound chatid IS the reader's userid, which is what localeFor wants; a
+		// room ignores it and reads the deployment's language (language.go).
+		Locale: localeFor(ctx, o.q, spokeAt.InstallationID, spokeAt.ChatType, spokeAt.ChatID),
 	})
 	return nil
 }
@@ -224,18 +238,28 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 // Nothing here re-asks where the question came from. processEvent has already
 // refused every run that is not this room's, which is what makes it safe for
 // this function to write without asking.
-func (o *Outbound) deliverAnswer(ctx context.Context, sessionID pgtype.UUID, t roundTurn, content string) (roundAddress, error) {
+func (o *Outbound) deliverAnswer(ctx context.Context, sessionID pgtype.UUID, t roundTurn, content string, carriesFiles bool) (roundAddress, error) {
 	if t.HasBubble {
 		// A bubble on screen has to end in words. An empty completion is a
 		// legitimate outcome — the agent had nothing to add — but an endless
 		// spinner is not, so the copy stands in for the silence. For a round
 		// that waited in line behind another, the silence has a better
 		// explanation: the reply ahead of it already covered this message.
+		// The round's own language, captured when its bubble was opened. And
+		// when the agent said nothing but produced files, the silence is not the
+		// end of the turn at all: those files arrive as their own messages right
+		// underneath, so a bubble reading "nothing to reply this round" would
+		// contradict the next thing on screen.
 		text := content
 		if !hasVisibleChar(text) {
-			text = streamCopyNoReply
-			if t.Handle.QueuedBehind {
-				text = streamCopyMerged
+			c := copyFor(t.Handle.Locale)
+			switch {
+			case t.Handle.QueuedBehind:
+				text = c.StreamMerged
+			case carriesFiles:
+				text = c.StreamNoReplyWithFiles
+			default:
+				text = c.StreamNoReply
 			}
 		}
 		if err := o.finishStream(ctx, t.Handle, text); err == nil {
@@ -268,12 +292,26 @@ func (o *Outbound) deliverAnswer(ctx context.Context, sessionID pgtype.UUID, t r
 		// the proof that a WeCom round is waiting on these words — no binding
 		// row is consulted and no session that never asked anything here is
 		// written to.
-		if !t.Promised || !t.Addr.known() || o.senders == nil {
+		if t.Promised && t.Addr.known() && o.senders != nil {
+			return t.Addr, o.senders.sendTextCtx(ctx, t.Addr.InstallationID, t.Addr.ChatID, t.Addr.ChatType, o.copyForAddress(ctx, t.Addr).StreamNoReply)
+		}
+		if !carriesFiles {
 			return roundAddress{}, errNothingToSay
 		}
-		return t.Addr, o.senders.sendTextCtx(ctx, t.Addr.InstallationID, t.Addr.ChatID, t.Addr.ChatType, streamCopyNoReply)
+		// The agent said nothing but produced files, and those still have to
+		// reach the room. sendAsMessage is where the binding row names it; with
+		// no words to carry it sends none, and returns the address the files go
+		// to.
 	}
 	return o.sendAsMessage(ctx, sessionID, content)
+}
+
+// copyForAddress picks the pack for a round whose handle is gone: the words are
+// going to a chat rather than to a reader anybody still holds, and in a 1:1 that
+// chatid IS the reader's userid, which is what localeFor wants. A room ignores
+// it and reads the deployment's language (language.go).
+func (o *Outbound) copyForAddress(ctx context.Context, addr roundAddress) copyPack {
+	return copyFor(localeFor(ctx, o.q, addr.InstallationID, addr.ChatType, addr.ChatID))
 }
 
 // sendAsMessage pushes an answer to the chat this session is bound to, for a
@@ -328,6 +366,12 @@ func (o *Outbound) sendAsMessage(ctx context.Context, sessionID pgtype.UUID, con
 		InstallationID: inst.ID,
 		ChatID:         binding.ChannelChatID,
 		ChatType:       aibotChatTypeFromChannel(channel.ChatType(binding.ChatType)),
+	}
+	// Words first — and only when there are any. An empty completion reaches
+	// here only because a file is bound to the turn, and an empty markdown
+	// message ahead of that file would be noise the user has to scroll past.
+	if !hasVisibleChar(content) {
+		return addr, nil
 	}
 	return addr, sender.sendTextCtx(ctx, addr.ChatID, addr.ChatType, content)
 }
@@ -444,13 +488,18 @@ func (o *Outbound) tryDeliverInbox(ctx context.Context, item map[string]any, rec
 		return false // supervisor down or reconnecting — no live connection
 	}
 
+	// The card is a 1:1 push to a known Multica member, so their own profile
+	// language decides what it says — the one surface where the reader is
+	// always resolvable by construction.
+	cp := copyFor(localeForUser(ctx, o.q, recipientID))
+
 	// Resolve slug for the link. Best-effort — a missing slug just falls
 	// back to the workspace UUID in the URL.
 	slug := ""
 	if ws, err := o.q.GetWorkspace(ctx, workspaceID); err == nil {
 		slug = ws.Slug
 	}
-	content := buildInboxMarkdown(item, workspaceIDStr, slug)
+	content := buildInboxMarkdown(item, workspaceIDStr, slug, cp)
 	if content == "" {
 		return false
 	}

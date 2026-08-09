@@ -35,34 +35,23 @@ import (
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
-// The four ways a streaming reply ends in something other than an answer. Each
-// one closes the loading bubble the question opened, so each one has to carry
-// visible text — WeCom discards a closing frame it considers empty and the
-// bubble spins on forever (see hasVisibleChar in ws_frame.go).
-//
-// Chinese, unconditionally, the same way the rest of this adapter's
-// user-facing strings are: WeCom deployments are China-only.
-const (
-	// streamCopyNoReply — the agent finished with nothing to say.
-	streamCopyNoReply = "（这轮没有需要回复的内容）"
-	// streamCopyMerged closes a QUEUED round's bubble whose run finished with
-	// nothing of its own to say — the reply ahead of it already covered this
-	// message. A first round's empty finish keeps streamCopyNoReply; this one
-	// has an earlier answer to point at.
-	streamCopyMerged = "✅ 这条已并入上一条回复一起处理了。"
-	// streamCopyNotStarted — no run was triggered at all (agent offline or
-	// archived, or the enqueue failed); the replier's own notice follows as a
-	// separate message with the detail.
-	streamCopyNotStarted = "已收到，但这条暂时没能开始处理。"
-	// streamCopyFailed — the run failed.
-	streamCopyFailed = "⚠️ 这次没跑通，请稍后再试一次。"
-	// streamCopyCancelled — the run was cancelled, so no answer is coming.
-	// Separate copy from streamCopyFailed on purpose: "试一次" invites a retry
-	// of something the user just stopped on purpose.
-	streamCopyCancelled = "⏹️ 这次处理已取消。"
-	// streamCopyStillWorking — the run outlived the protocol's stream window,
-	// so we close the bubble ourselves and answer separately later.
-	streamCopyStillWorking = "还在处理，完成后我再单独回复你。"
+// The ways a streaming reply ends in something other than an answer live in
+// the copy pack as copyPack.Stream* (strings.go), and each closer names the
+// one it wants rather than a string: the bubble's language is a property of
+// the reader, and by the time a closer runs the only thing that still knows
+// who that is, is the handle the round was opened with.
+
+// The same endings spelled in the compile-time default, for the ledger tests
+// that assert what a bubble was sealed with. A closer never reads these — it
+// reads its round's own pack — but a deployment that configures no second
+// language produces exactly these words, so they are what those tests pin.
+var (
+	streamCopyNoReply      = copyFor(DefaultLocale).StreamNoReply
+	streamCopyMerged       = copyFor(DefaultLocale).StreamMerged
+	streamCopyNotStarted   = copyFor(DefaultLocale).StreamNotStarted
+	streamCopyFailed       = copyFor(DefaultLocale).StreamFailed
+	streamCopyCancelled    = copyFor(DefaultLocale).StreamCancelled
+	streamCopyStillWorking = copyFor(DefaultLocale).StreamStillWorking
 )
 
 // streamCloseTimeout bounds a closing frame written from a timer or a bus
@@ -106,7 +95,10 @@ type TypingIndicatorManager struct {
 	streams  *streamStore
 	tasks    taskOrigin
 	bindings chatBindingLookup
-	log      *slog.Logger
+	// languages resolves a destination to the language its bubble is closed
+	// in (language.go). nil closes every bubble in the deployment's.
+	languages languageLookup
+	log       *slog.Logger
 
 	// guardAfter is when the manager closes a bubble nobody else has. Zero
 	// disables the guard (tests that drive the clock themselves).
@@ -134,6 +126,11 @@ type TypingIndicatorConfig struct {
 	// has a handle or a note for.
 	Bindings chatBindingLookup
 
+	// Languages resolves the chat a bubble was opened in to the language it is
+	// closed in: a 1:1 reads the asker's own Multica profile, a room the
+	// deployment's. Nil puts every bubble on the deployment's.
+	Languages languageLookup
+
 	// GuardAfter overrides streamGuardAfter. Test-only.
 	GuardAfter time.Duration
 }
@@ -155,6 +152,7 @@ func NewTypingIndicator(cfg TypingIndicatorConfig) *TypingIndicatorManager {
 		streams:    cfg.Streams,
 		tasks:      cfg.Tasks,
 		bindings:   cfg.Bindings,
+		languages:  cfg.Languages,
 		log:        logger,
 		guardAfter: guard,
 	}
@@ -169,6 +167,9 @@ func NewTypingIndicator(cfg TypingIndicatorConfig) *TypingIndicatorManager {
 // it with a promise nobody keeps. That makes "is it wired" unfalsifiable from
 // the outside, and a boot path that drops one looks exactly like a healthy
 // one. This is the inspection point that makes it falsifiable.
+//
+// Languages is deliberately not among them: a manager without it still closes
+// every bubble, in the deployment's language rather than the reader's.
 type TypingIndicatorWiring struct {
 	// Senders is the live WebSocket registry. Without it no closing frame and
 	// no plain-message fallback can be written at all.
@@ -246,12 +247,17 @@ func (m *TypingIndicatorManager) OnIngested(ctx context.Context, inst engine.Res
 		return
 	}
 
+	chatType := aibotChatTypeFromChannel(msg.Source.ChatType)
 	h := streamHandle{
 		ReqID:          wm.ReqID,
 		StreamID:       newStreamID(),
 		InstallationID: inst.ID,
 		ChatID:         chatID,
-		ChatType:       aibotChatTypeFromChannel(msg.Source.ChatType),
+		ChatType:       chatType,
+		// Resolved here, while the asker is still in hand. Every closer runs
+		// later, from an event that names a task and nobody else — and one of
+		// them runs on a timer, minutes after this goroutine is gone.
+		Locale: localeFor(ctx, m.languages, inst.ID, chatType, msg.Source.SenderID),
 	}
 	if m.streams.open(sessionID, batch, h) != roundOpened {
 		// roundJoined — the batcher folded this message into a run whose
@@ -329,7 +335,7 @@ func (m *TypingIndicatorManager) OnSettled(ctx context.Context, sessionID pgtype
 			if !t.HasBubble {
 				return roundAddress{}, errNothingToSay
 			}
-			return t.Handle.address(), m.writeClosing(ctx, sessionID, t.Handle, streamCopyNotStarted, "settled")
+			return t.Handle.address(), m.writeClosing(ctx, sessionID, t.Handle, copyFor(t.Handle.Locale).StreamNotStarted, "settled")
 		})
 }
 
@@ -532,7 +538,7 @@ func (m *TypingIndicatorManager) refuseUnknownOrigin(ctx context.Context, sessio
 // be exactly that path (handler.ArchiveAgent).
 //
 // Unlike a failure this does NOT go looking in the binding row when no round
-// is on file. streamCopyFailed is the only "that run did not go through" WeCom
+// is on file. StreamFailed is the only "that run did not go through" WeCom
 // ever produces, which is why a failure is worth chasing an address for; a
 // cancellation was performed by the user, and chasing it would turn one
 // "cancel all tasks" click into a message in every chat that agent serves —
@@ -562,7 +568,7 @@ func (m *TypingIndicatorManager) handleTaskCancelled(e events.Event) {
 				return roundAddress{}, errNothingToSay
 			}
 			if t.HasBubble {
-				return t.Handle.address(), m.writeClosing(ctx, sessionID, t.Handle, streamCopyCancelled, "task cancelled")
+				return t.Handle.address(), m.writeClosing(ctx, sessionID, t.Handle, copyFor(t.Handle.Locale).StreamCancelled, "task cancelled")
 			}
 			// No bubble left. If the guard already closed one for this run it
 			// promised a separate reply, and that promise is now void — say so,
@@ -573,7 +579,7 @@ func (m *TypingIndicatorManager) handleTaskCancelled(e events.Event) {
 			if !t.Promised || !t.Addr.known() {
 				return roundAddress{}, errNothingToSay
 			}
-			return t.Addr, m.sayAsPlainMessage(ctx, sessionID, t.Addr, streamCopyCancelled)
+			return t.Addr, m.sayAsPlainMessage(ctx, sessionID, t.Addr, m.copyForAddress(ctx, t.Addr).StreamCancelled)
 		})
 }
 
@@ -612,7 +618,7 @@ func (m *TypingIndicatorManager) sayTheRunFailed(ctx context.Context, sessionID 
 		return roundAddress{}, errNothingToSay
 	}
 	if t.HasBubble {
-		return t.Handle.address(), m.writeClosing(ctx, sessionID, t.Handle, streamCopyFailed, "task failed")
+		return t.Handle.address(), m.writeClosing(ctx, sessionID, t.Handle, copyFor(t.Handle.Locale).StreamFailed, "task failed")
 	}
 	addr := t.Addr
 	if !addr.known() {
@@ -622,7 +628,15 @@ func (m *TypingIndicatorManager) sayTheRunFailed(ctx context.Context, sessionID 
 		}
 		addr = found
 	}
-	return addr, m.sayAsPlainMessage(ctx, sessionID, addr, streamCopyFailed)
+	return addr, m.sayAsPlainMessage(ctx, sessionID, addr, m.copyForAddress(ctx, addr).StreamFailed)
+}
+
+// copyForAddress picks the pack for a round whose handle is gone: the words
+// are going to a chat rather than to a reader anybody still holds, and in a
+// 1:1 that chatid IS the reader's userid, which is what localeFor wants. A
+// room ignores it and reads the deployment's language (language.go).
+func (m *TypingIndicatorManager) copyForAddress(ctx context.Context, addr roundAddress) copyPack {
+	return copyFor(localeFor(ctx, m.languages, addr.InstallationID, addr.ChatType, addr.ChatID))
 }
 
 func (m *TypingIndicatorManager) sayAsPlainMessage(ctx context.Context, sessionID pgtype.UUID, addr roundAddress, text string) error {
@@ -783,7 +797,7 @@ func (m *TypingIndicatorManager) fireGuard(ctx context.Context, sessionID pgtype
 			if !t.HasBubble {
 				return roundAddress{}, errNothingToSay
 			}
-			return t.Handle.address(), m.writeClosing(ctx, sessionID, t.Handle, streamCopyStillWorking, "window expiring")
+			return t.Handle.address(), m.writeClosing(ctx, sessionID, t.Handle, copyFor(t.Handle.Locale).StreamStillWorking, "window expiring")
 		})
 }
 
@@ -794,7 +808,7 @@ func (m *TypingIndicatorManager) fireGuard(ctx context.Context, sessionID pgtype
 //
 // A closing frame that cannot go out falls back to a plain message, the same
 // way the answer does in outbound.go. The words matter more here than there:
-// streamCopyFailed is the only "that run did not go through" WeCom ever
+// StreamFailed is the only "that run did not go through" WeCom ever
 // produces, so a frame lost to a reconnect window would otherwise leave the
 // user with a spinner and no explanation that would ever arrive. The addressing
 // comes off the handle, captured at ingest, because by now the binding row may

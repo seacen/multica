@@ -50,10 +50,11 @@ type mediaObjectStore interface {
 	GetReader(ctx context.Context, key string) (io.ReadCloser, error)
 }
 
-// mediaSendFailedText is what the user is told when a file did not make it.
-// Hardcoded Chinese, like every other user-facing string this adapter sends
-// (replier.go) — WeCom deployments are China-only.
-const mediaSendFailedText = "⚠️ 有文件没能发出来，我这边保留着，需要的话我再试一次。"
+// What the user is told when a file did not make it is
+// copyPack.MediaSendFailed (strings.go), read in the language of the
+// conversation it lands in — resolved by the caller and carried on
+// attachmentTarget, because this path runs detached with no context left to
+// read a profile with.
 
 // attachmentBudget bounds one answer's whole attachment delivery — reading
 // every object, uploading it, and sending it. Generous because a 50MB file over
@@ -76,6 +77,11 @@ type attachmentTarget struct {
 	InstallationID pgtype.UUID
 	ChatID         string
 	ChatType       int
+	// Locale is the language the failure notice is written in, resolved once
+	// by the caller while it still holds the request's context. Delivery runs
+	// on a goroutine of its own with a budget measured in minutes, long after
+	// that context is gone.
+	Locale Locale
 }
 
 // OutboundOption configures the chat-done subscriber at construction.
@@ -189,7 +195,7 @@ func (o *Outbound) sendAttachments(ctx context.Context, messageID, workspaceID p
 	}
 	// The answer is already on the user's screen and it may well refer to a
 	// file. Saying nothing would leave them looking for one that never comes.
-	if err := sender.sendTextCtx(ctx, to.ChatID, to.ChatType, mediaSendFailedText); err != nil {
+	if err := sender.sendTextCtx(ctx, to.ChatID, to.ChatType, copyFor(to.Locale).MediaSendFailed); err != nil {
 		o.logger.WarnContext(ctx, "wecom outbound: could not say the file failed",
 			"error", err, "installation_id", uuidStringPub(to.InstallationID))
 	}

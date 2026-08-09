@@ -104,6 +104,11 @@ type wecomChannel struct {
 	// through mx(), which substitutes the no-op sink for a channel built
 	// without one.
 	metrics Metrics
+
+	// languages resolves a destination to the language this connection's own
+	// copy is written in — here, the receipt for a message kind we cannot
+	// read. Nil means everyone reads the deployment default.
+	languages languageLookup
 }
 
 var _ channel.Channel = (*wecomChannel)(nil)
@@ -514,8 +519,14 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 			// half-second press. Silence reads as a broken bot, so answer
 			// the same chat with a one-line receipt and stop. Best-effort: a
 			// send failure degrades to the prior silent drop.
+			//
+			// The receipt is addressed to whoever sent the unreadable message,
+			// so in a 1:1 it reads their profile language; a group has no
+			// shared profile and reads the deployment's (language.go).
+			chatType := aibotChatTypeFromChannel(msg.Source.ChatType)
+			cp := copyFor(localeFor(ctx, c.languages, c.installationID, chatType, msg.Source.SenderID))
 			log.Debug("wecom: unsupported message kind, replying with a receipt", "msg_type", mc.MsgType, "msg_id", mc.MsgID)
-			if err := sender.sendText(msg.Source.ChatID, aibotChatTypeFromChannel(msg.Source.ChatType), unsupportedMsgTypeReceipt); err != nil {
+			if err := sender.sendText(msg.Source.ChatID, chatType, cp.UnsupportedMsgType); err != nil {
 				log.Debug("wecom: unsupported-kind receipt send failed", "error", err, "msg_id", mc.MsgID)
 			}
 			return nil
@@ -656,6 +667,10 @@ type ChannelDeps struct {
 	// turned off gets.
 	Metrics Metrics
 
+	// Languages resolves a destination to its copy language (language.go).
+	// Nil puts every reader on the deployment default.
+	Languages languageLookup
+
 	// Dialer overrides the default gorilla dialer. Tests point it at an
 	// httptest server; production leaves this nil.
 	Dialer Dialer
@@ -720,6 +735,7 @@ func newWecomFactory(deps ChannelDeps) channel.Factory {
 			appURL:         strings.TrimRight(deps.AppURL, "/"),
 			bindPath:       normalizeBindingPath(deps.BindingPath),
 			metrics:        orNopMetrics(deps.Metrics),
+			languages:      deps.Languages,
 		}
 		// Assigned through the interface only when non-nil: a nil
 		// *BindingTokenService stored in a binder would be a non-nil interface
