@@ -665,9 +665,10 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 			// not know (a location card), or a known kind that arrived
 			// without the one field that makes it usable — a voice note
 			// whose transcript came back empty on background noise or a
-			// half-second press. Silence reads as a broken bot, so answer
-			// the same chat with a one-line receipt and stop. Best-effort: a
-			// send failure degrades to the prior silent drop.
+			// half-second press, an image callback carrying no url. Silence
+			// reads as a broken bot, so answer the same chat with a one-line
+			// receipt and stop. Best-effort: a send failure degrades to the
+			// prior silent drop.
 			//
 			// The receipt is addressed to whoever sent the unreadable
 			// message, so in a 1:1 it reads their profile language; a group

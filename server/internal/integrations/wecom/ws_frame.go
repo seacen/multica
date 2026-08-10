@@ -85,6 +85,14 @@ type aibotMsgCallback struct {
 	Text    struct {
 		Content string `json:"content"`
 	} `json:"text"`
+	// Voice carries the TRANSCRIPT, not audio. WeCom runs the speech
+	// recognition on its side and delivers only the result, so a voice note
+	// needs no download, no media key and no storage — it is a sentence that
+	// happened to be spoken. Not gated on chat type: whatever chat a voice
+	// note arrives from, the transcript is read the same way.
+	Voice struct {
+		Content string `json:"content"`
+	} `json:"voice"`
 	// Image / File / Video are the downloadable kinds. Each carries only a
 	// pre-signed COS url and the key its bytes are encrypted with — no name,
 	// no size, no MIME type (see media_download.go for where those come from
@@ -98,17 +106,6 @@ type aibotMsgCallback struct {
 	Mixed struct {
 		MsgItem []mixedItem `json:"msg_item"`
 	} `json:"mixed"`
-	// Voice carries the TRANSCRIPT, not audio. WeCom runs the speech
-	// recognition on its side and delivers only the result, so a voice note
-	// needs no download, no media key and no storage — it is a sentence that
-	// happened to be spoken. Not gated on chat type: whatever chat a voice
-	// note arrives from, the transcript is read the same way. mixedItem
-	// carries the same field, because a voice run inside a 图文混排 would
-	// otherwise drop a spoken sentence out of the middle of a message whose
-	// other runs are read.
-	Voice struct {
-		Content string `json:"content"`
-	} `json:"voice"`
 	// Quote is the message this one is a reply to, present when the sender
 	// used 引用. Only a text or 图文混排 message carries one.
 	//
@@ -445,20 +442,19 @@ func renderQuoteBlock(c copyPack, quoted string) string {
 // ownText is the agent-readable body of this callback, and whether there is
 // one at all.
 //
-// Plain text answers with its body; a photo, file or video answers with a
-// bracketed placeholder, because the bytes arrive later on a detached path
-// and the message has to say something in the meantime (the placeholder is
-// also what survives if the download never succeeds); 图文混排 answers with
-// its runs rendered in the order they were composed, so "look at this" still
-// reads above the picture it was written about.
+// Plain text answers with its body; a voice note answers with the transcript
+// WeCom recognised, which is the sender's own words and needs no download; a
+// photo, file or video answers with a bracketed placeholder, because the bytes
+// arrive later on a detached path and the message has to say something in the
+// meantime (the placeholder is also what survives if the download never
+// succeeds); 图文混排 answers with its runs rendered in the order they were
+// composed, so "look at this" still reads above the picture it was written
+// about.
 //
-// A standalone voice note answers with its transcript. Recognition comes back
-// empty on background noise or a half-second press, and an empty body would
-// reach the agent as a turn with nothing in it — so an empty transcript
-// reports false and takes the receipt path.
-//
-// Everything else — a location card, a kind WeCom adds next year — answers
-// false and takes the receipt path too.
+// Recognition comes back empty on background noise or a half-second press, and
+// an empty body would reach the agent as a turn with nothing in it — so an
+// empty transcript answers false and takes the receipt path, exactly like a
+// location card or a kind WeCom adds next year.
 func (mc aibotMsgCallback) ownText() (string, bool) {
 	switch strings.ToLower(mc.MsgType) {
 	case "text":
@@ -507,6 +503,13 @@ func (mc aibotMsgCallback) ownText() (string, bool) {
 // (engine/issue_command.go issueDescriptionFromCommandBody says the same
 // thing from the other end).
 //
+// A spoken message answers with its transcript. Those are the sender's own
+// words as much as a typed line is, so "/issue 登录坏了" said out loud files
+// the same issue it would have typed — and sourcing the command from the typed
+// field instead would leave it empty, at which point the engine falls back to
+// Text, files the issue anyway and, with SkipAgentRun false, runs the agent
+// over it as well.
+//
 // A standalone photo, file or video answers with nothing. Its whole body is a
 // placeholder, so there are no words in it to parse, and handing the parser a
 // string the sender never typed is the defect this exists to remove.
@@ -515,9 +518,6 @@ func (mc aibotMsgCallback) ownCommandSource() string {
 	case "text":
 		return mc.Text.Content
 	case "voice":
-		// A transcript is the sender's own words, so a spoken "/issue 登录坏了"
-		// is a command exactly like the typed one — the same rule mixedItem
-		// applies to a voice run inside a 图文混排.
 		return strings.TrimSpace(mc.Voice.Content)
 	case "mixed":
 		var runs []string
@@ -572,16 +572,15 @@ type InboundMessage struct {
 	// SenderUserID is the userid of the person who typed the message.
 	SenderUserID string `json:"sender_user_id,omitempty"`
 
-	// Content is the human-readable body: the user's words — typed for
-	// MsgType == "text", what WeCom's recognition returned for
-	// MsgType == "voice" — and the placeholders standing in for their
-	// attachments. The cross-platform envelope's Text field is populated
-	// from this.
+	// Content is the human-readable body: the user's words — typed, or as
+	// WeCom's recognition returned them for a voice note — and the
+	// placeholders standing in for their attachments. The cross-platform
+	// envelope's Text field is populated from this.
 	Content string `json:"content,omitempty"`
 
-	// ReqID is the frame req_id the server sent this message with. An
-	// aibot_respond_msg — the in-window reply — has to echo it; this adapter
-	// does not send one, and keeps the id so a caller that does can.
+	// ReqID is the frame req_id the server sent this message with. Every
+	// frame of an aibot_respond_msg stream has to echo it back, so the
+	// streaming replier reads it off here (ws_sender.go respondStream).
 	//
 	// There is no short window on it. Replies are allowed for 24 hours after the
 	// callback, and the id is not tied to the connection that received it: a
@@ -690,12 +689,8 @@ func channelMessageFromCallback(botID, botDisplayName string, mc aibotMsgCallbac
 	// issue nobody asked for plus, via SkipAgentRun below, no answer at all.
 	//
 	// For a plain text message this is mc.Text.Content, which is what p2p was
-	// passing through before CommandText was set here. It is read off
-	// ownCommandSource rather than Text.Content because a spoken "/issue …"
-	// carries the words in voice.content: sourcing the command from the typed
-	// field would leave it empty, and the engine would then fall back to Text,
-	// file the issue and — with SkipAgentRun false — run the agent over it as
-	// well.
+	// passing through before CommandText was set here; for a voice note it is
+	// the transcript, so a spoken command is a command.
 	command := mc.ownCommandSource()
 	if chatType == channel.ChatTypeGroup {
 		command = stripLeadingMentions(command, botDisplayName)
@@ -876,18 +871,17 @@ func channelMsgType(wecomType string) channel.MsgType {
 		// lark/media_ingest.go:272 pulls that same post's img/media spans.
 		//
 		// This line previously read Unknown, and the comment there was right
-		// for the code that existed: dispatchFrame routed only msgtype ==
-		// "text", so a mixed message never reached normalization and calling
-		// it Text would have claimed a routing that did not happen. That
-		// claim is what this change makes true. The two must land together —
-		// mapping to Text without the routing is the dead, misleading
-		// mapping the old comment warned about.
+		// for the code that existed: dispatchFrame routed only the kinds
+		// that arrived as words, so a mixed message never reached
+		// normalization and calling it Text would have claimed a routing that
+		// did not happen. That claim is what this change makes true. The two
+		// must land together — mapping to Text without the routing is the
+		// dead, misleading mapping the old comment warned about.
 		return channel.MsgTypeText
 	default:
-		// A kind ownText cannot read never reaches this normalization: it
-		// is answered with the unsupported-kind receipt instead. Kept as
-		// Unknown rather than mapping "mixed" → Text, which would imply a
-		// 图文混排 is routed as plain text when it is not.
+		// A kind the adapter cannot read at all. dispatchFrame answers it
+		// with the unsupported-kind receipt and stops, so this normalization
+		// is never reached for one.
 		return channel.MsgTypeUnknown
 	}
 }
@@ -900,15 +894,15 @@ func subscribeBody(botID, secret string) map[string]any {
 	return map[string]any{"bot_id": botID, "secret": secret}
 }
 
-// sendMsgTextBody builds an aibot_send_msg body carrying plain-text
-// content. aibot_send_msg's supported msgtypes are markdown and
-// template_card only — text is NOT accepted on this cmd (contrast
-// aibot_respond_msg, which does accept text). We therefore ship as
 // msgTypeMarkdown is the only aibot msgtype the adapter writes. It is also
 // what lands in channel_outbound_queue.msg_type, so the queue records what
 // wire form a row was enqueued as rather than assuming one at send time.
 const msgTypeMarkdown = "markdown"
 
+// sendMsgTextBody builds an aibot_send_msg body carrying plain-text
+// content. aibot_send_msg's supported msgtypes are markdown and
+// template_card only — text is NOT accepted on this cmd (contrast
+// aibot_respond_msg, which does accept text). We therefore ship as
 // markdown; the WeCom client renders plain text through the markdown
 // path without any special escaping. chatType is 1 for single, 2 for
 // group.

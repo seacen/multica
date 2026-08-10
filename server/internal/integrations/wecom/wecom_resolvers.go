@@ -46,12 +46,13 @@ func wecomMsgFromRaw(msg channel.InboundMessage) (InboundMessage, error) {
 // chat-session service, an outbound replier, the media resolver and the typing
 // indicator.
 //
-// The last three are optional. Pass nil to disable outbound binding prompts;
-// pass nil for media when no object-storage backend is configured, and inbound
-// attachments degrade to their placeholder text; pass nil for typing to
-// disable the streaming bubble. Replier and typing are taken as concrete types
-// rather than interfaces so a nil argument leaves the field nil instead of a
-// typed-nil interface the Router would happily call.
+// The last three are optional. Pass nil for replier to disable outbound
+// binding prompts; pass nil for media when no object-storage backend is
+// configured, and inbound attachments degrade to their placeholder text; pass
+// nil for typing to disable the streaming bubble. Typing is taken as the
+// concrete *TypingIndicatorManager rather than the engine interface so a nil
+// argument leaves the field nil instead of a typed-nil interface the Router
+// would happily call.
 func NewResolverSet(
 	store *Store,
 	session engineSessionBinder,
@@ -89,6 +90,7 @@ func NewResolverSet(
 // production value.
 type engineSessionBinder interface {
 	EnsureSession(ctx context.Context, in engine.EnsureSessionInput) (pgtype.UUID, error)
+	MarkPendingFresh(ctx context.Context, sessionID pgtype.UUID) error
 	AppendUserMessage(ctx context.Context, in engine.AppendInput) (engine.AppendResult, error)
 	BindMediaRefs(ctx context.Context, in engine.BindMediaInput) error
 }
@@ -237,6 +239,10 @@ func (r *sessionBinder) EnsureSession(ctx context.Context, p engine.EnsureSessio
 	})
 }
 
+func (r *sessionBinder) MarkPendingFresh(ctx context.Context, sessionID pgtype.UUID) error {
+	return r.session.MarkPendingFresh(ctx, sessionID)
+}
+
 func (r *sessionBinder) AppendMessage(ctx context.Context, p engine.AppendParams) (engine.AppendResult, error) {
 	// The adapter's own command source wins, and Text is only the fallback.
 	// Overwriting it with Text — which this used to do — threw away the line
@@ -256,6 +262,7 @@ func (r *sessionBinder) AppendMessage(ctx context.Context, p engine.AppendParams
 		CommandText:    commandText,
 		MessageID:      p.Message.MessageID,
 		ClaimToken:     p.ClaimToken,
+		ForceFresh:     p.Message.ForceFresh,
 		// How long the chat task waits before it runs. Without this the run
 		// fires the moment the message lands and the agent is handed the
 		// "[Image]" placeholder while the download is still going.

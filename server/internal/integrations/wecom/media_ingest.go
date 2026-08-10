@@ -104,7 +104,7 @@ func NewMediaResolver(storage mediaStorage, ledger engine.MediaIntentLedger, sen
 // the reason an operator would act on.
 //
 // It goes through the senders registry the resolver already holds rather than
-// a sink of its own: this type is built at boot from router.go with four
+// a sink of its own: this type is built at boot from router.go with five
 // arguments already, and the registry is the one thing here that both knows
 // about metrics and is guaranteed to be the same instance the read loop
 // reports through.
@@ -241,6 +241,7 @@ func (r *wecomMediaResolver) ingestOne(ctx context.Context, inst engine.Resolved
 	if err != nil {
 		return channel.MediaRef{}, err
 	}
+	traceMediaHeaders(r.logger, wm.MsgID, index, got.mediaHeaders)
 	plain, err := decryptMedia(m.AESKey, got.Body)
 	if err != nil {
 		return channel.MediaRef{}, err
@@ -555,11 +556,12 @@ func (r *wecomMediaResolver) ingestStreaming(
 	m InboundMedia,
 	key, link string,
 ) (channel.MediaRef, error) {
-	body, headerName, err := openMedia(ctx, r.http, m.URL)
+	body, headers, err := openMedia(ctx, r.http, m.URL)
 	if err != nil {
 		return channel.MediaRef{}, err
 	}
 	defer body.Close()
+	traceMediaHeaders(r.logger, wm.MsgID, index, headers)
 
 	plain, size, err := decryptToFile(m.AESKey, body, "")
 	if err != nil {
@@ -579,7 +581,7 @@ func (r *wecomMediaResolver) ingestStreaming(
 	if err != nil {
 		return channel.MediaRef{}, fmt.Errorf("wecom: media sniff: %w", err)
 	}
-	filename, contentType := describeMedia(wm, index, m, headerName, head)
+	filename, contentType := describeMedia(wm, index, m, headers.Filename, head)
 
 	if _, err := streamer.UploadStream(ctx, key, plain, size, contentType, filename); err != nil {
 		return channel.MediaRef{}, fmt.Errorf("upload media: %w", err)

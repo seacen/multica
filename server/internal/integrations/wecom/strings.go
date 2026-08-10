@@ -131,6 +131,14 @@ type copyPack struct {
 	// paragraph reads as the sender's own words.
 	QuotePrefix string
 
+	// FreshPending confirms /fresh: the next chat message runs without the
+	// context before it. IssueUsage answers a bare /issue with the shape it
+	// wanted. Both arrived from upstream after this pack existed, so they are
+	// stated here rather than as package constants — the lint asserts it, and
+	// a Chinese literal in replier.go is a line no other locale can read.
+	FreshPending string
+	IssueUsage   string
+
 	// MediaTooLarge / MediaUnreadable tell the sender that an attachment did
 	// not make it. Two reasons rather than one because the fix differs: a
 	// file over the limit needs splitting or a link, whereas an expired or
@@ -378,6 +386,8 @@ var copyPacks = map[Locale]copyPack{
 		AgentArchived:        "⚠️ 该智能体已归档，无法回复。请联系工作区管理员。",
 		UnsupportedMsgType:   "抱歉，我暂时无法处理这类消息。",
 		QuotePrefix:          "引用：",
+		FreshPending:         "✅ 已准备开始新对话。你的下一条聊天消息将不带之前的上下文运行。",
+		IssueUsage:           "请填写任务标题，格式如下：\n\n`/issue <标题>`\n`[描述]`（可选）",
 		MediaTooLarge:        "抱歉，附件太大了，我这边收不下。",
 		MediaUnreadable:      "抱歉，有附件没能收到，麻烦重新发一次。",
 		MediaSendFailed:      "⚠️ 有文件没能发出来，我这边保留着，需要的话我再试一次。",
@@ -457,6 +467,8 @@ var copyPacks = map[Locale]copyPack{
 	LocaleEn: {
 		AgentOffline:         "⚠️ The agent is offline right now. Your message was received and will be handled once it's back.",
 		AgentArchived:        "⚠️ This agent has been archived and can't reply. Please contact your workspace admin.",
+		FreshPending:         "✅ Ready for a fresh conversation. Your next chat message will run without the context before it.",
+		IssueUsage:           "Give the task a title, like this:\n\n`/issue <title>`\n`[description]` (optional)",
 		UnsupportedMsgType:   "Sorry, I can't read that kind of message.",
 		QuotePrefix:          "Quoted: ",
 		MediaTooLarge:        "Sorry, that attachment is too big for me to take.",

@@ -130,6 +130,21 @@ const modelCacheTTL = 60 * time.Second
 // executablePath lets the caller point at a non-default binary; pass
 // "" to use the provider's default name on PATH.
 func ListModels(ctx context.Context, providerType, executablePath string) (Catalog, error) {
+	// Built-in runtime identities (e.g. "omp") declare their model discovery
+	// strategy in the descriptor. Resolve generically before the protocol-
+	// family switch so no runtime-specific case is needed below. When the
+	// descriptor has no ModelDiscovery strategy, return an empty catalog
+	// (not the family's default) — running a semantically incompatible
+	// discovery command (e.g. omp rejecting --list-models) is worse than
+	// degrading to manual entry.
+	if desc, ok := BuiltinRuntimeByID(providerType); ok {
+		if desc.ModelDiscovery != nil {
+			return cachedDiscovery(discoveryCacheKey(providerType, executablePath), func() (Catalog, error) {
+				return discovered(desc.ModelDiscovery(ctx, executablePath))
+			})
+		}
+		return Catalog{Models: []Model{}}, nil
+	}
 	switch providerType {
 	case "claude":
 		models := claudeStaticModels()
@@ -1131,6 +1146,87 @@ func isPiDiscoveryNoise(line string) bool {
 		strings.Contains(lower, "usage:") ||
 		strings.Contains(lower, "unknown flag") ||
 		strings.Contains(lower, "unknown command")
+}
+
+// discoverOmpModels runs `omp models --json` and parses the JSON catalog.
+// omp (oh-my-pi) rejects `--list-models` — a pi flag it never adopted, and it
+// exits non-zero on it — so its native discovery is `omp models --json`, which
+// prints a `{"models":[...]}` object; parseOmpModels documents the entry shape.
+// An empty catalog (an omp with no provider credentials configured prints
+// `{"models":[]}`) or a non-zero exit (binary missing, omp too old) falls back
+// to an empty list so the UI degrades to manual entry instead of erroring.
+func discoverOmpModels(ctx context.Context, executablePath string) ([]Model, error) {
+	if executablePath == "" {
+		executablePath = "omp"
+	}
+	if _, err := exec.LookPath(executablePath); err != nil {
+		return []Model{}, nil
+	}
+	runCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(runCtx, executablePath, "models", "--json")
+	hideAgentWindow(cmd)
+	stdout, err := cmd.Output()
+	if err != nil || len(stdout) == 0 {
+		return []Model{}, nil
+	}
+	return parseOmpModels(stdout)
+}
+
+// parseOmpModels parses the JSON output from `omp models --json`. omp emits
+// an object wrapper with a `models` array — NOT a bare top-level array:
+//
+//	{"models":[{"provider":"anthropic","id":"claude-sonnet-5","selector":"anthropic/claude-sonnet-5","name":"Claude Sonnet 5",...}]}
+//
+// The persistable Model.ID is the selector (provider/id), matching the
+// convention parsePiModels uses: buildPiArgs splits Model.ID on "/" and
+// emits --provider + --model. Using the bare id would drop --provider and
+// let omp's internal provider priority ranking pick a different backend
+// for the same model id. Provider is kept for UI grouping. The dedup key
+// is the selector when present, falling back to provider/id.
+func parseOmpModels(data []byte) ([]Model, error) {
+	var wrapper struct {
+		Models []struct {
+			ID       string `json:"id"`
+			Provider string `json:"provider"`
+			Selector string `json:"selector"`
+			Name     string `json:"name"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return []Model{}, nil
+	}
+	var models []Model
+	seen := map[string]bool{}
+	for _, e := range wrapper.Models {
+		bareID := strings.TrimSpace(e.ID)
+		if bareID == "" {
+			continue
+		}
+		provider := strings.TrimSpace(e.Provider)
+		// Model.ID is the qualified selector (provider/id) so buildPiArgs
+		// emits both --provider and --model. When selector is absent, fall
+		// back to provider/id; when provider is also absent, the bare id is
+		// the only form available.
+		selector := strings.TrimSpace(e.Selector)
+		if selector == "" {
+			if provider != "" {
+				selector = provider + "/" + bareID
+			} else {
+				selector = bareID
+			}
+		}
+		if seen[selector] {
+			continue
+		}
+		seen[selector] = true
+		label := strings.TrimSpace(e.Name)
+		if label == "" {
+			label = selector
+		}
+		models = append(models, Model{ID: selector, Label: label, Provider: provider})
+	}
+	return models, nil
 }
 
 // discoverHermesModels spins up a throwaway `hermes acp` process,

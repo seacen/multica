@@ -882,6 +882,10 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 						store,
 						engine.NewDBMediaIntentLedger(queries),
 						wecomSenders,
+						// The notice for an attachment that never arrived is
+						// written to the person who sent it, so the resolver
+						// resolves their language the same way every other
+						// piece of the adapter's own copy does.
 						queries,
 						slog.Default(),
 					)
@@ -1687,6 +1691,19 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				r.Post("/", h.CreatePin)
 				r.Put("/reorder", h.ReorderPins)
 				r.Delete("/{itemType}/{itemId}", h.DeletePin)
+			})
+
+			// Saved issue views (MUL-4796).
+			r.Get("/api/issue-view-preferences", h.GetIssueViewPreference)
+			r.Put("/api/issue-view-preferences", h.PutIssueViewPreference)
+			r.Route("/api/issue-views", func(r chi.Router) {
+				r.Get("/", h.ListIssueViews)
+				r.Post("/", h.CreateIssueView)
+				r.Route("/{id}", func(r chi.Router) {
+					r.Get("/", h.GetIssueViewByID)
+					r.Patch("/", h.UpdateIssueView)
+					r.Delete("/", h.DeleteIssueView)
+				})
 			})
 
 			// Attachments

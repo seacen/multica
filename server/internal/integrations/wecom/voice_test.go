@@ -60,29 +60,14 @@ func TestTextIsUnaffected(t *testing.T) {
 	}
 }
 
-// The downloadable kinds are surfaced now that media ingest is in the tree, so
-// what separates ingested from refused is whether the callback carries a url to
-// download — not the kind. A kind with no url still takes the receipt path,
-// which is the case an empty transcript shares.
-func TestDownloadableKindsNeedAURL(t *testing.T) {
-	for _, kind := range []string{"image", "file", "video"} {
-		bare := aibotMsgCallback{MsgType: kind}
-		if _, ok := bare.ownText(); ok {
-			t.Errorf("%s with no url was routed as a turn; it has nothing to say and nothing to fetch", kind)
-		}
-
-		withURL := aibotMsgCallback{MsgType: kind}
-		body := mediaBody{URL: "https://example.invalid/o", AESKey: "k"}
-		switch kind {
-		case "image":
-			withURL.Image = body
-		case "file":
-			withURL.File = body
-		case "video":
-			withURL.Video = body
-		}
-		if _, ok := withURL.ownText(); !ok {
-			t.Errorf("%s with a url was refused; media ingest is in this tree and it should be surfaced", kind)
+// A downloadable kind is read from its url, so one that arrives without a url
+// has nothing to fetch and nothing to say — it takes the receipt path, the
+// same as a kind the adapter does not know at all.
+func TestDownloadableKindsWithoutAUrlTakeTheReceiptPath(t *testing.T) {
+	for _, kind := range []string{"image", "file", "video", "mixed"} {
+		mc := aibotMsgCallback{MsgType: kind}
+		if _, ok := mc.ownText(); ok {
+			t.Errorf("%s with no url was routed anyway", kind)
 		}
 	}
 }

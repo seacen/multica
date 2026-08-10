@@ -603,6 +603,12 @@ func TestZhHansPackIsTheCopyThatAlreadyShipped(t *testing.T) {
 		"TaskFailedReason":        "\n原因：%s",
 
 		"StreamNoReplyWithFiles": "（这轮没有文字回复，附件在下面）",
+
+		// Arrived from upstream as package constants in replier.go and were
+		// folded into the pack on the way in, so the text is upstream's,
+		// unchanged.
+		"FreshPending": "✅ 已准备开始新对话。你的下一条聊天消息将不带之前的上下文运行。",
+		"IssueUsage":   "请填写任务标题，格式如下：\n\n`/issue <标题>`\n`[描述]`（可选）",
 	}
 	wantLabels := map[string]string{
 		"issue_assigned":     "任务指派",

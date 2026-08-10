@@ -122,6 +122,16 @@ func (r *OutboundReplier) Reply(ctx context.Context, inst engine.ResolvedInstall
 			r.logger.WarnContext(ctx, "wecom replier: archived notice failed",
 				"installation_id", util.UUIDToString(inst.ID), "error", err)
 		}
+	case engine.OutcomeFreshPending:
+		if err := r.post(ctx, inst, msg, c.FreshPending); err != nil {
+			r.logger.WarnContext(ctx, "wecom replier: fresh-start confirmation failed",
+				"installation_id", util.UUIDToString(inst.ID), "error", err)
+		}
+	case engine.OutcomeIssueUsage:
+		if err := r.post(ctx, inst, msg, c.IssueUsage); err != nil {
+			r.logger.WarnContext(ctx, "wecom replier: issue usage reply failed",
+				"installation_id", util.UUIDToString(inst.ID), "error", err)
+		}
 	case engine.OutcomeIngested:
 		// Only a /issue-created message warrants a confirmation; a plain
 		// chat message stays silent (the agent's own reply lands via
