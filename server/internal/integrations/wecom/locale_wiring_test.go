@@ -592,8 +592,18 @@ func TestZhHansPackIsTheCopyThatAlreadyShipped(t *testing.T) {
 		"MediaTooLarge":   "抱歉，附件太大了，我这边收不下。",
 		"MediaUnreadable": "抱歉，有附件没能收到，麻烦重新发一次。",
 		"MediaSendFailed": "⚠️ 有文件没能发出来，我这边保留着，需要的话我再试一次。",
+		// New with the three-way delivery state (#6604). MediaSendFailed keeps
+		// its wording and its meaning narrows to what definitely did not
+		// arrive; these two cover the cases it used to be misapplied to.
+		"MediaSendUnknown":  "⚠️ 有文件我没收到企业微信的送达回执，可能已经发到了、也可能没有。我不会自动重发，免得发重了；你那边没看到的话说一声，我再发一次。",
+		"MediaLookupFailed": "⚠️ 我这边没查到这条回答带没带文件，所以要是有，这次没发出来。需要的话我再试一次。",
 
-		"WelcomeBound":          "👋 你好，我是 Multica 智能助手。有事直接发消息给我，或者用 “/issue 标题” 建一条任务。图片、文件、语音都可以发给我。",
+		// Widened deliberately (#6608): media routing (#6605) made typed
+		// messages and videos routable, and the sentence had stopped naming
+		// what the bot takes.
+		// TestTheBoundGreetingNamesEveryKindTheBotActuallyRoutes is what ties
+		// it to ownText; this line is where the wording change is argued for.
+		"WelcomeBound":          "👋 你好，我是 Multica 智能助手。有事直接发消息给我，或者用 “/issue 标题” 建一条任务。（文字、语音、图片、文件、视频都能发给我）",
 		"WelcomeUnboundPrefix":  "👋 你好，我是 Multica 智能助手。请先绑定你的 Multica 账号，才能与我对话：\n",
 		"WelcomeUnboundSuffix":  "\n（链接 15 分钟内有效）",
 		"WelcomeUnboundPending": "👋 你好，我是 Multica 智能助手。绑定链接刚才已经发给你了，就在上方，请直接点击完成绑定。",

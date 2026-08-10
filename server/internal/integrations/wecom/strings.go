@@ -146,13 +146,26 @@ type copyPack struct {
 	MediaTooLarge   string
 	MediaUnreadable string
 
-	// MediaSendFailed goes the other way: the agent produced a file and it did
-	// not reach the chat. The answer is already on screen and may well point
-	// at the file, so silence would leave the user waiting for something that
-	// is not coming. One line covers the whole turn however many files failed
-	// — the reason (too big, storage down, WeCom refused it) is a log line,
-	// not something the reader can act on.
-	MediaSendFailed string
+	// MediaSendFailed / MediaSendUnknown / MediaLookupFailed go the other way:
+	// the agent produced a file and it did not plainly reach the chat. The
+	// answer is already on screen and may well point at the file, so silence
+	// would leave the user waiting for something that is not coming. One line
+	// covers the whole turn however many files were affected — the reason (too
+	// big, storage down, WeCom refused it) is a log line, not something the
+	// reader can act on.
+	//
+	// Three of them because there are three things that can be true, and
+	// telling them apart is the point (see deliveryState in outbound_media.go).
+	// MediaSendFailed is the definite one: nothing arrived and nothing can
+	// have. MediaSendUnknown is for a send whose verdict never came back — its
+	// wording has to survive both endings, so it must not say "failed" to
+	// someone looking at the file, and it says why nothing is resent, since a
+	// duplicate cannot be taken back. MediaLookupFailed is earlier still: we
+	// could not read what was attached to this reply, so we do not know whether
+	// there was a file at all.
+	MediaSendFailed   string
+	MediaSendUnknown  string
+	MediaLookupFailed string
 
 	// BindingPromptPrefix / BindingPromptSuffix wrap the bind URL.
 	// BindingPending replaces the whole thing when the mint was throttled and
@@ -399,6 +412,8 @@ var copyPacks = map[Locale]copyPack{
 		MediaTooLarge:        "抱歉，附件太大了，我这边收不下。",
 		MediaUnreadable:      "抱歉，有附件没能收到，麻烦重新发一次。",
 		MediaSendFailed:      "⚠️ 有文件没能发出来，我这边保留着，需要的话我再试一次。",
+		MediaSendUnknown:     "⚠️ 有文件我没收到企业微信的送达回执，可能已经发到了、也可能没有。我不会自动重发，免得发重了；你那边没看到的话说一声，我再发一次。",
+		MediaLookupFailed:    "⚠️ 我这边没查到这条回答带没带文件，所以要是有，这次没发出来。需要的话我再试一次。",
 		BindingPromptPrefix:  "👋 请先绑定你的 Multica 账号，才能与我对话：\n",
 		BindingPromptSuffix:  "\n（链接 15 分钟内有效）",
 		BindingPending:       "👋 绑定链接刚才已经发给你了，就在上方，请直接点击完成绑定。",
@@ -482,6 +497,8 @@ var copyPacks = map[Locale]copyPack{
 		MediaTooLarge:        "Sorry, that attachment is too big for me to take.",
 		MediaUnreadable:      "Sorry, an attachment didn't come through — please send it again.",
 		MediaSendFailed:      "⚠️ I couldn't send one of the files. It is still here — say the word and I'll try again.",
+		MediaSendUnknown:     "⚠️ WeCom never confirmed one of the files, so it may or may not have arrived. I won't resend it automatically in case that shows it twice — tell me if it isn't there and I'll send it again.",
+		MediaLookupFailed:    "⚠️ I couldn't check whether this answer had a file with it, so if it did, it didn't go out. Say the word and I'll try again.",
 		BindingPromptPrefix:  "👋 Link your Multica account before we can talk:\n",
 		BindingPromptSuffix:  "\n(the link is good for 15 minutes)",
 		BindingPending:       "👋 I already sent you a link — it is just above, tap it to finish linking.",
