@@ -36,7 +36,6 @@
 // the in-process WebSocket in sendersRegistry, but replies reach it through
 // channel_outbound_queue: any replica enqueues, and the one holding the bot's
 // connection lease drains. See channel/outbox.
-
 package wecom
 
 import (
