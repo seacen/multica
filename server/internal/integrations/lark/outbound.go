@@ -255,10 +255,24 @@ func (p *Patcher) SetTypingIndicatorManager(m *TypingIndicatorManager) {
 //   - EventTaskCancelled — the run ended without an answer. Nothing is
 //     sent for it; the subscription exists so the Typing reaction comes
 //     off. A cancellation publishes no chat-done and no task-failed, so
-//     without this the badge sits on the user's message for good. Every
-//     cancel path lands here — CancelTask for a running or queued task,
-//     the queued follow-up cancel behind it, and the agent- and
-//     issue-level bulk cancels all broadcast task:cancelled per row.
+//     without this the badge sits on the user's message for good.
+//     task:cancelled is broadcast once per cancelled row by CancelTask,
+//     the queued follow-up cancel behind it, the agent- and issue-level
+//     bulk cancels, the runtime and member revocations, and deleting the
+//     chat session. The delete is the one that used to publish nothing:
+//     BroadcastCancelledTasks resolved each task's workspace through its
+//     chat_session, the same row its transaction had just deleted, and an
+//     event with no workspace is dropped before it reaches the bus. It now
+//     takes the workspace from its caller. Two holes are left, neither of
+//     them a missing subscription: archiving an agent stays silent by
+//     choice — agent:archived invalidates every client's task list
+//     instead — and no list refresh removes a Lark reaction; and an
+//     ending that arrives while the reaction is still being added clears
+//     nothing, because Add records its state only after the Lark call
+//     returns, so the badge lands after the clear with nothing left to
+//     take it off. That second one predates task:cancelled — chat-done
+//     and task-failed race the add the same way — and closing it needs a
+//     per-session generation the add can check when its call returns.
 //
 // We deliberately do NOT subscribe to EventTaskQueued / EventTaskRunning
 // (no thinking-card lifecycle anymore — adds noise without value) or to
@@ -298,6 +312,33 @@ func (p *Patcher) processEvent(ctx context.Context, e events.Event) error {
 		// Issue / autopilot tasks have no chat_session.
 		return nil
 	}
+	// A cancelled run has no reply to place, so the only thing owed to the user
+	// is taking the Typing badge off. That runs before every lookup below,
+	// because each of them can answer "no" for a run that still has a badge on
+	// screen:
+	//
+	//   - the binding is gone by the time a session delete's cancels are
+	//     broadcast (they fire after the transaction that dropped it commits);
+	//
+	//   - the origin classification answers "does this answer belong on Lark",
+	//     and a task cancelled for owning an empty input batch — the failure
+	//     #6611 fixed the cause of — reports no channel-ingested messages, so a
+	//     clear behind it would be skipped on exactly the run that most needs
+	//     it. A cancellation has no answer to misroute, so the question does not
+	//     arise.
+	//
+	// Nothing is posted here, so neither gate is protecting anything: the badge
+	// is Lark's own, and Clear only touches sessions this process put one on.
+	// The clear is keyed by session rather than by turn, so cancelling one of
+	// two turns in a session takes the badge off both; the worst that costs is a
+	// missing badge on a turn still running.
+	if e.Type == protocol.EventTaskCancelled {
+		if p.typingIndicator != nil {
+			p.typingIndicator.Clear(ctx, chatSessionID)
+		}
+		return nil
+	}
+
 	binding, err := p.queries.GetLarkChatSessionBindingBySession(ctx, chatSessionID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -305,24 +346,6 @@ func (p *Patcher) processEvent(ctx context.Context, e events.Event) error {
 			return nil
 		}
 		return fmt.Errorf("lookup chat session binding: %w", err)
-	}
-
-	// A cancelled run has no reply to place, so the only thing owed to the user
-	// is taking the Typing badge off. That happens here, ahead of the origin
-	// classification below, because the classification answers "does this
-	// answer belong on Lark" and a cancellation has no answer to misroute. The
-	// ordering is load-bearing: a task cancelled for owning an empty input
-	// batch — the failure #6611 fixed the cause of — reports no
-	// channel-ingested messages, so a clear placed after that gate would be
-	// skipped on exactly the run that most needs it. Removing a badge Lark
-	// itself put there is safe to do for any cancel on this session; this is
-	// the same session-wide clear slack.TypingIndicatorManager performs, and
-	// the worst it can cost is a missing badge on a turn still running.
-	if e.Type == protocol.EventTaskCancelled {
-		if p.typingIndicator != nil {
-			p.typingIndicator.Clear(ctx, chatSessionID)
-		}
-		return nil
 	}
 
 	// Only bound sessions reach here, so classify the task origin before
@@ -542,8 +565,8 @@ func (p *Patcher) fail(ctx context.Context, creds InstallationCredentials, bindi
 	})
 }
 
-// taskAndSessionFromEvent parses the typed-ish payload broadcastTaskEvent
-// publishes — a map[string]any with `task_id` (always) and
+// taskAndSessionFromEvent parses the typed-ish payload the task publishers
+// emit — a map[string]any with `task_id` (always) and
 // `chat_session_id` (chat tasks only). EventChatDone carries a
 // ChatDonePayload struct instead.
 func taskAndSessionFromEvent(e events.Event) (taskID, chatSessionID pgtype.UUID, ok bool) {
