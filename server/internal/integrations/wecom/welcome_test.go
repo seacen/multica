@@ -59,6 +59,10 @@ type countingBinder struct {
 	calls int
 	raw   string
 	err   error
+	// reused makes Mint answer the way the throttle does: a live link is
+	// already with this user, so only its expiry comes back and Raw stays
+	// empty — the raw secret was never stored.
+	reused bool
 }
 
 func (b *countingBinder) Mint(context.Context, pgtype.UUID, pgtype.UUID, string) (BindingToken, error) {
@@ -67,6 +71,9 @@ func (b *countingBinder) Mint(context.Context, pgtype.UUID, pgtype.UUID, string)
 	b.mu.Unlock()
 	if b.err != nil {
 		return BindingToken{}, b.err
+	}
+	if b.reused {
+		return BindingToken{ExpiresAt: time.Now().Add(BindingTokenTTL), Reused: true}, nil
 	}
 	return BindingToken{Raw: b.raw, ExpiresAt: time.Now().Add(BindingTokenTTL)}, nil
 }
@@ -173,6 +180,36 @@ func TestOpeningTheChatUnboundHandsOverTheLink(t *testing.T) {
 	}
 	if !strings.Contains(said, "https://multica.example/wecom/bind?token=s3cret") {
 		t.Fatalf("the greeting carries no bind link: %q", said)
+	}
+}
+
+// The throttle suppressed the mint, so there is no raw secret to put in a URL.
+// Building one anyway yields "?token=" and a link that binds nobody.
+//
+// Not a corner case: the bot answers an unbound user in a group, replier mints
+// and posts the link into their 1:1, and the user opens that 1:1 to click it —
+// their first entry of the day, so enter_chat fires seconds after the mint and
+// lands inside the throttle window.
+func TestOpeningTheChatWithALinkAlreadySentDoesNotSendAnEmptyToken(t *testing.T) {
+	t.Parallel()
+	lookup := &fakeWelcomeLookup{
+		bindingErr: pgx.ErrNoRows,
+		install:    db.ChannelInstallation{ID: mustTestUUID(t), WorkspaceID: mustTestUUID(t)},
+	}
+	minter := &countingBinder{raw: "s3cret", reused: true}
+	c, conn, sender := welcomeRig(t, lookup, minter)
+
+	c.handleEnterChat(context.Background(), enterChatFrame(t, "req-1", "single", "T-alex"), sender, slog.Default())
+
+	said := welcomeSaid(t, conn)
+	if said == "" {
+		t.Fatal("opening the chat produced nothing")
+	}
+	if strings.Contains(said, "token=") {
+		t.Errorf("the greeting carries a bind link built from a suppressed mint: %q", said)
+	}
+	if said != copyFor(DefaultLocale).WelcomeUnboundPending {
+		t.Errorf("greeting = %q, want the one pointing at the link already in the chat", said)
 	}
 }
 
@@ -570,5 +607,123 @@ func TestTheTwoGreetingsSayDifferentThings(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(copyPacks[LocaleEn].WelcomeUnboundPrefix), "link") {
 		t.Errorf("the unbound greeting never asks the user to link an account: %q", copyPacks[LocaleEn].WelcomeUnboundPrefix)
+	}
+}
+
+// The greeting names what the bot accepts, in copy. dispatchFrame decides it
+// in code, off ownText. Nothing connected the two, and they came apart the
+// moment voice routing landed: the greeting went on telling every linked user
+// that only text worked while a spoken message was already being answered —
+// including a spoken "/issue", which files a task.
+//
+// The failure is silent by construction. A capability arrives by widening
+// ownText, which is a different file from the one holding the sentence that
+// describes it, so nothing about that change draws the eye here. This asserts
+// the relation directly: whatever ownText routes, every locale's greeting has
+// to name — a capability named in Chinese and dropped in English is the same
+// defect for whoever reads English.
+func TestTheBoundGreetingNamesEveryKindTheBotActuallyRoutes(t *testing.T) {
+	t.Parallel()
+
+	// Each kind the adapter can route, the frame that carries it, and the word
+	// a user would look for in the greeting to know it is allowed — one per
+	// language, because the sentence is written per language. Add a row when
+	// ownText learns a kind; that is the point of the test.
+	kinds := []struct {
+		what  string
+		mc    aibotMsgCallback
+		words map[Locale]string
+	}{
+		{what: "a typed message", words: map[Locale]string{LocaleZhHans: "文字", LocaleEn: "text"}, mc: func() aibotMsgCallback {
+			var mc aibotMsgCallback
+			mc.MsgType = "text"
+			mc.Text.Content = "在吗"
+			return mc
+		}()},
+		{what: "a voice note WeCom transcribed", words: map[Locale]string{LocaleZhHans: "语音", LocaleEn: "voice"}, mc: func() aibotMsgCallback {
+			var mc aibotMsgCallback
+			mc.MsgType = "voice"
+			mc.Voice.Content = "在吗"
+			return mc
+		}()},
+		{what: "a photo", words: map[Locale]string{LocaleZhHans: "图片", LocaleEn: "photos"}, mc: func() aibotMsgCallback {
+			var mc aibotMsgCallback
+			mc.MsgType = "image"
+			mc.Image.URL = "https://cos.example/i"
+			return mc
+		}()},
+		// "files", not "file": every pack's greeting already says "file a
+		// task", so the singular would match the command sentence and pass
+		// without the greeting naming the kind at all.
+		{what: "a file", words: map[Locale]string{LocaleZhHans: "文件", LocaleEn: "files"}, mc: func() aibotMsgCallback {
+			var mc aibotMsgCallback
+			mc.MsgType = "file"
+			mc.File.URL = "https://cos.example/f"
+			return mc
+		}()},
+		{what: "a video", words: map[Locale]string{LocaleZhHans: "视频", LocaleEn: "videos"}, mc: func() aibotMsgCallback {
+			var mc aibotMsgCallback
+			mc.MsgType = "video"
+			mc.Video.URL = "https://cos.example/v"
+			return mc
+		}()},
+	}
+
+	// Anti-vacuity: if ownText routed nothing, every assertion below would
+	// pass without testing anything.
+	var routed int
+	for _, k := range kinds {
+		if _, ok := k.mc.ownText(); ok {
+			routed++
+		}
+	}
+	if routed == 0 {
+		t.Fatal("ownText routes none of the kinds listed here, so this guard asserts nothing. " +
+			"Re-point it at whatever decides a routable message now")
+	}
+
+	for _, k := range kinds {
+		_, routable := k.mc.ownText()
+		if !routable {
+			t.Errorf("ownText no longer routes %s. If that was deliberate, drop the row and take %v "+
+				"out of the greeting — leaving it in promises a user something the bot will refuse",
+				k.what, k.words)
+			continue
+		}
+		for locale, pack := range copyPacks {
+			word, ok := k.words[locale]
+			if !ok {
+				t.Errorf("%s has a copy pack but no word for %s, so this guard does not cover it. "+
+					"Add one to the row", locale, k.what)
+				continue
+			}
+			if !strings.Contains(strings.ToLower(pack.WelcomeBound), strings.ToLower(word)) {
+				t.Errorf("%s: the bot routes %s, but the greeting does not say %q: %q.\n"+
+					"Every linked user reads this sentence before trying anything, so a capability missing "+
+					"from it is a capability most of them never discover.",
+					locale, k.what, word, pack.WelcomeBound)
+			}
+		}
+	}
+
+	// The other half: the greeting must not narrow what the bot takes. It has
+	// said "text only" and then "text and voice", and both stopped being true
+	// while the sentence stayed put — first when voice routing landed, then
+	// when media did. The wordings are Chinese because that is what the
+	// greeting has actually said.
+	for _, stale := range []string{"只能处理文字", "只支持文字", "目前支持文字和语音消息"} {
+		if strings.Contains(copyPacks[LocaleZhHans].WelcomeBound, stale) {
+			t.Errorf("the greeting still says %q, which is narrower than what the bot routes: %q",
+				stale, copyPacks[LocaleZhHans].WelcomeBound)
+		}
+	}
+
+	// A kind the adapter genuinely refuses still has to read as refused, or the
+	// loop above would pass on a greeting that promised everything.
+	var unknown aibotMsgCallback
+	unknown.MsgType = "link"
+	if _, routable := unknown.ownText(); routable {
+		t.Error("ownText routes an unknown msgtype, so the rows above no longer distinguish " +
+			"what the bot accepts from what it does not")
 	}
 }

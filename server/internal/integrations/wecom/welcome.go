@@ -1,11 +1,14 @@
 package wecom
 
-// welcome.go — what the bot says when somebody opens the chat for the first
-// time.
+// welcome.go — what the bot says when somebody opens the chat.
 //
-// WeCom pushes an `enter_chat` event the moment a user opens the bot's
-// conversation, and expects an `aibot_respond_welcome_msg` echoing that
-// frame's req_id. The event type was already named here (eventEnterChat) but
+// WeCom pushes an `enter_chat` event on a user's FIRST entry into the bot's
+// 1:1 that DAY — not once per person and not on every open
+// (developer.work.weixin.qq.com/document/path/101463, supported event types) —
+// and expects an `aibot_respond_welcome_msg` echoing that frame's req_id. So
+// this greeting recurs daily for anyone who keeps opening the chat, which is
+// why it stays short and why the unbound branch below must not hand out a
+// fresh link every time. The event type was already named here (eventEnterChat) but
 // nothing acted on it, so it fell through to a log line: a first-time user
 // opened the bot and got an empty window — no statement of what the bot is
 // for, and no hint that they have to link an account before it will answer
@@ -50,16 +53,11 @@ const cmdRespondWelcome = "aibot_respond_welcome_msg"
 // lookup, mint and write — so a slow database produces no greeting rather than
 // a frame WeCom refuses for arriving late.
 //
-// ASSUMPTION, not a documented figure: the reply window for enter_chat is
-// taken to be around five seconds, by analogy with the 5s window documented
-// for aibot_respond_msg (ws_frame.go). WeCom's long-connection docs do not
-// state one for enter_chat, and we have not measured it against a live
-// tenant. 4s is that assumption minus room for the write itself.
-//
-// What would settle it: send a respond_welcome deliberately late against a
-// real bot and read the errcode. If the real window is wider, this is merely
-// conservative; if it is narrower, greetings are being refused and the fix is
-// to cut the lookup, not this number.
+// Five seconds is the documented window, stated for this event rather than
+// borrowed from the message path: developer.work.weixin.qq.com/document/path/101463
+// requires the reply within five seconds of the event callback or the greeting
+// cannot be sent, and WecomTeam/aibot-node-sdk says the same of
+// aibot_respond_welcome_msg. 4s is that window minus room for the write.
 const welcomeDeadline = 4 * time.Second
 
 // welcomeQueueDepth is small on purpose, and the queue behind it DROPS when
@@ -72,9 +70,11 @@ const welcomeQueueDepth = 8
 // WelcomeBound for somebody already linked — which is also the fallback
 // whenever we cannot establish that they are not, because offering a bind link
 // to a linked user is the confusing outcome — and WelcomeUnboundPrefix /
-// Suffix around the bind URL for somebody who is not. The unbound wording
-// matches the needs_binding prompt in replier.go on purpose: a user who sees
-// both should not have to work out whether they are the same link.
+// Suffix around the bind URL for somebody who is not, and WelcomeUnboundPending
+// when there is no URL to hand over because the mint throttle suppressed one.
+// The unbound wording matches the needs_binding prompt in replier.go on
+// purpose: a user who sees both should not have to work out whether they are
+// the same link.
 
 // defaultBindingPath is where the web app serves the bind page.
 const defaultBindingPath = "/wecom/bind"
@@ -270,8 +270,11 @@ func (c *wecomChannel) bindingPath() string {
 // respondWelcome writes the reply to an enter_chat frame.
 //
 // It goes straight to the socket rather than through sendersRegistry: this is
-// addressed by req_id, and a req_id means nothing on the next connection, so
-// there is no version of this message worth holding for a reconnect.
+// addressed by req_id, and welcomeDeadline expires well inside the life of the
+// connection the frame arrived on, so there is no version of this message
+// worth holding for a reconnect. (Whether an enter_chat req_id would still be
+// answerable after one is unmeasured — see the file header. Nothing here turns
+// on it.)
 func (s *wsSender) respondWelcome(ctx context.Context, reqID, content string) error {
 	if reqID == "" {
 		return errors.New("wecom: respond_welcome requires a req_id")
