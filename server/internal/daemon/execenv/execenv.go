@@ -80,12 +80,18 @@ type PrepareParams struct {
 	// HermesMemoryStore is the agent's persistent Hermes memory store
 	// (HermesMemoryStorePath) the overlay links memories/ to, so memory outlives
 	// the task. Empty keeps memories/ task-local — no agent to key on, or the
-	// MULTICA_HERMES_TASK_MEMORY rollback switch is engaged.
+	// Multica profile dir could not be resolved.
 	HermesMemoryStore string
 	// HermesEnv is the sanitized effective env (agent custom_env minus the daemon
 	// blocklisted keys) used to expand ${VAR} in Hermes external_dirs so it
 	// matches what the Hermes child process actually sees. Only used for hermes.
 	HermesEnv map[string]string
+	// ReasonixEnv is the sanitized agent custom_env, layered over the daemon's
+	// own environment exactly as the child's env is built. The per-task
+	// reasonix.toml restates the permissions from the user config that env
+	// resolves to, so an agent that re-points (or clears) REASONIX_HOME moves the
+	// daemon's read with it. Only used for reasonix.
+	ReasonixEnv map[string]string
 	// CodexCustomArgs are the effective Codex CLI args this task launches with
 	// (daemon defaults + profile-fixed + per-agent custom_args). Only the
 	// Windows sandbox decision reads them, to honor a `-c windows.sandbox=...`
@@ -413,6 +419,15 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 		env.QwenpawWorkspace = qwenpawWorkspace
 	}
 
+	// For Reasonix, deny the `ask` tool for this task through a project-scoped
+	// reasonix.toml. Degraded, not fatal: without it the task still runs under
+	// the backend's fail-closed question handling.
+	if params.Provider == "reasonix" {
+		if err := writeReasonixProjectConfig(workDir, params.ReasonixEnv, manifest, logger); err != nil {
+			logger.Warn("execenv: write reasonix project config failed", "error", err)
+		}
+	}
+
 	// For Cursor, materialize managed MCP into project-local config and use
 	// an isolated CURSOR_DATA_DIR for the per-workdir approval sidecar. Cursor
 	// still reads ~/.cursor/mcp.json, but only servers with approval entries in
@@ -501,6 +516,9 @@ type ReuseParams struct {
 	HermesSourceMustExist bool
 	HermesEnv             map[string]string
 	HermesMemoryStore     string
+	// ReasonixEnv mirrors PrepareParams.ReasonixEnv on reuse so the rewritten
+	// reasonix.toml keeps restating the owner's current permissions.
+	ReasonixEnv map[string]string
 	// CodexCustomArgs mirrors PrepareParams.CodexCustomArgs on reuse so the
 	// Windows sandbox decision honors a `-c windows.sandbox=...` override here
 	// too (MUL-4957).
@@ -627,6 +645,15 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 			logger.Warn("execenv: refresh claude skill settings failed", "error", err)
 		} else {
 			env.ClaudeSettingsPath = settingsPath
+		}
+	}
+
+	// Re-deny Reasonix's `ask` tool on reuse: CleanupSidecars above removed the
+	// prior run's reasonix.toml, so without this the next turn would run with
+	// the tool available again.
+	if params.Provider == "reasonix" {
+		if err := writeReasonixProjectConfig(params.WorkDir, params.ReasonixEnv, manifest, logger); err != nil {
+			logger.Warn("execenv: refresh reasonix project config failed", "error", err)
 		}
 	}
 
