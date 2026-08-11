@@ -21,6 +21,23 @@ import (
 	"github.com/multica-ai/multica/server/internal/util"
 )
 
+// defaultBindingPath is where the web app serves the bind page.
+const defaultBindingPath = "/wecom/bind"
+
+// normalizeBindingPath applies the one default. It lived beside the enter_chat
+// greeting until that was withdrawn upstream on product grounds; the binding
+// prompt is now the only thing that builds this URL, and the default stays here
+// so a deployment that configures no path still gets a usable link.
+func normalizeBindingPath(p string) string {
+	if p == "" {
+		return defaultBindingPath
+	}
+	if !strings.HasPrefix(p, "/") {
+		return "/" + p
+	}
+	return p
+}
+
 // OutboundReplier implements engine.OutboundReplier for WeCom.
 type OutboundReplier struct {
 	binding     binder
@@ -78,8 +95,6 @@ func NewOutboundReplier(cfg OutboundReplierConfig) *OutboundReplier {
 		senders:   cfg.Senders,
 		languages: cfg.Languages,
 		appURL:    strings.TrimRight(cfg.AppURL, "/"),
-		// Shared with the enter_chat greeting (welcome.go) so the two cannot
-		// drift onto different bind pages.
 		bindingPath: normalizeBindingPath(cfg.BindingPath),
 		logger:      logger,
 	}

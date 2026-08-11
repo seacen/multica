@@ -182,80 +182,7 @@ func TestReplierGroupNoticeReadsTheRoomNotTheMember(t *testing.T) {
 	}
 }
 
-// ---- surface 2: welcome.go ----
-
-// welcomeRigWithLanguages is welcomeRig plus a language lookup, since the
-// greeting's whole point here is which language it comes out in.
-func welcomeRigWithLanguages(t *testing.T, lookup *fakeWelcomeLookup, minter binder, langs languageLookup) (*wecomChannel, *recordingConn, *wsSender) {
-	t.Helper()
-	c, conn, sender := welcomeRig(t, lookup, minter)
-	c.languages = langs
-	return c, conn, sender
-}
-
-func TestWelcomeGreetingReadsTheOpenersLanguage(t *testing.T) {
-	t.Parallel()
-	for _, tc := range localeCases {
-		t.Run(tc.name, func(t *testing.T) {
-			// Already linked: the greeting says hello and offers no link.
-			lookup := &fakeWelcomeLookup{binding: db.ChannelUserBinding{}}
-			c, conn, sender := welcomeRigWithLanguages(t, lookup, nil, languagesFor(tc.language))
-			c.handleEnterChat(context.Background(), enterChatFrame(t, "REQ-1", "single", "T-asker"), sender, slog.Default())
-
-			if got, want := welcomeSaid(t, conn), copyPacks[tc.locale].WelcomeBound; got != want {
-				t.Fatalf("greeting = %q, want the %s copy %q", got, tc.locale, want)
-			}
-		})
-	}
-}
-
-// TestWelcomeUnboundGreetingReadsTheDeploymentLanguage — the unbound greeting
-// is prefix + URL + suffix, and all three parts have to come from one pack or
-// the sentence around the link is half in each language. A person opening the
-// bot for the first time is unbound by definition, so there is no profile to
-// read: the deployment default is the whole answer, and it is what the
-// language knob has to reach.
-func TestWelcomeUnboundGreetingReadsTheDeploymentLanguage(t *testing.T) {
-	// Not parallel: it moves the deployment locale, which every reader with
-	// no profile reads. Restored before it returns, inside the serial phase,
-	// so no parallel test ever observes it moved.
-	restoreLocale(t, LocaleEn)
-
-	lookup := &fakeWelcomeLookup{bindingErr: pgx.ErrNoRows}
-	minter := &countingBinder{raw: "RAW_TOKEN"}
-	c, conn, sender := welcomeRigWithLanguages(t, lookup, minter, languagesFor("en"))
-	c.handleEnterChat(context.Background(), enterChatFrame(t, "REQ-1", "single", "T-nobody"), sender, slog.Default())
-
-	got := welcomeSaid(t, conn)
-	want := copyPacks[LocaleEn]
-	if !strings.HasPrefix(got, want.WelcomeUnboundPrefix) || !strings.HasSuffix(got, want.WelcomeUnboundSuffix) {
-		t.Fatalf("unbound greeting = %q, want it wrapped in the English pack's prefix/suffix", got)
-	}
-	if !strings.Contains(got, "RAW_TOKEN") {
-		t.Fatalf("unbound greeting = %q, want the bind link inside it", got)
-	}
-}
-
-// TestWelcomeReusedTokenSaysSoRatherThanPrintingADeadLink — Mint returns
-// Reused with Raw EMPTY when the throttle suppressed it, so interpolating
-// token.Raw produces a greeting whose link ends in "?token=" and redeems
-// nothing. The pack has copy for exactly this case.
-func TestWelcomeReusedTokenSaysSoRatherThanPrintingADeadLink(t *testing.T) {
-	t.Parallel()
-	lookup := &fakeWelcomeLookup{bindingErr: pgx.ErrNoRows}
-	c, conn, sender := welcomeRigWithLanguages(t, lookup, fakeBinder{reused: true}, languagesFor("en"))
-	c.handleEnterChat(context.Background(), enterChatFrame(t, "REQ-1", "single", "T-nobody"), sender, slog.Default())
-
-	got := welcomeSaid(t, conn)
-	if strings.Contains(got, "?token=") {
-		t.Fatalf("greeting = %q, want no link at all when there is no raw token to put in one", got)
-	}
-	if got != copyFor(deploymentLocale()).WelcomeUnboundPending {
-		t.Fatalf("greeting = %q, want the pending-link copy", got)
-	}
-}
-
-// ---- surface 3: inbox_message.go ----
+// ---- surface 2: inbox_message.go ----
 
 func TestInboxCardReadsTheRecipientsLanguage(t *testing.T) {
 	// Not parallel: the card's deep link needs an app URL, and t.Setenv is
@@ -335,7 +262,7 @@ func TestInboxCardUnknownTypeUsesTheSamePacksFallback(t *testing.T) {
 	}
 }
 
-// ---- surface 4: the attachment-failure notice ----
+// ---- surface 3: the attachment-failure notice ----
 
 // TestAttachmentSendFailureNoticeReadsTheDestinationsLanguage drives the whole
 // chat:done path, not sendAttachments directly, because the locale is resolved
@@ -375,7 +302,7 @@ func TestAttachmentSendFailureNoticeReadsTheDestinationsLanguage(t *testing.T) {
 	}
 }
 
-// ---- surface 5: the media failure notice ----
+// ---- surface 4: the media failure notice ----
 
 // TestMediaFailureNoticeReadsTheSendersLanguage drives the whole ingest, not
 // tellTheSender directly: the notice runs after the download has already
@@ -411,7 +338,7 @@ func TestMediaFailureNoticeReadsTheSendersLanguage(t *testing.T) {
 	}
 }
 
-// ---- surface 6: the streaming bubble ----
+// ---- surface 5: the streaming bubble ----
 
 // TestTheBubbleClosesInTheAskersLanguage drives the real open-then-close path.
 // The language is resolved when the bubble is opened and carried on the
@@ -441,7 +368,7 @@ func TestTheBubbleClosesInTheAskersLanguage(t *testing.T) {
 	}
 }
 
-// ---- surface 7: the read loop's own receipt ----
+// ---- surface 6: the read loop's own receipt ----
 
 func TestUnreadableKindReceiptReadsTheSendersLanguage(t *testing.T) {
 	t.Parallel()
@@ -603,10 +530,6 @@ func TestZhHansPackIsTheCopyThatAlreadyShipped(t *testing.T) {
 		// what the bot takes.
 		// TestTheBoundGreetingNamesEveryKindTheBotActuallyRoutes is what ties
 		// it to ownText; this line is where the wording change is argued for.
-		"WelcomeBound":          "👋 你好，我是 Multica 智能助手。有事直接发消息给我，或者用 “/issue 标题” 建一条任务。（文字、语音、图片、文件、视频都能发给我）",
-		"WelcomeUnboundPrefix":  "👋 你好，我是 Multica 智能助手。请先绑定你的 Multica 账号，才能与我对话：\n",
-		"WelcomeUnboundSuffix":  "\n（链接 15 分钟内有效）",
-		"WelcomeUnboundPending": "👋 你好，我是 Multica 智能助手。绑定链接刚才已经发给你了，就在上方，请直接点击完成绑定。",
 
 		"TaskFailedNotice":        "⚠️ %s处理这条消息时失败了。",
 		"TaskFailedAgentFallback": "智能体",

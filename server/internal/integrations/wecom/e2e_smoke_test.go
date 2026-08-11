@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
-	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 // captured records what the engine would have been handed.
@@ -91,9 +90,8 @@ func runInbound(t *testing.T, body json.RawMessage) channel.InboundMessage {
 func runInboundAs(t *testing.T, body json.RawMessage, botDisplayName string) channel.InboundMessage {
 	t.Helper()
 	cap := &captured{}
-	conn := newWelcomeConn(serverFrame(t, cmdMsgCallback, "req-1", body))
+	conn := newScriptedAckConn(serverFrame(t, cmdMsgCallback, "req-1", body))
 	c := connectedChannel(t, conn,
-		&fakeWelcomeLookup{binding: db.ChannelUserBinding{MulticaUserID: mustTestUUID(t)}},
 		cap.handle)
 	c.botDisplayName = botDisplayName
 

@@ -10,7 +10,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -24,7 +23,6 @@ import (
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
 	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
-	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 // countingMetrics records every call so a test can assert on the shape of what
@@ -56,9 +54,6 @@ func (m *countingMetrics) RecordCallbackQueued()       { m.bump("callback_queued
 func (m *countingMetrics) RecordCallbackQueueBlocked() { m.bump("callback_blocked") }
 func (m *countingMetrics) RecordStreamFinished()       { m.bump("stream_finished") }
 func (m *countingMetrics) RecordStreamFellBack()       { m.bump("stream_fell_back") }
-func (m *countingMetrics) RecordWelcomeSent()          { m.bump("welcome_sent") }
-func (m *countingMetrics) RecordWelcomeSkipped()       { m.bump("welcome_skipped") }
-func (m *countingMetrics) RecordWelcomeFailed()        { m.bump("welcome_failed") }
 
 // The reason is part of what is asserted, not a detail: "an attachment
 // failed" and "the guard refused the address it resolved to" send an operator
@@ -462,79 +457,6 @@ func TestAnAnswerSentAsANewMessageIsCountedAsFallenBack(t *testing.T) {
 	}
 	if got := mx.get("stream_finished"); got != 0 {
 		t.Fatalf("stream_finished = %d, want 0 — a refused closing frame was counted as a bubble that worked", got)
-	}
-}
-
-// ---- the greeting ----
-//
-// A greeting is never retried and its failure is never told to anybody: the
-// req_id it answers is spent, and the person is left looking at an empty
-// window. The counter is the only trace.
-
-func TestAGreetingThatWentOutIsCountedAsSent(t *testing.T) {
-	t.Parallel()
-	mx := newCountingMetrics()
-	lookup := &fakeWelcomeLookup{binding: db.ChannelUserBinding{MulticaUserID: mustTestUUID(t)}}
-	c, conn, sender := welcomeRig(t, lookup, nil)
-	c.metrics = mx
-
-	c.handleEnterChat(context.Background(), enterChatFrame(t, "req-m1", "single", "T-alex"), sender, slog.Default())
-
-	if welcomeSaid(t, conn) == "" {
-		t.Fatal("no greeting was written; this test's premise is gone")
-	}
-	if got := mx.get("welcome_sent"); got != 1 {
-		t.Fatalf("welcome_sent = %d, want 1 — with nothing counted here, 'is the bot greeting people?' has no answer at all", got)
-	}
-}
-
-// A group is skipped on purpose, and it must not read as a failure — the
-// number an operator alerts on is failed, and a busy group would bury it.
-func TestAGroupIsCountedAsSkippedAndNotAsFailed(t *testing.T) {
-	t.Parallel()
-	mx := newCountingMetrics()
-	c, conn, sender := welcomeRig(t, &fakeWelcomeLookup{}, nil)
-	c.metrics = mx
-
-	c.handleEnterChat(context.Background(), enterChatFrame(t, "req-m2", "group", "T-alex"), sender, slog.Default())
-
-	if said := welcomeSaid(t, conn); said != "" {
-		t.Fatalf("the bot greeted a group: %q", said)
-	}
-	if got := mx.get("welcome_skipped"); got != 1 {
-		t.Fatalf("welcome_skipped = %d, want 1 — a deliberate skip that counts nothing is indistinguishable from the handler never running", got)
-	}
-	if got := mx.get("welcome_failed"); got != 0 {
-		t.Fatalf("welcome_failed = %d, want 0 — a deliberate skip counted as a failure makes the alert fire on group traffic", got)
-	}
-}
-
-// The window closed: the write was refused, the req_id is spent, and the
-// person who opened the chat is looking at nothing.
-func TestAGreetingThatCouldNotBeWrittenIsCountedAsFailed(t *testing.T) {
-	t.Parallel()
-	mx := newCountingMetrics()
-	lookup := &fakeWelcomeLookup{binding: db.ChannelUserBinding{MulticaUserID: mustTestUUID(t)}}
-	c, conn, _ := welcomeRig(t, lookup, nil)
-	c.metrics = mx
-	// A socket that takes the frame and never acks it. respondWelcome waits
-	// for the reply that will not come and gives up with the handler's
-	// deadline — the shape of a window that closed.
-	dead := &recordingConn{}
-	sender := newWSSender(dead, nil)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-	defer cancel()
-	c.handleEnterChat(ctx, enterChatFrame(t, "req-m3", "single", "T-alex"), sender, slog.Default())
-
-	if said := welcomeSaid(t, conn); said != "" {
-		t.Fatalf("the greeting reached the wrong socket: %q", said)
-	}
-	if got := mx.get("welcome_failed"); got != 1 {
-		t.Fatalf("welcome_failed = %d, want 1 — a greeting that never landed leaves no other trace: no retry, no user-visible error, one WARN line", got)
-	}
-	if got := mx.get("welcome_sent"); got != 0 {
-		t.Fatalf("welcome_sent = %d, want 0 — a greeting that was never delivered was counted as delivered", got)
 	}
 }
 

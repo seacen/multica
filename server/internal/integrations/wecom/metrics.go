@@ -10,14 +10,12 @@ package wecom
 // wrong behaviour for the operator behind it — nothing on a dashboard changes
 // when a bot has been unable to connect for an hour.
 //
-// The same is true one layer up, of the three features that answer a user
+// The same is true one layer up, of the two features that answer a user
 // without the user being able to tell whether they worked: a bubble that
-// refused its closing frame still delivers the answer, as a new message; a
-// greeting that missed its window is simply never sent (how long that window
-// is, is welcomeDeadline's assumption, not a documented figure); an
+// refused its closing frame still delivers the answer, as a new message; and an
 // attachment that could not be fetched leaves its "[Image]" placeholder in the
-// body and the agent answers as though it had seen the picture. All three read
-// as a quiet afternoon from outside.
+// body, so the agent answers as though it had seen the picture. Both read as a
+// quiet afternoon from outside.
 //
 // The counters here are chosen for what somebody would page on rather than for
 // completeness: the connection is not coming up, and if so whether that needs a
@@ -72,14 +70,6 @@ type Metrics interface {
 	RecordStreamFinished()
 	RecordStreamFellBack()
 
-	// RecordWelcomeSent / Skipped / Failed — the enter_chat greeting.
-	// Skipped is a group, which is deliberate and should track group traffic.
-	// Failed is a window that closed before the greeting was written, and it
-	// is never retried, so this counter is the only trace it leaves.
-	RecordWelcomeSent()
-	RecordWelcomeSkipped()
-	RecordWelcomeFailed()
-
 	// RecordMediaFailure — an attachment that never reached the agent.
 	// reason is one of the mediaDrop* constants below.
 	RecordMediaFailure(reason string)
@@ -111,9 +101,6 @@ func (nopMetrics) RecordCallbackQueued()       {}
 func (nopMetrics) RecordCallbackQueueBlocked() {}
 func (nopMetrics) RecordStreamFinished()       {}
 func (nopMetrics) RecordStreamFellBack()       {}
-func (nopMetrics) RecordWelcomeSent()          {}
-func (nopMetrics) RecordWelcomeSkipped()       {}
-func (nopMetrics) RecordWelcomeFailed()        {}
 func (nopMetrics) RecordMediaFailure(string)   {}
 
 // orNopMetrics turns an unset sink into one that is safe to call.

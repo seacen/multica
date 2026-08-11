@@ -37,7 +37,6 @@ func TestEveryWecomCounterActuallyCounts(t *testing.T) {
 	m.RecordCallbackQueueBlocked()
 	m.RecordStreamFinished()
 	m.RecordStreamFellBack()
-	m.RecordWelcomeSent()
 	m.RecordMediaFailure("too_large")
 
 	seen := gatherWecomValues(t, reg)
@@ -48,7 +47,6 @@ func TestEveryWecomCounterActuallyCounts(t *testing.T) {
 		"multica_wecom_inbound_queue_blocked_total",
 		"multica_wecom_stream_finished_total",
 		"multica_wecom_stream_fell_back_total",
-		"multica_wecom_welcome_total",
 		"multica_wecom_media_failures_total",
 	} {
 		if seen[want] != 1 {
@@ -84,31 +82,6 @@ func TestUnknownWecomLabelValuesAreBucketed(t *testing.T) {
 	}
 	if len(seen) != 2 {
 		t.Errorf("reason series = %v, want exactly blocked_address and other", seen)
-	}
-}
-
-// The three welcome outcomes have to be one metric with three label values
-// rather than three metrics: the only reading anyone takes off it is the
-// ratio, and a ratio across separate metric names is a query nobody writes.
-func TestWelcomeOutcomesShareOneMetric(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	m := NewWecomMetrics()
-	for _, c := range m.Collectors() {
-		if err := reg.Register(c); err != nil {
-			t.Fatalf("register: %v", err)
-		}
-	}
-
-	m.RecordWelcomeSent()
-	m.RecordWelcomeSent()
-	m.RecordWelcomeSkipped()
-	m.RecordWelcomeFailed()
-
-	seen := gatherWecomLabelValues(t, reg, "multica_wecom_welcome_total", "outcome")
-	for outcome, want := range map[string]float64{"sent": 2, "skipped": 1, "failed": 1} {
-		if seen[outcome] != want {
-			t.Errorf("outcome=%s is %v, want %v", outcome, seen[outcome], want)
-		}
 	}
 }
 
@@ -158,7 +131,6 @@ func TestWecomMetricsCarryNoUnboundedLabels(t *testing.T) {
 	m.RecordCallbackQueueBlocked()
 	m.RecordStreamFinished()
 	m.RecordStreamFellBack()
-	m.RecordWelcomeSent()
 	m.RecordMediaFailure("blocked_address")
 
 	families, err := reg.Gather()
