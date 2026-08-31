@@ -79,7 +79,6 @@ func (r *bubbleRig) answerErr(t *testing.T, content, taskName string) error {
 	})
 	// An answer that missed its bubble leaves as a queue row, so what the user
 	// reads is what the consumer drains — the same step rig.answer takes.
-	r.drainQueue(t)
 	return err
 }
 

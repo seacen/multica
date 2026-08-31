@@ -9,6 +9,19 @@
     "archive_all_read": "Archive all read",
     "archive_completed": "Archive completed"
   },
+  "filters": {
+    "tooltip": "Filter inbox",
+    "active_count_one": "{{count}} active filter",
+    "active_count_other": "{{count}} active filters",
+    "status": "Status",
+    "priority": "Priority",
+    "from": "From",
+    "unread_only": "Unread only",
+    "notification_count_one": "{{count}} notification",
+    "notification_count_other": "{{count}} notifications",
+    "clear": "Clear filters",
+    "empty": "No notifications match your filters"
+  },
   "context_menu": {
     "mark_read": "Mark as read",
     "mark_unread": "Mark as unread",
@@ -28,12 +41,14 @@
     },
     "archived_title": "Archived",
     "archived_empty": "No archived notifications",
-    "unarchive_tooltip": "Unarchive"
+    "unarchive_tooltip": "Unarchive",
+    "actions_aria": "Notification actions"
   },
   "detail": {
     "select_prompt": "Select a notification to view details",
     "empty": "Your inbox is empty",
     "original_input": "Original input",
+    "retry_with_context": "Retry with context",
     "edit_advanced": "Edit as advanced form",
     "archive": "Archive",
     "unarchive": "Unarchive"
@@ -72,7 +87,14 @@
     "created_with_agent": "Created with agent: {{identifier}}",
     "failed_with_detail": "Failed: {{detail}}"
   },
+  "toasts": {
+    "source_context_retry_started": "Retry started with the original context",
+    "archived": "Notification archived",
+    "unarchived": "Notification restored"
+  },
   "errors": {
+    "source_context_retry_failed": "Could not retry with the original context",
+    "source_context_retry_unavailable": "This context can no longer be retried. Start again from the branch point.",
     "mark_read_failed": "Failed to mark as read",
     "mark_unread_failed": "Failed to mark as unread",
     "archive_failed": "Failed to archive",

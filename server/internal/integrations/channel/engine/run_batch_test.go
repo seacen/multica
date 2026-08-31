@@ -198,3 +198,41 @@ func TestRunBatch_SettledFlushNamesItsBatch(t *testing.T) {
 		t.Fatalf("the settled batch was %d, want %d — the batch the message was ingested under", got, want)
 	}
 }
+
+// TestRunBatch_StartedChatNamesItsRun covers the one path that never reaches
+// the debouncer: `/new <body>` commits its task inside StartSession's own
+// transaction, so no flush is ever armed and no flush ever mints an id. The
+// Router still reports the message as scheduled, so the platform is told to
+// open an affordance — and both halves have to come from here instead.
+//
+// Nothing else in the suite fails when they are missing. Without the id the
+// affordance never opens (a zero batch is dropped downstream); without the
+// binding it opens and never closes, because every ending is matched to a
+// round by task id.
+func TestRunBatch_StartedChatNamesItsRun(t *testing.T) {
+	h := newHarness(t)
+	h.media.noMedia = true
+	msg := p2pMessage(t)
+	msg.Text = "/new look at the deploy"
+
+	if err := h.router.Handle(context.Background(), msg); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if !waitFor(time.Second, func() bool { return h.typing.calls() == 1 }) {
+		t.Fatal("a /new that started a run was never reported to the typing indicator")
+	}
+
+	batch := h.typing.ingested()[0]
+	if batch == 0 {
+		t.Fatal("the started run was ingested with no batch at all, so no affordance can open for it")
+	}
+	h.typing.mu.Lock()
+	bound := h.typing.boundTasks[batch]
+	h.typing.mu.Unlock()
+	if !bound.Valid {
+		t.Fatalf("batch %d named no task, so its affordance could never be closed by an ending", batch)
+	}
+	if enqueued := h.tasks.enqueuedIDs(); len(enqueued) != 1 || bound != enqueued[0] {
+		t.Fatalf("the indicator was bound to task %v, want the task /new actually committed %v", bound, enqueued)
+	}
+}

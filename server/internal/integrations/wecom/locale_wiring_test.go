@@ -197,29 +197,28 @@ func TestInboxCardReadsTheRecipientsLanguage(t *testing.T) {
 				userLanguage:  tc.language,
 				userBindingID: localeTestUserID,
 			}
-			o, instID, store := newOutboundWithQueue(t, q)
+			o, instID, conn := newOutboundWithConn(t, q)
 			q.memberBinding.InstallationID = instID
 
 			const recipient = "33333333-3333-3333-3333-333333333333"
 			const workspace = "44444444-4444-4444-4444-444444444444"
 			const item = "66666666-6666-6666-6666-666666666666"
-			// Read off the queue row rather than a frame: an inbox card is
-			// addressed by chat id, so it is enqueued and delivered by
-			// whichever replica holds the socket. The copy is chosen here, at
-			// enqueue time, which is what this test is about.
-			if !o.tryEnqueueInbox(context.Background(), map[string]any{
+			// The card is a 1:1 push to a bound member, so it goes out on this
+			// installation's socket and the copy is chosen on the way. Read the
+			// frame, which is what the member actually sees.
+			if !o.tryDeliverInbox(context.Background(), map[string]any{
 				"id":             item,
 				"recipient_type": "member",
 				"recipient_id":   recipient,
 				"workspace_id":   workspace,
 				"type":           "issue_assigned",
 				"title":          "New issue",
-			}, item, recipient, workspace) {
-				t.Fatal("tryEnqueueInbox returned false; expected an enqueue for a bound member")
+			}, recipient, workspace) {
+				t.Fatal("tryDeliverInbox returned false; expected delivery to a bound member")
 			}
 
 			want := copyPacks[tc.locale]
-			got := store.payload(t, 0).Content
+			got := sentMarkdown(t, conn, 0)
 			if !strings.HasPrefix(got, "**["+want.label("issue_assigned")+"]") {
 				t.Fatalf("inbox card = %q, want the %s label %q", got, tc.locale, want.label("issue_assigned"))
 			}
@@ -241,23 +240,23 @@ func TestInboxCardUnknownTypeUsesTheSamePacksFallback(t *testing.T) {
 		userLanguage:  "en",
 		userBindingID: localeTestUserID,
 	}
-	o, instID, store := newOutboundWithQueue(t, q)
+	o, instID, conn := newOutboundWithConn(t, q)
 	q.memberBinding.InstallationID = instID
 
 	const recipient = "33333333-3333-3333-3333-333333333333"
 	const workspace = "44444444-4444-4444-4444-444444444444"
 	const item = "66666666-6666-6666-6666-666666666666"
-	if !o.tryEnqueueInbox(context.Background(), map[string]any{
+	if !o.tryDeliverInbox(context.Background(), map[string]any{
 		"id":             item,
 		"recipient_type": "member",
 		"recipient_id":   recipient,
 		"workspace_id":   workspace,
 		"type":           "something_invented_next_year",
 		"title":          "New issue",
-	}, item, recipient, workspace) {
-		t.Fatal("tryEnqueueInbox returned false; expected an enqueue for a bound member")
+	}, recipient, workspace) {
+		t.Fatal("tryDeliverInbox returned false; expected delivery to a bound member")
 	}
-	if got, want := store.payload(t, 0).Content, "**["+copyPacks[LocaleEn].InboxTypeFallback+"]"; !strings.HasPrefix(got, want) {
+	if got, want := sentMarkdown(t, conn, 0), "**["+copyPacks[LocaleEn].InboxTypeFallback+"]"; !strings.HasPrefix(got, want) {
 		t.Fatalf("inbox card = %q, want the English fallback label %q", got, want)
 	}
 }
@@ -282,7 +281,7 @@ func TestAttachmentSendFailureNoticeReadsTheDestinationsLanguage(t *testing.T) {
 			q.userLanguage = tc.language
 			q.userBindingID = localeTestUserID
 
-			o, instID, conn, _ := newOutboundWithMedia(t, q, &fakeObjectStore{key: "obj/bin", data: []byte("DATA")})
+			o, instID, conn := newOutboundWithMedia(t, q, &fakeObjectStore{key: "obj/bin", data: []byte("DATA")})
 			q.sessionBinding.InstallationID = instID
 			q.installation.ID = instID
 			conn.refuse[cmdUploadMediaInit] = 40058 // the server will not take the file
@@ -539,8 +538,13 @@ func TestZhHansPackIsTheCopyThatAlreadyShipped(t *testing.T) {
 
 		// Arrived from upstream as package constants in replier.go and were
 		// folded into the pack on the way in, so the text is upstream's,
-		// unchanged.
-		"FreshPending": "✅ 已准备开始新对话。你的下一条聊天消息将不带之前的上下文运行。",
+		// unchanged. FreshPending was reworded upstream when #7468 split
+		// /fresh into /clear and /new: /clear now stays in the conversation
+		// it is already in, and ChatStarted is the answer to /new. Answering
+		// a /clear with the old "started a new conversation" line sends the
+		// reader looking for a thread that never moved.
+		"FreshPending": "✅ 已准备从空上下文运行。你的下一条聊天消息仍会进入当前对话，但不会带上之前的上下文。",
+		"ChatStarted":  "✅ 已新建 Multica 对话。你的下一条消息会进入该对话。",
 		"IssueUsage":   "请填写任务标题，格式如下：\n\n`/issue <标题>`\n`[描述]`（可选）",
 	}
 	wantLabels := map[string]string{

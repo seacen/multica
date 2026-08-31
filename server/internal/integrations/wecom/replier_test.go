@@ -159,16 +159,22 @@ func TestPost_AddressesRoomChatID(t *testing.T) {
 }
 
 func TestReply_CommandOutcomes_PostGuidance(t *testing.T) {
-	// Read out of the pack rather than pinned to a literal: these two arrived
-	// from upstream as package constants and were folded into copyPack on the
-	// way in, so the assertion has to follow the copy to where it lives now or
-	// it stops being about what the user reads.
+	// Read out of the pack rather than pinned to a literal: these arrived from
+	// upstream as package constants and were folded into copyPack on the way
+	// in, so the assertion has to follow the copy to where it lives now or it
+	// stops being about what the user reads.
+	//
+	// FreshPending and ChatStarted are both here because #7468 split /fresh
+	// into two commands that answer differently — /clear keeps the
+	// conversation and drops its context, /new opens another one — and the
+	// two lines are one field apart in the pack.
 	deflt := copyFor(DefaultLocale)
 	for _, tc := range []struct {
 		outcome engine.Outcome
 		want    string
 	}{
 		{engine.OutcomeFreshPending, deflt.FreshPending},
+		{engine.OutcomeChatStarted, deflt.ChatStarted},
 		{engine.OutcomeIssueUsage, deflt.IssueUsage},
 	} {
 		t.Run(string(tc.outcome), func(t *testing.T) {

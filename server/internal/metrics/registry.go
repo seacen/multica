@@ -17,13 +17,6 @@ type RegistryOptions struct {
 	DaemonWS *daemonws.Metrics
 	Version  string
 	Commit   string
-
-	// BusinessSampler, when non-nil, opts the registry into the
-	// scrape-time SQL sampler from PR4 (MUL-2947). It is intentionally
-	// separate from Pool so existing tests (and any deployment without
-	// METRICS_ADDR) cannot accidentally start hitting the database on
-	// every /metrics scrape.
-	BusinessSampler *BusinessSamplerOptions
 }
 
 type Registry struct {
@@ -31,14 +24,8 @@ type Registry struct {
 	HTTP         *HTTPMetrics
 	Business     *BusinessMetrics
 	ChannelMedia *ChannelMediaReconcilerMetrics
+	ChannelLease *ChannelLeaseMetrics
 	Wecom        *WecomMetrics
-	// ChannelOutbox is the sink the per-channel outbound queue workers push
-	// to. It is always non-nil so an adapter can wire it unconditionally.
-	ChannelOutbox *ChannelOutboxMetrics
-	// Sampler is non-nil only when RegistryOptions.BusinessSampler was
-	// supplied with a valid Pool. Exposed so the cmd/server entrypoint
-	// can plumb the same instance into health checks if it ever wants to.
-	Sampler *BusinessSamplerCollector
 }
 
 func NewRegistry(opts RegistryOptions) *Registry {
@@ -62,11 +49,11 @@ func NewRegistry(opts RegistryOptions) *Registry {
 	channelMedia := NewChannelMediaReconcilerMetrics()
 	reg.MustRegister(channelMedia.Collectors()...)
 
+	channelLease := NewChannelLeaseMetrics()
+	reg.MustRegister(channelLease.Collectors()...)
+
 	wecomMetrics := NewWecomMetrics()
 	reg.MustRegister(wecomMetrics.Collectors()...)
-
-	channelOutbox := NewChannelOutboxMetrics()
-	reg.MustRegister(channelOutbox.Collectors()...)
 
 	if opts.Pool != nil {
 		reg.MustRegister(NewDBCollector(opts.Pool))
@@ -78,19 +65,13 @@ func NewRegistry(opts RegistryOptions) *Registry {
 		reg.MustRegister(NewDaemonWSCollector(opts.DaemonWS))
 	}
 
-	sampler := NewBusinessSamplerCollector(opts.BusinessSampler)
-	if sampler != nil {
-		reg.MustRegister(sampler.Collectors()...)
-	}
-
 	return &Registry{
-		Gatherer:      reg,
-		HTTP:          httpMetrics,
-		Business:      businessMetrics,
-		ChannelMedia:  channelMedia,
-		Wecom:         wecomMetrics,
-		ChannelOutbox: channelOutbox,
-		Sampler:       sampler,
+		Gatherer:     reg,
+		HTTP:         httpMetrics,
+		Business:     businessMetrics,
+		ChannelMedia: channelMedia,
+		ChannelLease: channelLease,
+		Wecom:        wecomMetrics,
 	}
 }
 

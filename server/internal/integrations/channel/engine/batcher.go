@@ -24,10 +24,12 @@ const DefaultChatRunBatchWindow = 3 * time.Second
 // directions. See wecom/stream_store.go for what the id is used for.
 //
 // Ids are unique per process and never zero. Minting starts at 1 and
-// Router.scheduleRun mints one line above the branch that checks for a
+// Router.scheduleRunMode mints one line above the branch that checks for a
 // debouncer, so a notifier is never handed a zero: with batching disabled each
 // message still gets a fresh id of its own, and OnIngested only fires for a
-// message that scheduled a run.
+// message that scheduled a run. The one run that never reaches this file —
+// /new, whose task is committed inside StartSession's transaction — mints its
+// id in the Router for the same reason.
 //
 // They are NOT a clock. The counter is atomic, but it is read outside the
 // batcher's lock, so a message holding 6 can reach the batcher ahead of one
@@ -45,20 +47,21 @@ type stoppableTimer interface {
 	Stop() bool
 }
 
-// pendingBatcher debounces the per-chat_session run trigger. Each inbound
-// message that lands in a session calls Schedule, which (re)arms a single
-// timer for that session; when the session goes quiet for the window the
-// latest flush runs exactly once. This collapses a burst into ONE agent run —
-// safe because the chat task reads the WHOLE session at run time. Only the run
-// TRIGGER is debounced; the chat_message rows, dedup, and frame ACK already
-// happened synchronously upstream.
+// pendingBatcher debounces a per-(chat_session, context generation) run trigger.
+// Each inbound message calls Schedule, which (re)arms one timer for that
+// generation; when it goes quiet the latest flush runs exactly once. This
+// collapses an in-generation burst into one agent run while preserving /clear as
+// a hard batch boundary. Only the run trigger is debounced; chat_message rows,
+// dedup, and frame ACK already happened synchronously upstream.
 //
-// State is in-process, keyed by chat_session_id (a globally-unique UUID). The
+// State is in-process, keyed by chat_session_id plus context revision. The
 // WS lease guarantees a single active owner per installation, so a session is
 // debounced by one process. A hard crash inside the window drops the pending
 // trigger (messages are durable; they just do not fire a run until the next
-// message). Graceful shutdown calls FlushAll so that boundary is not hit on a
-// normal restart. Goroutine-safe; one instance is shared across supervisors.
+// message). Callers include the durable context revision in the key, so a
+// /clear boundary can never replace the pending flush for the preceding context.
+// Graceful shutdown calls FlushAll so that boundary is not hit on a normal
+// restart. Goroutine-safe; one instance is shared across supervisors.
 type pendingBatcher struct {
 	window time.Duration
 
@@ -121,6 +124,22 @@ func realAfterFunc(d time.Duration, fn func()) stoppableTimer {
 // entry is gone (so the message starts newBatch and a new flush answers it).
 // Both outcomes leave one batch id per flush, with no gap and no overlap.
 func (b *pendingBatcher) Schedule(key string, newBatch RunBatchID, flush func(RunBatchID)) RunBatchID {
+	return b.schedule(key, newBatch, flush, true)
+}
+
+// ScheduleIfAbsent arms key only when this process has no live window for it.
+// Crash recovery uses this for older durable context generations: a missing
+// timer must be restored, but a message on a newer generation must not reset an
+// older generation's already-running silence window or replace its sender
+// metadata.
+//
+// It reports a batch id on the same terms as Schedule: the live window's id
+// when one is already collecting for key, newBatch when this call armed it.
+func (b *pendingBatcher) ScheduleIfAbsent(key string, newBatch RunBatchID, flush func(RunBatchID)) RunBatchID {
+	return b.schedule(key, newBatch, flush, false)
+}
+
+func (b *pendingBatcher) schedule(key string, newBatch RunBatchID, flush func(RunBatchID), replace bool) RunBatchID {
 	b.mu.Lock()
 	if b.stopped {
 		b.mu.Unlock()
@@ -131,6 +150,11 @@ func (b *pendingBatcher) Schedule(key string, newBatch RunBatchID, flush func(Ru
 	gen := b.seq
 	fire := func() { b.onFire(key, gen) }
 	if e, ok := b.pending[key]; ok {
+		if !replace {
+			batch := e.batch
+			b.mu.Unlock()
+			return batch
+		}
 		e.timer.Stop()
 		e.flush = flush
 		e.gen = gen

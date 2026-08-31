@@ -10,8 +10,10 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
+import { AppLink } from "../navigation/app-link";
 import { NavigationProvider } from "../navigation/context";
 import type { NavigationAdapter } from "../navigation/types";
+import { DeferredPopup } from "./deferred-popup";
 
 vi.mock("@multica/core/workspace/hooks", () => ({
   useActorName: () => ({
@@ -59,6 +61,7 @@ function makeAdapter(overrides: Partial<NavigationAdapter> = {}): NavigationAdap
     back: vi.fn(),
     pathname: "/",
     searchParams: new URLSearchParams(),
+    hash: "",
     getShareableUrl: (p) => `https://app.example${p}`,
     ...overrides,
   };
@@ -68,6 +71,47 @@ function renderAvatar(adapter: NavigationAdapter) {
   return render(
     <NavigationProvider value={adapter}>
       <ActorAvatar actorType="member" actorId={MEMBER_ID} />
+    </NavigationProvider>,
+  );
+}
+
+function PickerWrapper({ children }: { children: React.ReactNode }) {
+  const stop = (event: React.SyntheticEvent) => {
+    event.stopPropagation();
+    event.preventDefault();
+  };
+  return (
+    <div onClick={stop} onMouseDown={stop} onPointerDown={stop}>
+      {children}
+    </div>
+  );
+}
+
+function renderCardPicker(adapter: NavigationAdapter) {
+  return render(
+    <NavigationProvider value={adapter}>
+      <AppLink href="/acme/issues/issue-1">
+        <PickerWrapper>
+          <DeferredPopup
+            trigger={
+              <span>
+                <ActorAvatar
+                  actorType="member"
+                  actorId={MEMBER_ID}
+                  enableHoverCard
+                />
+                <span>Change assignee</span>
+              </span>
+            }
+          >
+            {(open) => (
+              <span data-testid="mounted-picker" data-open={String(open)}>
+                Picker mounted
+              </span>
+            )}
+          </DeferredPopup>
+        </PickerWrapper>
+      </AppLink>
     </NavigationProvider>,
   );
 }
@@ -86,6 +130,26 @@ describe("ActorAvatar profile link", () => {
 
     expect(push).toHaveBeenCalledWith(HREF);
     expect(open).not.toHaveBeenCalled();
+  });
+
+  it("opens the deferred picker while cancelling the enclosing card link", () => {
+    const push = vi.fn();
+    renderCardPicker(makeAdapter({ push }));
+
+    expect(fireEvent.click(screen.getByText("Change assignee"))).toBe(false);
+    expect(screen.getByTestId("mounted-picker")).toHaveAttribute("data-open", "true");
+    expect(push).not.toHaveBeenCalled();
+  });
+
+  it("yields to the picker by default without leaking native card navigation", () => {
+    const push = vi.fn();
+    const { container } = renderCardPicker(makeAdapter({ push }));
+    const avatar = container.querySelector('[data-slot="avatar"]');
+
+    expect(avatar).not.toBeNull();
+    expect(fireEvent.click(avatar!)).toBe(false);
+    expect(screen.getByTestId("mounted-picker")).toHaveAttribute("data-open", "true");
+    expect(push).not.toHaveBeenCalled();
   });
 
   it("uses openInNewTab for cmd/ctrl click when available (desktop)", () => {

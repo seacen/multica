@@ -1,9 +1,9 @@
 package wecom
 
-// regression_fresh_session_behind_quote_test.go — "/new" is how a person tells
+// regression_fresh_session_behind_quote_test.go — "/clear" is how a person tells
 // the bot to forget the previous conversation and start over. In a busy room
 // the way you ask about one specific message is to 引用 it and type your
-// question underneath, so "quote a message + /new 重新分析" is the ordinary
+// question underneath, so "quote a message + /clear 重新分析" is the ordinary
 // shape of the request, not an exotic one.
 //
 // The quote is rendered ABOVE the user's own line in the stored body, so
@@ -24,6 +24,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
@@ -35,7 +36,7 @@ import (
 // ---- the narrow doubles the Router needs ----
 
 // freshWatchingTasks records the fresh-session flag every chat run is queued
-// with. That flag is the whole product behaviour of /new: with it false the
+// with. That flag is the whole product behaviour of /clear: with it false the
 // agent resumes the old provider session and the user's "start over" was
 // silently ignored.
 type freshWatchingTasks struct {
@@ -43,12 +44,27 @@ type freshWatchingTasks struct {
 	queued []bool
 }
 
-func (f *freshWatchingTasks) EnqueueChatTask(_ context.Context, _ db.ChatSession, _ pgtype.UUID, forceFresh bool) (db.AgentTaskQueue, error) {
+func (f *freshWatchingTasks) EnqueueChannelChatTask(_ context.Context, _ db.ChatSession, _ pgtype.UUID, forceFresh bool, _ int64, _ pgtype.UUID, _ int64) (db.AgentTaskQueue, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.queued = append(f.queued, forceFresh)
 	return db.AgentTaskQueue{}, nil
 }
+
+func (*freshWatchingTasks) PrepareChatTaskEnqueue(context.Context, pgtype.UUID, pgtype.UUID) (service.PreparedChatTaskEnqueue, error) {
+	return service.PreparedChatTaskEnqueue{}, nil
+}
+
+// EnqueuePreparedChannelChatTaskInTx records through the same slice: /clear is
+// ControlCommandFreshSession, which never takes the start-a-new-chat path, so
+// exactly one of the two fires per message here. Recording both means a change
+// that reroutes the run shows up as a wrong flag rather than as "no runs at
+// all", which reads like the rig broke instead of the behaviour.
+func (f *freshWatchingTasks) EnqueuePreparedChannelChatTaskInTx(ctx context.Context, _ pgx.Tx, session db.ChatSession, initiator pgtype.UUID, forceFresh bool, contextRevision int64, _ service.PreparedChatTaskEnqueue) (db.AgentTaskQueue, error) {
+	return f.EnqueueChannelChatTask(ctx, session, initiator, forceFresh, contextRevision, pgtype.UUID{}, 0)
+}
+
+func (*freshWatchingTasks) FinalizeChatTaskEnqueue(context.Context, db.AgentTaskQueue) {}
 
 func (*freshWatchingTasks) PromoteChannelChatTasksIfMediaReady(context.Context, pgtype.UUID) error {
 	return nil
@@ -158,67 +174,67 @@ func freshSessionRig(t *testing.T) (*wecomChannel, *recordingConn, *freshWatchin
 	return c, conn, tasks, binder
 }
 
-// TestANewCommandBehindAQuoteStillStartsAFreshSession: someone quotes a
-// colleague's number and writes "/new 重新分析这个数". They asked for a clean
+// TestAClearCommandBehindAQuoteStillStartsAFreshSession: someone quotes a
+// colleague's number and writes "/clear 重新分析这个数". They asked for a clean
 // start; if the command is read off the stored body it lands on the quote
 // block instead, the run resumes the old provider session, and the agent
 // answers carrying all the context the person just asked it to drop. Nothing
 // tells them it was ignored — the reply simply comes back wrong.
-func TestANewCommandBehindAQuoteStillStartsAFreshSession(t *testing.T) {
+func TestAClearCommandBehindAQuoteStillStartsAFreshSession(t *testing.T) {
 	c, conn, tasks, binder := freshSessionRig(t)
 
-	frame := groupQuotingFrame("msg-new-quoted", "/new 重新分析这个数", "Q3 毛利率 42.1%")
+	frame := groupQuotingFrame("msg-clear-quoted", "/clear 重新分析这个数", "Q3 毛利率 42.1%")
 	if err := c.dispatchFrame(context.Background(), frame, conn.autoAck(newWSSender(conn, nil)), slog.Default()); err != nil {
 		t.Fatalf("dispatchFrame: %v", err)
 	}
 
 	runs := tasks.runs()
 	if len(runs) != 1 {
-		t.Fatalf("the message queued %d agent runs, want exactly 1 — the rig is not exercising the /new path", len(runs))
+		t.Fatalf("the message queued %d agent runs, want exactly 1 — the rig is not exercising the /clear path", len(runs))
 	}
 	if !runs[0] {
-		t.Errorf("the agent run was queued with force-fresh=false: the user quoted a message, typed %q, and got the old session back instead of the fresh one they asked for", "/new 重新分析这个数")
+		t.Errorf("the agent run was queued with force-fresh=false: the user quoted a message, typed %q, and got the old session back instead of the fresh one they asked for", "/clear 重新分析这个数")
 	}
 	body := binder.appendIn.Body
-	if strings.Contains(body, "/new") {
-		t.Errorf("stored body = %q — the /new directive was never stripped, so the agent is handed the raw slash command as if it were part of the question", body)
+	if strings.Contains(body, "/clear") {
+		t.Errorf("stored body = %q — the /clear directive was never stripped, so the agent is handed the raw slash command as if it were part of the question", body)
 	}
 	if !strings.Contains(body, "Q3 毛利率 42.1%") {
 		t.Errorf("stored body = %q — the quoted figure was dropped, so the fresh session was asked to re-analyse a number it has never been shown and has no earlier turn to find it in", body)
 	}
 }
 
-// TestANewCommandWithNothingQuotedStartsAFreshSession is the positive control
+// TestAClearCommandWithNothingQuotedStartsAFreshSession is the positive control
 // for the rig above: with no quote in front of it the same command already
 // works today. It is here so that a future red run tells you which half broke
 // — the wiring, or the quoted case specifically.
-func TestANewCommandWithNothingQuotedStartsAFreshSession(t *testing.T) {
+func TestAClearCommandWithNothingQuotedStartsAFreshSession(t *testing.T) {
 	c, conn, tasks, binder := freshSessionRig(t)
 
-	frame := groupQuotingFrame("msg-new-plain", "/new 重新分析这个数", "")
+	frame := groupQuotingFrame("msg-clear-plain", "/clear 重新分析这个数", "")
 	if err := c.dispatchFrame(context.Background(), frame, conn.autoAck(newWSSender(conn, nil)), slog.Default()); err != nil {
 		t.Fatalf("dispatchFrame: %v", err)
 	}
 
 	runs := tasks.runs()
 	if len(runs) != 1 || !runs[0] {
-		t.Fatalf("an unquoted /new queued runs %v, want exactly one fresh run", runs)
+		t.Fatalf("an unquoted /clear queued runs %v, want exactly one fresh run", runs)
 	}
 	if got := binder.appendIn.Body; got != "重新分析这个数" {
 		t.Errorf("stored body = %q, want the question with the directive stripped", got)
 	}
 }
 
-// TestAQuotedNewCommandDoesNotRestartSomebodyElsesSession is the negative
+// TestAQuotedClearCommandDoesNotRestartSomebodyElsesSession is the negative
 // control: the quoted message is another person's old text. Someone quoting a
-// message that happens to begin with /new, and asking an ordinary question
+// message that happens to begin with /clear, and asking an ordinary question
 // underneath, must not wipe the room's session. Reading the command out of
 // the quote is the failure mode a careless fix for the test above would
 // introduce.
-func TestAQuotedNewCommandDoesNotRestartSomebodyElsesSession(t *testing.T) {
+func TestAQuotedClearCommandDoesNotRestartSomebodyElsesSession(t *testing.T) {
 	c, conn, tasks, _ := freshSessionRig(t)
 
-	frame := groupQuotingFrame("msg-new-inside-quote", "这条我处理过了", "/new 重跑一遍")
+	frame := groupQuotingFrame("msg-clear-inside-quote", "这条我处理过了", "/clear 重跑一遍")
 	if err := c.dispatchFrame(context.Background(), frame, conn.autoAck(newWSSender(conn, nil)), slog.Default()); err != nil {
 		t.Fatalf("dispatchFrame: %v", err)
 	}
@@ -228,13 +244,13 @@ func TestAQuotedNewCommandDoesNotRestartSomebodyElsesSession(t *testing.T) {
 		t.Fatalf("the message queued %d agent runs, want exactly 1", len(runs))
 	}
 	if runs[0] {
-		t.Error("a /new inside a quote restarted the session: one person's old message must not throw away the room's context the moment somebody quotes it")
+		t.Error("a /clear inside a quote restarted the session: one person's old message must not throw away the room's context the moment somebody quotes it")
 	}
 }
 
 // The binder is what hands CommandText to the shared classifier. With the
 // stored body carrying a quote in front, passing that body instead of the
-// user's own line is how /issue and /new stop being recognised at all.
+// user's own line is how /issue and /clear stop being recognised at all.
 func TestTheBinderPassesTheUnquotedLineAsTheCommandText(t *testing.T) {
 	t.Parallel()
 	fb := &fakeSessionBinder{sessID: uuidOf(6)}

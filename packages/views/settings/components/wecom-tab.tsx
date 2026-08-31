@@ -89,12 +89,6 @@ export function WecomTab() {
 
   return (
     <div className="space-y-8">
-      <section className="space-y-1">
-        <p className="text-body text-muted-foreground">
-          {t(($) => $.wecom.page_description)}
-        </p>
-      </section>
-
       {!configured ? (
         <Card>
           <CardContent className="space-y-2">

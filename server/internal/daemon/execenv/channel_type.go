@@ -13,10 +13,28 @@ package execenv
 // agree on the wire strings below. WeCom keeps its reserved wire discriminator
 // here until its adapter lands.
 const (
-	ChannelTypeSlack  = "slack"
-	ChannelTypeFeishu = "feishu"
-	ChannelTypeWecom  = "wecom"
+	ChannelTypeSlack    = "slack"
+	ChannelTypeFeishu   = "feishu"
+	ChannelTypeWecom    = "wecom"
+	ChannelTypeDingtalk = "dingtalk"
 )
+
+// SurfacePersistsTranscript reports whether a chat surface stores its
+// conversation in Multica's chat_message table, readable back via `multica chat
+// history` (handler/chat_history.go's non-Slack fallback). Web chat (empty
+// discriminator), Feishu, WeCom and DingTalk all persist via the shared
+// AppendUserMessage path; Slack reads the live channel instead. It is the single
+// source of truth for "which surfaces are readable", shared by the
+// continuity-notice router, the chat-prompt history copy, and the surface list —
+// so a future non-persisting channel is never told "read it back".
+func SurfacePersistsTranscript(channelType string) bool {
+	switch channelType {
+	case "", ChannelTypeFeishu, ChannelTypeWecom, ChannelTypeDingtalk:
+		return true
+	default:
+		return false
+	}
+}
 
 // Room-shape discriminators, mirroring channel_chat_session_binding.chat_type
 // (channel.ChatTypeP2P / channel.ChatTypeGroup). Every adapter persists this
@@ -67,6 +85,10 @@ func AudienceOf(channelType, chatType string) ChatAudience {
 // reach this conversation. It is the delivery half of the two-layer channel
 // policy (MUL-4899).
 //
+// Its one caller is the per-turn chat prompt (daemon.buildChatPrompt). The
+// runtime brief must not call it: the answer changes turn to turn on one
+// resumed session, and the brief is the prompt-cache prefix (MUL-5377).
+//
 // serverSaysDelivers is the claim's chat_channel_delivers_files, and it is the
 // ONLY thing consulted for a channel-backed chat. The channel type is not, and
 // the temptation to answer from it is the defect this signature exists to
@@ -79,7 +101,8 @@ func AudienceOf(channelType, chatType string) ChatAudience {
 // Mixed versions land in the same place from the other direction: a daemon new
 // enough to know WeCom delivers files, talking to a server too old to perform
 // the hop, infers a capability that is not there. Both cases arrive as false
-// here, which is the brief that says to describe the file in words.
+// here, which is the per-turn instruction that says to describe the file in
+// words.
 //
 // Web / mobile chat is not answered here. It has no channel type at all and is
 // handled by its own branch, which points at the attachment card the browser
@@ -103,6 +126,8 @@ func ChannelDisplayName(channelType string) string {
 		return "Feishu/Lark"
 	case ChannelTypeWecom:
 		return "WeCom"
+	case ChannelTypeDingtalk:
+		return "DingTalk"
 	default:
 		return channelType
 	}

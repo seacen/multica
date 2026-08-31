@@ -1,25 +1,43 @@
 package wecom
 
-// outbound.go — the WeCom EventChatDone / EventInboxNew subscriber. It runs on
-// whichever replica published the event and does not try to write to WeCom at
-// all: it enqueues onto channel_outbound_queue and nudges the local consumer.
-// The replica holding the bot's WebSocket lease drains the row (see
-// outbox_sender.go).
+// outbound.go — the WeCom EventChatDone / EventInboxNew subscriber. An agent's
+// answer leaves this process the way every other WeCom write does: over the
+// aibot WebSocket held in the sendersRegistry. aibot has no outbound REST path,
+// so there is nothing else to fall back on.
 //
-// That indirection is the whole point. aibot has no outbound REST path, so a
-// reply can only leave the process that holds the socket — but the bus is
-// in-process, so the publishing replica is frequently not that one. Pushing
-// straight to the sendersRegistry from here therefore dropped every reply
-// produced off-lease, which is why this adapter previously carried a
-// single-replica constraint. Enqueueing instead makes the handoff durable and
-// replica-agnostic.
+// Two shapes of write, tried in this order. A round that opened a bubble when
+// the question arrived has its answer written INTO that bubble and the bubble
+// sealed — that is the whole point of the streaming reply, and it is why an
+// empty completion still has to reach this far: a spinner nobody closes is
+// worse than a short answer (stream_store.go, typing_indicator.go). A round
+// with no bubble left — a restart mid-run, a stream past its window, a frame
+// the server refused — gets an ordinary message addressed by the task's own
+// delivery row.
+//
+// REPLICA TOPOLOGY: EventChatDone / EventInboxNew are dispatched on the
+// in-process events.Bus, so the replica that publishes an event is not
+// necessarily the one holding the bot's WS lease (Slack/Lark are immune —
+// their outbound is stateless HTTP any replica can perform). With a
+// sharded/dual realtime relay running, a reply or inbox push produced
+// off-lease is forwarded to the lease holder over the relay
+// (relay_outbound.go) and the single-replica constraint no longer applies to
+// routing. Without a relay — legacy mode, or no REDIS_URL — the constraint
+// stands: run the WeCom-enabled backend as a single replica. In every mode, a
+// delivery produced while NO replica holds a live connection (all of them
+// mid-reconnect) is still lost; that residual window is a durability problem
+// the relay deliberately does not solve. Boot logs which of the two regimes is
+// in effect. See router.go.
+//
+// The bubble path and the relay never contend for the same turn. A bubble is
+// writable only on the replica that painted it, which is the replica holding
+// the socket; a round whose bubble lives elsewhere finds none here and takes
+// the addressed path, which is where the relay is.
 //
 // Sessions with no wecom binding are ignored so this coexists with the Slack /
 // Lark subscribers on the shared bus.
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -32,7 +50,6 @@ import (
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
 	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
-	"github.com/multica-ai/multica/server/internal/integrations/channel/outbox"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
@@ -41,7 +58,12 @@ import (
 // outboundQueries is the slice of generated queries the WeCom outbound
 // subscriber needs. *db.Queries satisfies it.
 type outboundQueries interface {
-	GetChannelChatSessionBindingBySession(ctx context.Context, arg db.GetChannelChatSessionBindingBySessionParams) (db.ChannelChatSessionBinding, error)
+	// GetChannelTaskDelivery is the route this turn was admitted on, stamped
+	// when the question was ingested. Read by task rather than by session
+	// because /new and /clear re-point a session at a different binding: an
+	// answer still in flight across one of those belongs to the room that
+	// asked, not to whatever the session points at by the time it lands.
+	GetChannelTaskDelivery(ctx context.Context, taskID pgtype.UUID) (db.ChannelTaskDelivery, error)
 	// GetAgentTask serves two readers on this path. The origin gate reads the
 	// row to get at the channel_ingested stamp; the round matcher reads it to
 	// resolve an auto-retry clone back to the turn that owns its input batch,
@@ -58,20 +80,16 @@ type outboundQueries interface {
 	languageLookup
 }
 
-// Outbound enqueues agent replies and inbox notifications for delivery to
-// WeCom. Registered against the shared event bus.
+// Outbound delivers an agent's chat reply back to WeCom over the same aibot
+// WebSocket the inbound loop owns, sealing the round's bubble with it where
+// there still is one. Registered against the shared event bus; sessions with no
+// wecom binding are silently ignored.
 type Outbound struct {
 	q       outboundQueries
 	tasks   taskLookup
 	senders *sendersRegistry
 	streams *streamStore
 	logger  *slog.Logger
-
-	// producer puts an answer on channel_outbound_queue instead of on the
-	// socket. Any replica may enqueue; the one holding the bot's connection
-	// lease drains. Nil keeps the direct send this adapter had before the
-	// queue existed.
-	producer *outbox.Producer
 
 	// objects is the deployment's object storage, or nil when there is none.
 	// Non-nil is what turns file delivery on (outbound_media.go).
@@ -80,6 +98,15 @@ type Outbound struct {
 	// spawn runs an attachment delivery. A field rather than a bare `go` so a
 	// test can run it inline and observe the result deterministically.
 	spawn func(func())
+
+	// metrics counts what happened to each reply. Nil discards; see
+	// outbound_outcome.go for why the drop breakdown exists at all.
+	metrics Metrics
+
+	// relay routes a reply to the replica holding the bot's socket when this
+	// one does not. Nil on a deployment with no Redis, where it is also
+	// unnecessary: one replica publishes and holds the socket both.
+	relay *RelayOutbound
 
 	// Two counters bound attachment delivery, and they are two because one
 	// cannot be in both places at once.
@@ -95,9 +122,12 @@ type Outbound struct {
 	// delivery refused for want of capacity be reported to the user without
 	// ever warning about a file that never existed.
 	//
-	// The admitted cap is deliberately the larger of the two: reaching it
-	// means the pending cap is full AND as many more turns are still in their
-	// lookup, so the honest post-lookup path is the one a backlog meets first.
+	// The admitted cap is deliberately the larger of the two, so that a
+	// backlog of turns that DO carry a file fills the pending cap first and is
+	// shed on the path that can say what was dropped. Reaching the admitted cap
+	// does not imply the pending cap is full: admission is held for a
+	// goroutine's whole life, including its lookup and including turns that
+	// turn out to carry no file, and those never claim a pending slot at all.
 	pendingMu           sync.Mutex
 	pendingAttachments  int
 	admittedAttachments int
@@ -107,33 +137,26 @@ type Outbound struct {
 // process-wide registry the wecom.ChannelDeps and OutboundReplier were
 // built with — reply delivery goes through the live wsSender for the
 // binding's installation, so a session whose Supervisor lost the lease
-// mid-flight silently drops rather than opening a second connection.
+// mid-flight is routed over the relay or dropped, never given a second
+// connection.
 //
 // streams is the same store the typing indicator writes to; nil disables the
 // in-place reply and leaves every answer going out as a new message.
 //
-// WithAttachments is the one option: pass the deployment's object storage and
-// the files an agent produced are delivered into the chat behind the answer.
-//
-// No metrics parameter: the counters this subscriber reports reach the sink
-// through senders, which it already holds and which every outbound write goes
-// through anyway. See sendersRegistry.WithMetrics.
-// producer is the shared outbound queue producer: an answer with no bubble
-// left to put it in becomes a row rather than a frame, so any replica may
-// produce it and the one holding the bot's connection lease delivers. Nil
-// keeps the direct socket send this adapter had before the queue existed.
-func NewOutbound(q outboundQueries, senders *sendersRegistry, streams *streamStore, producer *outbox.Producer, logger *slog.Logger, opts ...OutboundOption) *Outbound {
+// WithAttachments is the one option that changes what can be delivered: pass
+// the deployment's object storage and the files an agent produced are
+// delivered into the chat behind the answer.
+func NewOutbound(q outboundQueries, senders *sendersRegistry, streams *streamStore, logger *slog.Logger, opts ...OutboundOption) *Outbound {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	o := &Outbound{
-		q:        q,
-		tasks:    q,
-		senders:  senders,
-		streams:  streams,
-		producer: producer,
-		logger:   logger,
-		spawn:    func(f func()) { go f() },
+		q:       q,
+		tasks:   q,
+		senders: senders,
+		streams: streams,
+		logger:  logger,
+		spawn:   func(f func()) { go f() },
 	}
 	for _, opt := range opts {
 		opt(o)
@@ -144,27 +167,50 @@ func NewOutbound(q outboundQueries, senders *sendersRegistry, streams *streamSto
 // Register subscribes to the chat-done and inbox events on the bus.
 func (o *Outbound) Register(bus *events.Bus) {
 	bus.Subscribe(protocol.EventChatDone, o.handleEvent)
-	// Inbox notifications delivered through the smart bot: when the recipient
-	// member has a WeCom binding, their inbox:new items are enqueued as a
-	// markdown card addressed to their 1:1 chat with the bot.
+	// Inbox notifications delivered through the smart bot: when the
+	// recipient member has a WeCom binding with a live connection, their
+	// inbox:new items are pushed to the aibot as a markdown card.
 	bus.Subscribe(protocol.EventInboxNew, o.handleInboxNew)
 }
 
 func (o *Outbound) handleEvent(e events.Event) {
-	// Bus delivery is synchronous — a slow INSERT must not wedge the publish
-	// call site. Fresh ctx with a tight timeout, same as Slack.
+	// Bus delivery is synchronous — a stuck WS write must not wedge the
+	// publish call site. Fresh ctx with a tight timeout, same as Slack.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	// One place records an undelivered reply, so a drop is counted exactly
+	// once and always carries a reason. The branches inside processEvent that
+	// end a turn without an error of their own record themselves and return
+	// nil; everything that surfaces here is classified from the error.
 	if err := o.processEvent(ctx, e); err != nil {
-		o.logger.WarnContext(ctx, "wecom outbound: enqueue reply failed",
-			"error", err, "chat_session_id", e.ChatSessionID)
+		if reason := unconfirmedReason(err); reason != "" {
+			o.unconfirmed(ctx, e, reason, err)
+		} else {
+			o.dropped(ctx, e, classifyDrop(err), err)
+		}
 	}
 }
 
+// answerOutcome is what deliverAnswer reports back about a turn's words, for
+// the two decisions its caller still has to make once they are gone.
+type answerOutcome struct {
+	// addr is where the words went, or the zero value when none did. It is the
+	// address the files that follow are sent to.
+	addr roundAddress
+
+	// spoke says words reached the user from THIS process. It is what the
+	// attachment path needs to know whether the files are the whole answer:
+	// a sealed bubble already put text on the screen, so files failing behind
+	// it are a file problem, not a reply this adapter owed and lost.
+	spoke bool
+
+	// routed says the turn was handed to the replica holding the socket. That
+	// replica sends the files too (relayFrame.CarriesFiles), so this one must
+	// not, or the user gets each attachment twice.
+	routed bool
+}
+
 func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
-	if o.producer == nil {
-		return errors.New("wecom: outbound producer not configured")
-	}
 	sessionID, err := util.ParseUUID(e.ChatSessionID)
 	if err != nil || !sessionID.Valid {
 		// Issue / autopilot tasks carry no chat_session.
@@ -184,26 +230,31 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 	// Asked BEFORE sayEnding, which is the line that consumes the round. Every
 	// way a web run could touch this room is on the far side of it: sayEnding
 	// takes the bubble the room's own question opened, and deliverAnswer seals
-	// it — with the answer, or with the copy pack's StreamNoReply when the completion is
-	// empty. Sealing is not sending, so a gate placed inside deliverAnswer
-	// would still cost the asker in the room the bubble they were waiting on,
-	// and they would read a web run's ending in it. An answer that must not
-	// reach the room must not take over the room's message either. The failure
-	// notice orders its own gate the same way, and for the same reason — see
-	// failureBelongsOnWecom in typing_indicator.go.
+	// it — with the answer, or with the copy pack's StreamNoReply when the
+	// completion is empty. Sealing is not sending, so a gate placed inside
+	// deliverAnswer would still cost the asker in the room the bubble they were
+	// waiting on, and they would read a web run's ending in it. An answer that
+	// must not reach the room must not take over the room's message either. The
+	// failure notice orders its own gate the same way, and for the same reason
+	// — see failureBelongsOnWecom in typing_indicator.go.
 	//
-	// The cost of asking this early is two reads on a chat:done that turns out
-	// to belong to another adapter, which used to be refused one query later by
-	// the binding lookup. That lookup cannot come first any more: it moved into
-	// sendAsMessage, past the take, and nothing may precede the take but this.
+	// Everything up to here is a read. Keep it that way.
+	//
+	// The empty completion is deliberately NOT short-circuited ahead of this.
+	// An agent that finished with nothing to add still owes the room's bubble
+	// an ending, and returning early would leave it spinning forever; the turn
+	// that genuinely had nothing to say names itself as skipNothingToSay inside
+	// deliverAnswer, where it is known that no bubble was waiting on it.
 	taskID, ok := chatDoneTaskID(e)
 	if !ok {
+		o.dropped(ctx, e, dropTaskMissing, nil)
 		return nil
 	}
 	task, err := o.q.GetAgentTask(ctx, taskID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Cancelled and deleted while its completion was in flight.
+			o.dropped(ctx, e, dropTaskMissing, nil)
 			return nil
 		}
 		return fmt.Errorf("wecom: load agent task: %w", err)
@@ -213,6 +264,7 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 		return fmt.Errorf("wecom: classify task input origin: %w", err)
 	}
 	if !deliver {
+		o.skipped(ctx, e, skipOriginNotChannel)
 		return nil
 	}
 
@@ -225,34 +277,57 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 	// the ledger records the ending only from what deliverAnswer reports. There
 	// is no path here that sends without recording, and none that records
 	// without sending — see the ending ledger's contract in stream_store.go.
-	var spokeAt roundAddress
+	var said answerOutcome
 	_, err = o.rounds().sayEnding(ctx, sessionID, byTask(taskIDFromEvent(e)), roundOver,
 		func(t roundTurn) (roundAddress, error) {
-			addr, err := o.deliverAnswer(ctx, sessionID, taskID, t, content, carriesFiles)
-			spokeAt = addr
-			return addr, err
+			var err error
+			said, err = o.deliverAnswer(ctx, e, taskID, t, content, carriesFiles)
+			return said.addr, err
 		})
 	if errors.Is(err, errNothingToSay) {
+		// Counted by whichever branch declined to speak — each one names its
+		// own reason, and a blanket count here would file a revoked
+		// installation and a silent agent under the same label.
 		return nil
 	}
 	if err != nil {
 		return err
+	}
+	if said.routed {
+		// The replica holding the socket owns the rest of this turn, files
+		// included — relayFrame.CarriesFiles is how it knows. Sending them from
+		// here as well would put every attachment in the chat twice.
+		//
+		// The ending is recorded as said even though nothing left this process:
+		// a published frame is owed an outcome by the relay, which records the
+		// drop itself if nobody takes it (RelayOutbound.watchOutcomes). Leaving
+		// the round owed instead would let the next repeat of this run's failure
+		// claim the promise and tell the user "这次没跑通" under an answer that
+		// did arrive.
+		return nil
 	}
 	// Then whatever the agent produced alongside the words, as its own message —
 	// a WeCom reply cannot carry a file inline. It goes wherever the answer just
 	// went, bubble or plain message, which is the one address this turn has
 	// established belongs to the room that asked. An address the round never
 	// learned is a no-op inside deliverAttachments.
+	//
+	// carriesTheReply is true only when nothing has been shown to the user yet,
+	// which makes the files the whole answer and their outcome the reply's. A
+	// sealed bubble or a sent message has already settled that, so this is read
+	// off what deliverAnswer did rather than off the completion being empty:
+	// an empty completion under a bubble was answered in words all the same.
 	o.deliverAttachments(e, attachmentTarget{
-		InstallationID: spokeAt.InstallationID,
-		ChatID:         spokeAt.ChatID,
-		ChatType:       spokeAt.ChatType,
+		InstallationID: said.addr.InstallationID,
+		ChatID:         said.addr.ChatID,
+		ChatType:       said.addr.ChatType,
+		SessionID:      e.ChatSessionID,
 		// Resolved here rather than at the failure, which happens on a detached
 		// goroutine with no context left to read a profile with. In a 1:1 the
 		// bound chatid IS the reader's userid, which is what localeFor wants; a
 		// room ignores it and reads the deployment's language (language.go).
-		Locale: localeFor(ctx, o.q, spokeAt.InstallationID, spokeAt.ChatType, spokeAt.ChatID),
-	})
+		Locale: localeFor(ctx, o.q, said.addr.InstallationID, said.addr.ChatType, said.addr.ChatID),
+	}, !said.spoke)
 	return nil
 }
 
@@ -263,12 +338,12 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 // the whole point of the feature is that the answer replaces it in place. The
 // round's own address is next, for the one case where an empty completion still
 // owes the user words. Everything else is an ordinary message to the chat the
-// binding row names.
+// task's delivery row names.
 //
 // Nothing here re-asks where the question came from. processEvent has already
 // refused every run that is not this room's, which is what makes it safe for
 // this function to write without asking.
-func (o *Outbound) deliverAnswer(ctx context.Context, sessionID, taskID pgtype.UUID, t roundTurn, content string, carriesFiles bool) (roundAddress, error) {
+func (o *Outbound) deliverAnswer(ctx context.Context, e events.Event, taskID pgtype.UUID, t roundTurn, content string, carriesFiles bool) (answerOutcome, error) {
 	if t.HasBubble {
 		// A bubble on screen has to end in words. An empty completion is a
 		// legitimate outcome — the agent had nothing to add — but an endless
@@ -319,16 +394,8 @@ func (o *Outbound) deliverAnswer(ctx context.Context, sessionID, taskID pgtype.U
 				// any files: it is the same answer, and a file arriving between two
 				// halves of a sentence reads as an interruption.
 				o.sendRest(ctx, t.Handle, rest)
-				// The answer left over the socket, so no queue row was ever written
-				// for it — and the reconciler reads a terminal task with no row as a
-				// reply the realtime path dropped. Record the delivery under the key
-				// the enqueue would have used, or the answer the user has just
-				// finished reading arrives a second time about a minute later. This
-				// covers the pieces sendRest put underneath the bubble and the files
-				// deliverAttachments puts under those: they are the same turn, and
-				// the reconciler's unit is the task, not the frame.
-				o.recordAnswerDelivered(ctx, sessionID, taskID)
-				return t.Handle.address(), nil
+				o.delivered()
+				return answerOutcome{addr: t.Handle.address(), spoke: true}, nil
 			}
 		}
 		// The frame was refused, or was never worth attempting. Say it as a
@@ -358,27 +425,26 @@ func (o *Outbound) deliverAnswer(ctx context.Context, sessionID, taskID pgtype.U
 		//
 		// The promise is what makes this safe to send at all. One exists only
 		// where the guard closed a bubble this adapter opened, so it is itself
-		// the proof that a WeCom round is waiting on these words — no binding
+		// the proof that a WeCom round is waiting on these words — no delivery
 		// row is consulted and no session that never asked anything here is
 		// written to.
 		if t.Promised && t.Addr.known() && o.senders != nil {
 			err := o.senders.sendTextCtx(ctx, t.Addr.InstallationID, t.Addr.ChatID, t.Addr.ChatType, o.copyForAddress(ctx, t.Addr).StreamNoReply)
 			if err == nil {
-				// Written to the socket, so the queue has no row for this task and
-				// the reconciler would read that as a dropped reply.
-				o.recordAnswerDelivered(ctx, sessionID, taskID)
+				o.delivered()
 			}
-			return t.Addr, err
+			return answerOutcome{addr: t.Addr, spoke: err == nil}, err
 		}
 		if !carriesFiles {
-			return roundAddress{}, errNothingToSay
+			o.skipped(ctx, e, skipNothingToSay)
+			return answerOutcome{}, errNothingToSay
 		}
 		// The agent said nothing but produced files, and those still have to
-		// reach the room. sendAsMessage is where the binding row names it; with
+		// reach the room. sendAsMessage is where the delivery row names it; with
 		// no words to carry it sends none, and returns the address the files go
 		// to.
 	}
-	return o.sendAsMessage(ctx, sessionID, taskID, content, carriesFiles)
+	return o.sendAsMessage(ctx, e, taskID, content, carriesFiles)
 }
 
 // copyForAddress picks the pack for a round whose handle is gone: the words are
@@ -389,151 +455,117 @@ func (o *Outbound) copyForAddress(ctx context.Context, addr roundAddress) copyPa
 	return copyFor(localeFor(ctx, o.q, addr.InstallationID, addr.ChatType, addr.ChatID))
 }
 
-// deliverAnswerOverSocket writes this turn's answer straight to the chat and
-// records the delivery, reporting whether it went. It exists so a turn that
-// also carries files is written to one transport, answer first — see
-// sendAsMessage for what that does and does not buy.
-//
-// false means the caller must fall back to the queue, and it is returned only
-// when NOTHING was written: no connection here, or the first piece refused. A
-// piece that fails after an earlier one landed stops the rest and returns true
-// — the same thing sendRest does under a bubble, and for the same reason.
-// Falling back there would re-send the whole answer on top of the part the
-// user can already read, which is the duplicate this avoids.
-//
-// The answer is split here rather than left to sendTextCtx because the split
-// is what makes "nothing was written" observable.
-func (o *Outbound) deliverAnswerOverSocket(ctx context.Context, inst db.ChannelInstallation, binding db.ChannelChatSessionBinding, chatType int, content string, taskID pgtype.UUID) bool {
-	if o.senders == nil || o.senders.get(inst.ID) == nil {
-		return false
-	}
-	for i, piece := range splitForWire(content) {
-		err := o.senders.sendTextCtx(ctx, inst.ID, binding.ChannelChatID, chatType, piece)
-		if err == nil {
-			continue
-		}
-		if i == 0 {
-			o.logger.WarnContext(ctx, "wecom outbound: could not put an answer on the socket ahead of its files; falling back to the queue",
-				"installation_id", util.UUIDToString(inst.ID),
-				"task_id", util.UUIDToString(taskID), "error", err)
-			return false
-		}
-		o.logger.WarnContext(ctx, "wecom outbound: could not send the rest of an answer that carries files",
-			"installation_id", util.UUIDToString(inst.ID),
-			"task_id", util.UUIDToString(taskID), "piece", i+1, "error", err)
-		break
-	}
-	recordSocketDelivery(ctx, o.producer, o.logger, inst, binding, taskID, sourceKindChatDone)
-	return true
-}
-
-// recordAnswerDelivered files this turn's answer on the outbound queue as
-// already sent, because the round delivered it over the socket and left the
-// queue nothing to see. The address is read back off the session rather than
-// passed in: the bubble path never loaded a binding row, and one indexed lookup
-// on the sealed path is cheaper than making it load one earlier.
-func (o *Outbound) recordAnswerDelivered(ctx context.Context, sessionID, taskID pgtype.UUID) {
-	if o.producer == nil {
-		return
-	}
-	inst, binding, ok := resolveSocketDeliveryTarget(ctx, o.q, sessionID)
-	if !ok {
-		return
-	}
-	recordSocketDelivery(ctx, o.producer, o.logger, inst, binding, taskID, sourceKindChatDone)
-}
-
-// sendAsMessage pushes an answer to the chat this session is bound to, for a
+// sendAsMessage pushes an answer to the chat this turn was admitted on, for a
 // round with no bubble left to put it in — a restart mid-run, a stream past its
 // window, a frame the server refused. It returns where it spoke, so a round
 // whose note never held an address learns one.
+//
+// The address comes off channel_task_delivery rather than off the session's
+// current binding: /new and /clear re-point a session, and an answer produced
+// across one of those belongs to the room that asked. The bubble path is
+// already routed that way — its handle carries the address the question came in
+// on — so both paths of this adapter answer where they were asked.
 //
 // For a round the guard closed at nine minutes this message IS the separate
 // reply it promised, which is why the ledger settles on the strength of it:
 // left owed, the promise would be claimed by the next repeat of this run's
 // failure and tell the user "这次没跑通" underneath the answer they just read.
-func (o *Outbound) sendAsMessage(ctx context.Context, sessionID, taskID pgtype.UUID, content string, carriesFiles bool) (roundAddress, error) {
-	binding, err := o.q.GetChannelChatSessionBindingBySession(ctx, db.GetChannelChatSessionBindingBySessionParams{
-		ChatSessionID: sessionID,
-		ChannelType:   channelTypeWecom,
-	})
+func (o *Outbound) sendAsMessage(ctx context.Context, e events.Event, taskID pgtype.UUID, content string, carriesFiles bool) (answerOutcome, error) {
+	delivery, err := o.q.GetChannelTaskDelivery(ctx, taskID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Not a wecom session (Slack / Lark / web-only).
-			return roundAddress{}, errNothingToSay
+			// No route was recorded for this turn: it never came in over a
+			// channel, or it came in over one that keeps no delivery row.
+			return answerOutcome{}, errNothingToSay
 		}
-		return roundAddress{}, fmt.Errorf("wecom: lookup chat binding: %w", err)
+		return answerOutcome{}, fmt.Errorf("wecom: lookup task delivery: %w", err)
 	}
+	if delivery.ChannelType != channelTypeWecom {
+		// Not a wecom turn (Slack / Lark / web-only).
+		return answerOutcome{}, errNothingToSay
+	}
+	binding := wecomBindingFromTaskDelivery(delivery)
 	inst, err := o.q.GetChannelInstallation(ctx, db.GetChannelInstallationParams{
 		ID:          binding.InstallationID,
 		ChannelType: channelTypeWecom,
 	})
 	if err != nil {
-		return roundAddress{}, fmt.Errorf("wecom: load installation: %w", err)
+		return answerOutcome{}, fmt.Errorf("wecom: load installation: %w", err)
 	}
 	if inst.Status != string(InstallationActive) {
-		// Revoked between trigger and reply.
-		return roundAddress{}, errNothingToSay
+		// Revoked between trigger and reply. Named here rather than left to the
+		// caller: from outside, this and a silent agent are both errNothingToSay.
+		o.skippedFor(ctx, e.ChatSessionID, skipInstallationInactive)
+		return answerOutcome{}, errNothingToSay
+	}
+	if o.senders == nil {
+		return answerOutcome{}, errors.New("wecom: sender registry not configured")
 	}
 	addr := roundAddress{
 		InstallationID: inst.ID,
 		ChatID:         binding.ChannelChatID,
 		ChatType:       aibotChatTypeFromChannel(channel.ChatType(binding.ChatType)),
 	}
+	sender := o.senders.get(inst.ID)
+	if sender == nil {
+		// Before giving up: this reply may simply have been produced on the
+		// wrong replica. Hand it to the one holding the socket.
+		//
+		// Counted by the replica that delivers it, not here — so a reply that
+		// is routed and then delivered appears once, on the sender's side.
+		// A reply routed while EVERY replica is mid-reconnect is read by
+		// nobody and counted by nobody; that window is the durability problem
+		// this deliberately does not solve (relay_outbound.go).
+		if o.relay.publish(relayFrame{
+			Kind:           relayKindReply,
+			InstallationID: util.UUIDToString(inst.ID),
+			ChatID:         addr.ChatID,
+			ChatType:       addr.ChatType,
+			Content:        content,
+			TaskID:         util.UUIDToString(taskID),
+			MessageID:      chatDoneMessageID(e.Payload),
+			WorkspaceID:    e.WorkspaceID,
+			SessionID:      e.ChatSessionID,
+			CarriesFiles:   carriesFiles,
+		}, relayEventID(e, taskID)) {
+			o.logger.DebugContext(ctx, "wecom outbound: routed to the replica holding the socket",
+				"installation_id", util.UUIDToString(inst.ID), "chat_session_id", e.ChatSessionID)
+			return answerOutcome{addr: addr, routed: true}, nil
+		}
+		// No live WS for this installation on this replica. Two causes:
+		// (1) the Supervisor lost the lease or is mid-reconnect — transient,
+		// and the user's next inbound message reaches the reconnected loop;
+		// (2) on a multi-replica deployment the lease is held by a DIFFERENT
+		// replica than the one that published this event, so it can never be
+		// delivered from here (see the single-replica constraint in this
+		// file's header). Either way, buffering is wrong — the reply is stale
+		// by the time a socket returns — so we surface it to the caller's WARN
+		// rather than drop it silently.
+		return answerOutcome{}, errNoLiveConnection
+	}
 	// Words first — and only when there are any. An empty completion reaches
 	// here only because a file is bound to the turn, and an empty markdown
 	// message ahead of that file would be noise the user has to scroll past.
 	if !hasVisibleChar(content) {
-		return addr, nil
+		return answerOutcome{addr: addr}, nil
 	}
-	// A message addressed by chat id becomes a queue row rather than a frame:
-	// any replica may produce it, and the replica holding this bot's
-	// connection lease delivers it. That is what removes the single-replica
-	// constraint this path used to carry, and what keeps an answer produced
-	// during a reconnect instead of being dropped for want of a socket.
-	if o.producer != nil {
-		// A turn that also carries files goes down ONE transport, answer
-		// first: the files are frames on this connection's socket, and an
-		// answer that took the queue could be drained after them, leaving the
-		// user reading the attachments before the sentence about them.
-		if carriesFiles && o.deliverAnswerOverSocket(ctx, inst, binding, addr.ChatType, content, taskID) {
-			return addr, nil
-		}
-		return addr, o.enqueueAnswer(ctx, inst, binding, addr, taskID, content)
+	if err := sender.sendTextCtx(ctx, addr.ChatID, addr.ChatType, content); err != nil {
+		return answerOutcome{addr: addr}, err
 	}
-	if o.senders == nil {
-		return roundAddress{}, errors.New("wecom: sender registry not configured")
-	}
-	sender := o.senders.get(inst.ID)
-	if sender == nil {
-		// No live WS for this installation on this replica and no queue to
-		// leave it on. Buffering in memory would be wrong — the reply is stale
-		// by the time a socket returns — so surface it to the caller's WARN
-		// rather than drop it silently.
-		return roundAddress{}, errors.New("wecom: connection not ready on this replica")
-	}
-	return addr, sender.sendTextCtx(ctx, addr.ChatID, addr.ChatType, content)
+	o.delivered()
+	return answerOutcome{addr: addr, spoke: true}, nil
 }
 
-// enqueueAnswer puts one answer on channel_outbound_queue, keyed on the run it
-// answers so a redelivered chat:done cannot produce a second copy of it.
-func (o *Outbound) enqueueAnswer(ctx context.Context, inst db.ChannelInstallation, binding db.ChannelChatSessionBinding, addr roundAddress, taskID pgtype.UUID, content string) error {
-	payload, err := json.Marshal(outboundPayload{Content: content})
-	if err != nil {
-		return fmt.Errorf("wecom: marshal chat_done payload: %w", err)
+// wecomBindingFromTaskDelivery reads a turn's route back as the binding row the
+// rest of this adapter is written against.
+func wecomBindingFromTaskDelivery(delivery db.ChannelTaskDelivery) db.ChannelChatSessionBinding {
+	return db.ChannelChatSessionBinding{
+		ID: delivery.BindingID, InstallationID: delivery.InstallationID,
+		ChannelType: delivery.ChannelType, ChannelChatID: delivery.ChannelChatID,
+		ChatType:      delivery.ChatType,
+		LastMessageID: delivery.ChannelMessageID, LastThreadID: delivery.ChannelThreadID,
+		RouteRevision: delivery.RouteRevision, Config: delivery.Config,
 	}
-	_, err = o.producer.Enqueue(ctx, outbox.Request{
-		InstallationID: inst.ID,
-		WorkspaceID:    inst.WorkspaceID,
-		ChatSessionID:  binding.ChatSessionID,
-		SourceKind:     sourceKindChatDone,
-		SourceID:       util.UUIDToString(taskID),
-		TargetChatID:   addr.ChatID,
-		TargetChatType: int16(addr.ChatType),
-		MsgType:        msgTypeMarkdown,
-		Payload:        payload,
-	}, outbox.EnqueuePathRealtime)
-	return err
 }
 
 // rounds builds the matcher that turns a task id on an event into the round it
@@ -629,11 +661,12 @@ func chatDoneContent(payload any) string {
 	return ""
 }
 
-// handleInboxNew is the inbox:new subscriber that enqueues a member
-// notification for delivery via the smart bot. On any miss — non-member
-// recipient, no wecom binding, nothing renderable — the handler is a no-op and
-// the member simply receives the notification through the in-app inbox as
-// usual.
+// handleInboxNew is the inbox:new subscriber that delivers a member
+// notification via the smart bot. When the recipient member has a WeCom
+// binding with a live connection, the notification is pushed to the aibot.
+// On any miss — non-member recipient, no wecom binding, no live sender,
+// send failure — the handler is a no-op and the member simply receives the
+// notification through the in-app inbox as usual.
 func (o *Outbound) handleInboxNew(e events.Event) {
 	payload, ok := e.Payload.(map[string]any)
 	if !ok {
@@ -649,22 +682,19 @@ func (o *Outbound) handleInboxNew(e events.Event) {
 	}
 	recipientIDStr, _ := item["recipient_id"].(string)
 	workspaceIDStr, _ := item["workspace_id"].(string)
-	itemIDStr, _ := item["id"].(string)
-	if recipientIDStr == "" || workspaceIDStr == "" || itemIDStr == "" {
+	if recipientIDStr == "" || workspaceIDStr == "" {
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	o.tryEnqueueInbox(ctx, item, itemIDStr, recipientIDStr, workspaceIDStr)
+	o.tryDeliverInbox(ctx, item, recipientIDStr, workspaceIDStr)
 }
 
-// tryEnqueueInbox is the enqueue core. Returns true iff a row was written.
-func (o *Outbound) tryEnqueueInbox(ctx context.Context, item map[string]any, itemIDStr, recipientIDStr, workspaceIDStr string) bool {
-	if o.producer == nil {
-		return false
-	}
+// tryDeliverInbox is the delivery core. Returns true iff the bot pushed
+// the notification.
+func (o *Outbound) tryDeliverInbox(ctx context.Context, item map[string]any, recipientIDStr, workspaceIDStr string) bool {
 	recipientID, err := util.ParseUUID(recipientIDStr)
 	if err != nil || !recipientID.Valid {
 		return false
@@ -685,6 +715,10 @@ func (o *Outbound) tryEnqueueInbox(ctx context.Context, item map[string]any, ite
 		}
 		return false // no binding → nothing to deliver via bot
 	}
+	if o.senders == nil {
+		return false
+	}
+	sender := o.senders.get(binding.InstallationID)
 
 	// The card is a 1:1 push to a known Multica member, so their own profile
 	// language decides what it says — the one surface where the reader is
@@ -701,40 +735,49 @@ func (o *Outbound) tryEnqueueInbox(ctx context.Context, item map[string]any, ite
 	if content == "" {
 		return false
 	}
-	payload, err := json.Marshal(outboundPayload{Content: content})
-	if err != nil {
-		return false
-	}
-
 	// Smart-bot inbox notifications are 1:1 pushes to the bound user. The
 	// binding row's channel_user_id is the bot-scoped T-* userid — WeCom
 	// treats that as the chatid for a single (chat_type=1) send.
-	//
-	// The business key is the inbox item id, so a redelivered inbox:new event
-	// cannot notify the same member about the same item twice.
-	inserted, err := o.producer.Enqueue(ctx, outbox.Request{
-		InstallationID: binding.InstallationID,
-		WorkspaceID:    workspaceID,
-		SourceKind:     sourceKindInboxNotify,
-		SourceID:       itemIDStr,
-		TargetChatID:   binding.ChannelUserID,
-		TargetChatType: int16(chatTypeSingleInt),
-		MsgType:        msgTypeMarkdown,
-		Payload:        payload,
-	}, outbox.EnqueuePathRealtime)
-	if err != nil {
-		o.logger.WarnContext(ctx, "wecom outbound: enqueue inbox push failed",
-			"error", err, "installation_id", util.UUIDToString(binding.InstallationID),
+	if sender == nil {
+		// No socket here. Same shape as the reply path: hand it to the replica
+		// that holds one. An inbox push is as user-visible as an answer, and
+		// leaving it local was the reason the single-replica constraint had to
+		// stay even with replies routed.
+		if o.relay.publish(relayFrame{
+			Kind:           relayKindInbox,
+			InstallationID: util.UUIDToString(binding.InstallationID),
+			ChatID:         binding.ChannelUserID,
+			ChatType:       chatTypeSingleInt,
+			Content:        content,
+		}, relayInboxEventID(itemIDOf(item), recipientIDStr)) {
+			o.logger.DebugContext(ctx, "wecom outbound: routed an inbox push to the replica holding the socket",
+				"installation_id", uuidStringPub(binding.InstallationID))
+			return true
+		}
+		// Logged, not counted on the reply counters. Their documented unit is
+		// AGENT REPLIES, and an inbox notification recorded there would show up
+		// as a reply this adapter owed somebody and failed to deliver — the
+		// same unit error the relayed-inbox path in deliverRelayed already
+		// avoids, and the reason the delivered/dropped ratio can be read as an
+		// outcome at all. The member still receives this in the in-app inbox,
+		// which is what makes a missed bot push a degradation rather than a
+		// loss.
+		o.logger.WarnContext(ctx, "wecom outbound: inbox push not delivered and not routable",
+			"installation_id", uuidStringPub(binding.InstallationID),
 			"recipient_id", recipientIDStr)
-		return false
+		return false // supervisor down or reconnecting — no live connection
 	}
-	if inserted {
-		o.logger.DebugContext(ctx, "wecom outbound: inbox notification enqueued",
-			"installation_id", util.UUIDToString(binding.InstallationID),
-			"recipient_id", recipientIDStr,
-			"inbox_type", item["type"])
+	if err := sender.sendTextCtx(ctx, binding.ChannelUserID, chatTypeSingleInt, content); err != nil {
+		o.logger.WarnContext(ctx, "wecom outbound: inbox push failed",
+			"error", err, "installation_id", uuidStringPub(binding.InstallationID),
+			"recipient_id", recipientIDStr)
+		return false // send failed → no bot delivery
 	}
-	return inserted
+	o.logger.DebugContext(ctx, "wecom outbound: inbox delivered via bot",
+		"installation_id", uuidStringPub(binding.InstallationID),
+		"recipient_id", recipientIDStr,
+		"inbox_type", item["type"])
+	return true
 }
 
 // uuidStringPub renders a pgtype.UUID for a log line without depending on

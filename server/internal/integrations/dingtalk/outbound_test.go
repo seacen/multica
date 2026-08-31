@@ -10,12 +10,41 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/events"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
+
+type noDeliveryOutboundQueries struct{}
+
+func (noDeliveryOutboundQueries) GetChannelTaskDelivery(context.Context, pgtype.UUID) (db.ChannelTaskDelivery, error) {
+	return db.ChannelTaskDelivery{}, pgx.ErrNoRows
+}
+func (noDeliveryOutboundQueries) GetAgentTask(context.Context, pgtype.UUID) (db.AgentTaskQueue, error) {
+	panic("GetAgentTask must not run without a task delivery snapshot")
+}
+func (noDeliveryOutboundQueries) TaskHasChannelIngestedMessages(context.Context, pgtype.UUID) (bool, error) {
+	panic("TaskHasChannelIngestedMessages must not run without a task delivery snapshot")
+}
+func (noDeliveryOutboundQueries) GetChannelInstallation(context.Context, db.GetChannelInstallationParams) (db.ChannelInstallation, error) {
+	panic("GetChannelInstallation must not run without a task delivery snapshot")
+}
+
+func TestOutboundFailsClosedWithoutTaskDeliverySnapshot(t *testing.T) {
+	o := NewOutbound(noDeliveryOutboundQueries{}, nil, nil, nil)
+	event := events.Event{
+		Type:          protocol.EventChatDone,
+		TaskID:        "11111111-1111-1111-1111-111111111111",
+		ChatSessionID: "22222222-2222-2222-2222-222222222222",
+		Payload:       protocol.ChatDonePayload{Content: "must stay in Multica"},
+	}
+	if err := o.processEvent(context.Background(), event); err != nil {
+		t.Fatalf("processEvent: %v", err)
+	}
+}
 
 func TestEventContent(t *testing.T) {
 	cases := []struct {
@@ -79,8 +108,19 @@ func (f *fakeOutboundQueries) TaskHasChannelIngestedMessages(context.Context, pg
 	return f.channelIngested, nil
 }
 
-func (f *fakeOutboundQueries) GetChannelChatSessionBindingBySession(context.Context, db.GetChannelChatSessionBindingBySessionParams) (db.ChannelChatSessionBinding, error) {
-	return f.binding, nil
+// GetChannelTaskDelivery answers from the same binding stub the tests fill in.
+// ChannelType must be DingTalk's own: processEvent drops any delivery whose
+// channel is something else, so a zero value here would silence every case for
+// the wrong reason — including the one asserting silence.
+func (f *fakeOutboundQueries) GetChannelTaskDelivery(context.Context, pgtype.UUID) (db.ChannelTaskDelivery, error) {
+	return db.ChannelTaskDelivery{
+		BindingID:      f.binding.ID,
+		InstallationID: f.binding.InstallationID,
+		ChannelType:    string(TypeDingTalk),
+		ChannelChatID:  f.binding.ChannelChatID,
+		ChatType:       f.binding.ChatType,
+		Config:         f.binding.Config,
+	}, nil
 }
 
 func (f *fakeOutboundQueries) GetChannelInstallation(context.Context, db.GetChannelInstallationParams) (db.ChannelInstallation, error) {

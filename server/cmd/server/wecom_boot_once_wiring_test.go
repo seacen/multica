@@ -203,9 +203,9 @@ func TestWecomBootWiringIsWrittenExactlyOnce(t *testing.T) {
 	}
 
 	// Everything a merge can duplicate without the compiler noticing: bare call
-	// statements, calls inside their own `if` scope, and the reconciler append.
-	// Plain `x := ...` constructors are left out on purpose — duplicating one
-	// is "no new variables on left side of :=" and never builds.
+	// statements and calls inside their own `if` scope. Plain `x := ...`
+	// constructors are left out on purpose — duplicating one is "no new
+	// variables on left side of :=" and never builds.
 	wiring := []struct {
 		what  string
 		want  int
@@ -282,14 +282,6 @@ func TestWecomBootWiringIsWrittenExactlyOnce(t *testing.T) {
 			twice: "two typing-indicator managers exist over one stream store, so two of them race to open, " +
 				"refresh and seal the same bubble",
 			match: calleeIs("wecom.NewTypingIndicator"),
-		},
-		{
-			what: "outbox.NewReconciler",
-			want: 1,
-			twice: "two reconcilers are appended to h.ChannelOutboxReconcilers and main starts both. This one " +
-				"is an append, not an assignment, so the duplicate does not even overwrite — both run, both " +
-				"rescue the same missed reply, and the user gets it twice",
-			match: calleeIs("outbox.NewReconciler"),
 		},
 		{
 			what: "wecomInstall.SetNotify",

@@ -363,7 +363,21 @@ func (mc aibotMsgCallback) attachments() []InboundMedia {
 	// sender's own words. The Nth placeholder in the body is the Nth
 	// attachment here, and that correspondence is the only thing an agent has
 	// to work out which picture is which — 图文混排 already depends on it.
-	out := mc.Quote.media()
+	return append(mc.Quote.media(), mc.ownAttachments()...)
+}
+
+// ownAttachments is attachments() without the quoted message's — the files
+// this sender attached to THIS message.
+//
+// The distinction is not cosmetic. It decides whether a control command is a
+// turn of its own: normalizeWeComControlLayout treats a bare "/clear" with
+// media as a real message rather than the shared pending sentinel, and quoting
+// a colleague's screenshot is not the same act as attaching one. Measured with
+// attachments(), replying "/clear" under any picture anybody ever posted
+// produced an empty body and an empty CommandText, and the sender got a turn
+// with nothing in it.
+func (mc aibotMsgCallback) ownAttachments() []InboundMedia {
+	var out []InboundMedia
 	if body, kind, ok := mediaFor(mc.MsgType, mc.Image, mc.File, mc.Video); ok {
 		if strings.TrimSpace(body.URL) != "" {
 			out = append(out, InboundMedia{Kind: kind, URL: body.URL, AESKey: body.AESKey})
@@ -650,8 +664,9 @@ func (m InboundMedia) inline(ref channel.MediaRef) channel.MediaRef {
 // group message on the wire — WeCom only forwards to the bot when it was
 // addressed, so any received group message counts as addressed.
 //
-// c is the destination's copy pack, needed again here to recompose the body
-// when a directive is stripped off it — see forceFresh below.
+// c is the destination's copy pack, needed again here to put the quote block
+// back on a body normalizeWeComControlLayout rebuilt from the sender's own
+// runs — see the ForceFresh path below.
 //
 // text is the agent-readable body the caller already resolved via routableText.
 // It is passed in rather than recomputed because the caller has to know
@@ -679,7 +694,7 @@ func channelMessageFromCallback(botID, botDisplayName string, mc aibotMsgCallbac
 	// its "/issue …" on the first line the parser reads.
 	//
 	// In a group the @-mention IS how you reach the bot, so it arrives glued to
-	// whatever was typed after it — "@Andrew /new" is a person asking for a
+	// whatever was typed after it — "@Andrew /clear" is a person asking for a
 	// fresh session, not prose that happens to contain a word — and the
 	// addressing comes off the front.
 	//
@@ -695,31 +710,47 @@ func channelMessageFromCallback(botID, botDisplayName string, mc aibotMsgCallbac
 	if chatType == channel.ChatTypeGroup {
 		command = stripLeadingMentions(command, botDisplayName)
 	}
+	media := mc.attachments()
+	// hasMedia is read off the sender's OWN attachments, not media: media
+	// leads with the quoted message's files, and a quoted picture is not a
+	// file this sender attached. Passing len(media) > 0 let a bare "/clear"
+	// under somebody else's screenshot past the guard below, and the sender
+	// got an empty turn.
+	normalizedText, control, controlNormalized := normalizeWeComControlLayout(
+		mc, text, command, chatType, botDisplayName, len(mc.ownAttachments()) > 0,
+	)
+	if controlNormalized {
+		text = normalizedText
 
-	// A fresh-session directive behind a quote loses its subject.
-	// The shape is ordinary: somebody quotes a colleague's line — "Q3 毛利率
-	// 42.1%" — and types "/new 重新分析这个数" under it. The router strips the
-	// directive off CommandText and puts what is left into Text, and what is
-	// left is the sender's own words WITHOUT the quote block routableText had
-	// rendered above them. So a fresh session opened and the agent was asked
-	// to re-analyse a number it was never shown, in a session that by
-	// construction holds no earlier context to find it in.
-	//
-	// Recomposing here — quote block, then the stripped body — and declaring
-	// ForceFresh tells the router the adapter has already stripped, so it
-	// leaves Text alone. Same arrangement Feishu uses for its enriched
-	// bodies. CommandText stays unstripped so the shared parser still
-	// classifies the command the same way on every platform.
-	//
-	// A bare "/new" behind a quote is deliberately left alone: the router
-	// returns before storing anything, so recomposing would be inert, and
-	// claiming ForceFresh for a message that is never written is a lie about
-	// state.
-	forceFresh := false
-	if body, ok := engine.ParseFreshSessionCommand(command); ok && strings.TrimSpace(body) != "" {
+		// A control directive behind a quote loses its subject. The shape is
+		// ordinary: somebody quotes a colleague's line — "Q3 毛利率 42.1%" —
+		// and types "/clear 重新分析这个数" under it. normalizeWeComControlLayout
+		// rebuilds the body from the sender's own runs, which is what keeps a
+		// 图文混排 message's "[Image]" placeholders where they were, and the
+		// quote block routableText had rendered above those runs is not one of
+		// them. Left there, a fresh session opened and the agent was asked to
+		// re-analyse a number it was never shown, in a session that by
+		// construction holds no earlier context to find it in.
+		//
+		// So put the quote back. Declaring ForceFresh below tells the router
+		// the adapter has already stripped the directive, so it leaves Text
+		// alone — the same arrangement Feishu uses for its enriched bodies.
+		// CommandText stays unstripped so the shared parser still classifies
+		// the command the same way on every platform.
 		if quoted := mc.Quote.render(); quoted != "" {
-			text = renderQuoteBlock(c, quoted) + "\n" + body
-			forceFresh = true
+			if strings.TrimSpace(text) == "" {
+				text = renderQuoteBlock(c, quoted)
+			} else {
+				text = renderQuoteBlock(c, quoted) + "\n" + text
+			}
+		}
+
+		// A media-bearing bare /clear is a real turn, not the shared pending
+		// sentinel. ForceFresh below carries the already-consumed directive.
+		// After the quote is back, so the turn is the whole thing the sender
+		// is looking at rather than an empty string.
+		if control.Kind == engine.ControlCommandFreshSession && control.Body == "" {
+			command = text
 		}
 	}
 
@@ -732,7 +763,7 @@ func channelMessageFromCallback(botID, botDisplayName string, mc aibotMsgCallbac
 		SenderUserID: senderID,
 		Content:      text,
 		ReqID:        reqID,
-		Media:        mc.attachments(),
+		Media:        media,
 	}
 	raw, _ := json.Marshal(wm)
 
@@ -751,8 +782,10 @@ func channelMessageFromCallback(botID, botDisplayName string, mc aibotMsgCallbac
 		// (feishu_channel.go:139) and Slack from its cleaned text
 		// (slack/inbound.go:131); WeCom was the one adapter leaving it empty.
 		CommandText: command,
-		// Set only when we recomposed Text above; see the comment there.
-		ForceFresh: forceFresh,
+		// Set only when the adapter already took the directive out of Text
+		// above; see the comment there. FreshSession only — /new is left to
+		// the router, which does not overwrite a recomposed Text for it.
+		ForceFresh: controlNormalized && control.Kind == engine.ControlCommandFreshSession,
 		// A pure /issue command in WeCom should NOT trigger the
 		// agent — the engine already creates the issue and the
 		// OutboundReplier already sends "✅ 已创建 #N". Letting the agent
@@ -780,6 +813,68 @@ func channelMessageFromCallback(botID, botDisplayName string, mc aibotMsgCallbac
 	}
 }
 
+// normalizeWeComControlLayout removes /clear or /new from the agent-readable
+// body while retaining media placeholders in their original mixed-message
+// positions. CommandText remains the sender-authored, placeholder-free source
+// so Router alone applies the semantic difference between the directives.
+func normalizeWeComControlLayout(
+	mc aibotMsgCallback,
+	visible string,
+	command string,
+	chatType channel.ChatType,
+	botDisplayName string,
+	hasMedia bool,
+) (string, engine.ControlCommand, bool) {
+	control, ok := engine.ParseControlCommand(command)
+	if !ok || (control.Body == "" && !hasMedia) {
+		return visible, engine.ControlCommand{}, false
+	}
+
+	normalizeWords := func(words string) string {
+		if chatType == channel.ChatTypeGroup {
+			return stripLeadingMentions(words, botDisplayName)
+		}
+		return strings.TrimSpace(words)
+	}
+
+	switch strings.ToLower(mc.MsgType) {
+	case "text":
+		itemControl, itemOK := engine.ParseControlCommand(normalizeWords(mc.Text.Content))
+		if !itemOK || itemControl.Kind != control.Kind {
+			return visible, engine.ControlCommand{}, false
+		}
+		return itemControl.Body, control, true
+	case "voice":
+		itemControl, itemOK := engine.ParseControlCommand(normalizeWords(mc.Voice.Content))
+		if !itemOK || itemControl.Kind != control.Kind {
+			return visible, engine.ControlCommand{}, false
+		}
+		return itemControl.Body, control, true
+	case "mixed":
+		var runs []string
+		consumed := false
+		for _, item := range mc.Mixed.MsgItem {
+			rendered := item.render()
+			if !consumed {
+				if words := item.words(); words != "" {
+					itemControl, itemOK := engine.ParseControlCommand(normalizeWords(words))
+					if itemOK && itemControl.Kind == control.Kind {
+						rendered = itemControl.Body
+						consumed = true
+					}
+				}
+			}
+			if rendered != "" {
+				runs = append(runs, rendered)
+			}
+		}
+		if consumed {
+			return strings.Join(runs, "\n"), control, true
+		}
+	}
+	return visible, engine.ControlCommand{}, false
+}
+
 // stripLeadingMentions removes the @-mentions a message opens with, which in a
 // group chat is how the sender addresses the bot. WeCom puts them in the text
 // and sends no mention list alongside it, so there is nothing to match against
@@ -793,8 +888,10 @@ func channelMessageFromCallback(botID, botDisplayName string, mc aibotMsgCallbac
 // somebody — "@Andrew ask @李雷 about yesterday" is one instruction naming one
 // colleague — and stripping that would quietly rewrite what they said.
 //
-// This feeds command classification only. The stored message keeps the text
-// exactly as it arrived, so the transcript still shows who was addressed.
+// This primarily feeds command classification. For a recognized /clear or /new,
+// normalizeWeComControlLayout also applies the same addressing cleanup while
+// rebuilding the agent-visible mixed-media body, so neither the bot mention nor
+// the consumed directive is persisted as prompt text.
 //
 // Slack does the same thing with a regex over its mention token
 // (slack/inbound.go cleanText); Feishu is handed an already-clean command body
@@ -807,7 +904,7 @@ func stripLeadingMentions(s, botName string) string {
 		}
 		// Our own name first, matched whole. A display name may contain
 		// spaces — "Multica Bot" is the obvious one — and cutting at the
-		// first space would leave "Bot /new 重新分析", which is not a command,
+		// first space would leave "Bot /clear 重新分析", which is not a command,
 		// so every slash command in that group would still be dropped.
 		//
 		// The name is not guessed. It comes from the installation config, set
@@ -894,9 +991,7 @@ func subscribeBody(botID, secret string) map[string]any {
 	return map[string]any{"bot_id": botID, "secret": secret}
 }
 
-// msgTypeMarkdown is the only aibot msgtype the adapter writes. It is also
-// what lands in channel_outbound_queue.msg_type, so the queue records what
-// wire form a row was enqueued as rather than assuming one at send time.
+// msgTypeMarkdown is the only aibot msgtype the adapter writes.
 const msgTypeMarkdown = "markdown"
 
 // sendMsgTextBody builds an aibot_send_msg body carrying plain-text

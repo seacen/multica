@@ -190,8 +190,10 @@ var (
 	// while waiting for its verdict or on the way to the wire.
 	errStreamSuperseded = errors.New("wecom: stream frame superseded by the closing frame")
 
-	// errNoLiveConnection — the installation has no socket right now.
-	errNoLiveConnection = errors.New("wecom: no live connection for installation")
+	// errNoLiveConnection lives in outbound_outcome.go: classifyDrop matches on
+	// it to file a delivery under no_live_connection, and two sentinels with
+	// the same meaning would split that counter in half depending on which
+	// layer raised it.
 )
 
 // ackWaiter is one stream frame's standing request for a verdict. seq is where

@@ -13,7 +13,7 @@ import { Callout } from "fumadocs-ui/components/callout";
 
 对话也可以携带背景。点击输入框左下角的 **+**，选择**项目上下文**，为对话挂上一个[项目](/projects)；智能体执行时会收到该项目的描述和仓库等资源。
 
-![与智能体的对话：提问后得到整理成表格的回答](/images/docs/chat-conversation.png)
+![与智能体的对话：提问后得到整理成表格的回答](/images/docs/chat-conversation.webp)
 
 ## 开始对话
 
@@ -23,6 +23,8 @@ import { Callout } from "fumadocs-ui/components/callout";
 4. 发送后，Multica 会为这条消息创建一次执行，回复会回到当前对话。
 
 运行时离线时，消息会等待它重新上线。智能体被归档，或者你失去调用权限后，不能继续发送新消息。
+
+第一条消息发送前，对话页会显示所选智能体配置的最多三个建议。选择后会把完整提示词填入输入框而不会发送，方便你先调整。未配置建议的智能体会使用本地化的通用示例。
 
 ## 对话与 issue 的选择
 

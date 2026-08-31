@@ -829,7 +829,7 @@ INSERT INTO channel_outbound_queue (
     'sent', now()
 )
 ON CONFLICT (installation_id, source_kind, source_id) DO NOTHING
-RETURNING id, installation_id, workspace_id, channel_type, chat_session_id, source_kind, source_id, target_chat_id, target_chat_type, msg_type, payload_version, payload, status, attempts, next_attempt_at, lease_token, lease_expires_at, sent_at, last_error, created_at, updated_at
+RETURNING id, seq, installation_id, workspace_id, channel_type, chat_session_id, source_kind, source_id, target_chat_id, target_chat_type, msg_type, payload_version, payload, status, attempts, next_attempt_at, lease_token, lease_expires_at, sent_at, last_error, created_at, updated_at
 `
 
 type RecordChannelOutboundDeliveredParams struct {
@@ -881,6 +881,7 @@ func (q *Queries) RecordChannelOutboundDelivered(ctx context.Context, arg Record
 	var i ChannelOutboundQueue
 	err := row.Scan(
 		&i.ID,
+		&i.Seq,
 		&i.InstallationID,
 		&i.WorkspaceID,
 		&i.ChannelType,

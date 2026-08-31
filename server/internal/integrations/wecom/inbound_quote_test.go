@@ -467,17 +467,22 @@ func TestTheCommandIsTheBodyWhenNothingIsQuoted(t *testing.T) {
 	}
 }
 
-// /new under a quote must keep the quote.
+// /clear under a quote must keep the quote.
 //
 // This is the ordinary shape of the request: quote the number, ask for it to
-// be looked at again in a clean session. The router strips the directive off
-// CommandText and writes what is left into Text — the sender's own words,
-// without the quote block. So the agent was asked to re-analyse a figure it
-// had never been shown, in a session that by construction holds no earlier
-// context to find it in.
+// be looked at again with the context cleared. The adapter rebuilds the body
+// from the sender's own runs, which is what keeps a mixed message's
+// placeholders in place, and the quote block is not one of those runs — so
+// without putting it back the agent is asked to re-analyse a figure it was
+// never shown, in a session that by construction holds no earlier context to
+// find it in.
+//
+// /clear, not /new: since #7468 they are two commands. /clear is the one that
+// clears context in the conversation the sender is already in, and it is the
+// only one the adapter declares ForceFresh for.
 func TestAFreshSessionUnderAQuoteKeepsTheQuote(t *testing.T) {
 	t.Parallel()
-	got, _, _ := dispatchOne(t, quotingFrame("msg-q9", "/new 重新分析这个数", map[string]any{
+	got, _, _ := dispatchOne(t, quotingFrame("msg-q9", "/clear 重新分析这个数", map[string]any{
 		"msgtype": "text",
 		"text":    map[string]any{"content": "Q3 毛利率 42.1%"},
 	}))
@@ -491,40 +496,69 @@ func TestAFreshSessionUnderAQuoteKeepsTheQuote(t *testing.T) {
 	if !strings.Contains(got.Text, "重新分析这个数") {
 		t.Fatalf("Text = %q, want the sender's own words", got.Text)
 	}
-	if strings.Contains(got.Text, "/new") {
+	if strings.Contains(got.Text, "/clear") {
 		t.Fatalf("Text = %q, want the directive stripped", got.Text)
 	}
 	// CommandText stays as typed so the shared parser classifies it the same
 	// way it does on every other platform.
-	if got.CommandText != "/new 重新分析这个数" {
+	if got.CommandText != "/clear 重新分析这个数" {
 		t.Fatalf("CommandText = %q, want the command as the user typed it", got.CommandText)
 	}
 }
 
-// A bare /new behind a quote is left alone: the router returns before it
+// A bare /clear behind a quote is left alone: the router returns before it
 // stores anything, so recomposing Text would only be inert — and claiming
 // ForceFresh for a message that is never written is a lie about state.
 func TestABareFreshCommandUnderAQuoteIsNotRecomposed(t *testing.T) {
 	t.Parallel()
-	got, _, _ := dispatchOne(t, quotingFrame("msg-q10", "/new", map[string]any{
+	got, _, _ := dispatchOne(t, quotingFrame("msg-q10", "/clear", map[string]any{
 		"msgtype": "text",
 		"text":    map[string]any{"content": "Q3 毛利率 42.1%"},
 	}))
 	if got.ForceFresh {
-		t.Fatal("a bare /new must not claim the adapter already stripped anything")
+		t.Fatal("a bare /clear must not claim the adapter already stripped anything")
 	}
 }
 
-// Without a quote there is nothing to preserve, so the router keeps doing the
-// stripping — the adapter must not take that over and leave "/new" in Text.
-func TestAFreshSessionWithoutAQuoteIsLeftToTheRouter(t *testing.T) {
+// The same bare /clear, under a quote that carries a picture. A file the
+// SENDER attached makes a bare /clear a real turn; a picture in the message
+// they quoted does not, and reading the two as one leaves the body and the
+// command source both empty — the sender gets a turn with nothing in it, and
+// the router cannot even tell a control command arrived.
+func TestABareFreshCommandUnderAQuotedImageIsNotRecomposed(t *testing.T) {
 	t.Parallel()
-	got, _, _ := dispatchOne(t, quotingFrame("msg-q11", "/new 重新分析", nil))
+	got, _, _ := dispatchOne(t, quotingFrame("msg-q10b", "/clear", map[string]any{
+		"msgtype": "image",
+		"image":   map[string]any{"url": "https://cos.invalid/theirs.enc", "aeskey": testAESKey},
+	}))
 	if got.ForceFresh {
-		t.Fatal("ForceFresh set with no quote to preserve; the router would then leave /new in Text")
+		t.Fatal("a quoted picture made a bare /clear look like an attachment-bearing turn")
 	}
-	if got.Text != "/new 重新分析" {
-		t.Fatalf("Text = %q, want it untouched for the router", got.Text)
+	if got.CommandText != "/clear" {
+		t.Fatalf("CommandText = %q, want the bare directive — emptied, the router cannot see a command at all", got.CommandText)
+	}
+	if !strings.Contains(got.Text, "[Image: unavailable]") {
+		t.Fatalf("Text = %q, want the quoted picture's placeholder still in it", got.Text)
+	}
+}
+
+// With no quote there is nothing to put back, but the adapter still strips.
+//
+// This inverts what the test asserted before #7362: normalization is now the
+// adapter's job on every /clear, quoted or not, and only the semantics stay
+// with the router. Text arrives already stripped and ForceFresh says so, which
+// is what stops the router stripping a second time.
+func TestAFreshSessionWithoutAQuoteIsNormalizedByTheAdapter(t *testing.T) {
+	t.Parallel()
+	got, _, _ := dispatchOne(t, quotingFrame("msg-q11", "/clear 重新分析", nil))
+	if !got.ForceFresh {
+		t.Fatal("ForceFresh is unset although the adapter already took /clear out of Text; the router will strip the stripped body again")
+	}
+	if got.Text != "重新分析" {
+		t.Fatalf("Text = %q, want the directive stripped off the sender's words", got.Text)
+	}
+	if got.CommandText != "/clear 重新分析" {
+		t.Fatalf("CommandText = %q, want the command as the user typed it", got.CommandText)
 	}
 }
 

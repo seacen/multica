@@ -65,9 +65,9 @@ func (b *kimiBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 	// a safe granting option the agent offered (see
 	// selectACPApprovalOptionID) for each session/request_permission request.
 	kimiArgs := append([]string{"acp"}, filterCustomArgs(opts.CustomArgs, kimiBlockedArgs, b.cfg.Logger)...)
-	cmd := exec.CommandContext(runCtx, execPath, kimiArgs...)
+	cmd := b.cfg.commandAt(execPath).exec(runCtx, kimiArgs...)
 	hideAgentWindow(cmd)
-	b.cfg.Logger.Info("agent command", "exec", execPath, "args", kimiArgs)
+	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs(kimiArgs, trustAgentCommandPositional(0, "acp")))
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}
@@ -102,7 +102,7 @@ func (b *kimiBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 		return nil, fmt.Errorf("kimi stderr pipe: %w", err)
 	}
 
-	if err := cmd.Start(); err != nil {
+	if err := startOwnedProcessTree(cmd, b.cfg.Logger); err != nil {
 		cancel()
 		return nil, fmt.Errorf("start kimi: %w", err)
 	}
@@ -135,10 +135,15 @@ func (b *kimiBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 
 	// Reuse the hermesClient ACP transport — Kimi speaks the same protocol.
 	c := &hermesClient{
-		cfg:          b.cfg,
-		stdin:        stdin,
-		pending:      make(map[int]*pendingRPC),
-		pendingTools: make(map[string]*pendingToolCall),
+		cfg:             b.cfg,
+		stdin:           stdin,
+		pending:         make(map[int]*pendingRPC),
+		pendingTools:    make(map[string]*pendingToolCall),
+		terminalEnabled: true,
+		terminalCtx:     runCtx,
+		terminalCwd:     opts.Cwd,
+		terminalEnv:     buildEnv(b.cfg.Env),
+		terminals:       make(map[string]*acpTerminal),
 		acceptNotification: func(string) bool {
 			return streamingCurrentTurn.Load()
 		},
@@ -200,6 +205,7 @@ func (b *kimiBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 		defer func() {
 			stdin.Close()
 			_ = cmd.Wait()
+			releaseProcessGroup(cmd)
 		}()
 
 		startTime := time.Now()
@@ -218,7 +224,9 @@ func (b *kimiBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 				"name":    "multica-agent-sdk",
 				"version": "0.2.0",
 			},
-			"clientCapabilities": map[string]any{},
+			"clientCapabilities": map[string]any{
+				"terminal": true,
+			},
 		})
 		if err != nil {
 			finalStatus = "failed"

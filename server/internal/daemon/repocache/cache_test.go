@@ -3,6 +3,7 @@ package repocache
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -116,6 +117,251 @@ func TestRunGitOutputTimesOut(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "timed out after 0s") {
 		t.Fatalf("runGitOutputWithTimeout error = %v, want timeout context", err)
+	}
+}
+
+func TestNewGitCommandUsesStableWorkingDirectory(t *testing.T) {
+	cmd := newGitCommand("--version")
+	if cmd.Dir == "" {
+		t.Fatal("newGitCommand Dir is empty; Git would inherit the daemon working directory")
+	}
+	if !filepath.IsAbs(cmd.Dir) {
+		t.Fatalf("newGitCommand Dir = %q, want an absolute path", cmd.Dir)
+	}
+	if info, err := os.Stat(cmd.Dir); err != nil {
+		t.Fatalf("newGitCommand Dir = %q is unavailable: %v", cmd.Dir, err)
+	} else if !info.IsDir() {
+		t.Fatalf("newGitCommand Dir = %q is not a directory", cmd.Dir)
+	}
+}
+
+func TestSyncSurvivesDeletedProcessWorkingDirectory(t *testing.T) {
+	sourceRepo := createTestRepo(t)
+	cacheRoot := t.TempDir()
+	originalCWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get original working directory: %v", err)
+	}
+	deletedRoot := t.TempDir()
+	deletedCWD := filepath.Join(deletedRoot, "worktree")
+	if err := os.Mkdir(deletedCWD, 0o755); err != nil {
+		t.Fatalf("create disposable working directory: %v", err)
+	}
+	if err := os.Chdir(deletedCWD); err != nil {
+		t.Fatalf("chdir to disposable working directory: %v", err)
+	}
+	defer func() {
+		if err := os.Chdir(originalCWD); err != nil {
+			t.Errorf("restore working directory: %v", err)
+		}
+	}()
+	if err := os.RemoveAll(deletedRoot); err != nil {
+		t.Skipf("platform does not allow removing the process working directory: %v", err)
+	}
+
+	cache := New(cacheRoot, testLogger())
+	if err := cache.Sync("ws-deleted-cwd", []RepoInfo{{URL: sourceRepo}}); err != nil {
+		t.Fatalf("Sync with deleted process working directory failed: %v", err)
+	}
+	if cachedPath := cache.Lookup("ws-deleted-cwd", sourceRepo); !isBareRepo(cachedPath) {
+		t.Fatalf("expected synced bare repo, got %q", cachedPath)
+	}
+}
+
+func TestRepoMaintenanceYieldsToForeground(t *testing.T) {
+	t.Parallel()
+
+	cache := New(t.TempDir(), testLogger())
+	const barePath = "/cache/repo.git"
+	entered := make(chan struct{})
+	maintenanceDone := make(chan error, 1)
+	go func() {
+		ran, err := cache.WithRepoMaintenance(context.Background(), barePath, func(ctx context.Context) error {
+			close(entered)
+			<-ctx.Done()
+			return context.Cause(ctx)
+		})
+		if !ran && err == nil {
+			err = errors.New("maintenance did not run")
+		}
+		maintenanceDone <- err
+	}()
+	<-entered
+
+	foregroundDone := make(chan error, 1)
+	go func() {
+		foregroundDone <- cache.WithRepoLockContext(context.Background(), barePath, func() error { return nil })
+	}()
+
+	select {
+	case err := <-foregroundDone:
+		if err != nil {
+			t.Fatalf("foreground lock: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("foreground work did not preempt maintenance")
+	}
+	if err := <-maintenanceDone; !errors.Is(err, ErrMaintenancePreempted) {
+		t.Fatalf("maintenance error = %v, want preemption", err)
+	}
+	activity := cache.Activity()
+	if activity.MaintenanceActive != 0 || activity.ForegroundWaiters != 0 {
+		t.Fatalf("activity after release = %+v, want zero", activity)
+	}
+}
+
+func TestCancelMaintenanceStopsMaintenanceWithoutARepoCheckout(t *testing.T) {
+	t.Parallel()
+
+	cache := New(t.TempDir(), testLogger())
+	const barePath = "/cache/reused-worktree.git"
+	entered := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		ran, err := cache.WithRepoMaintenance(context.Background(), barePath, func(ctx context.Context) error {
+			close(entered)
+			<-ctx.Done()
+			return context.Cause(ctx)
+		})
+		if !ran && err == nil {
+			err = errors.New("maintenance did not run")
+		}
+		done <- err
+	}()
+	<-entered
+
+	cache.CancelMaintenance()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrMaintenancePreempted) {
+			t.Fatalf("maintenance error = %v, want preemption", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("maintenance did not stop after task-level cancellation")
+	}
+
+	if got := cache.Activity().MaintenanceActive; got != 0 {
+		t.Fatalf("maintenance active after cancellation = %d, want 0", got)
+	}
+}
+
+func TestCancelMaintenanceWaitsForCleanupBarrier(t *testing.T) {
+	t.Parallel()
+
+	cache := New(t.TempDir(), testLogger())
+	const barePath = "/cache/cleanup-barrier.git"
+	entered := make(chan struct{})
+	cancelled := make(chan struct{})
+	releaseCleanup := make(chan struct{})
+	maintenanceDone := make(chan struct{})
+	go func() {
+		_, _ = cache.WithRepoMaintenance(context.Background(), barePath, func(ctx context.Context) error {
+			close(entered)
+			<-ctx.Done()
+			close(cancelled)
+			<-releaseCleanup
+			return context.Cause(ctx)
+		})
+		close(maintenanceDone)
+	}()
+	<-entered
+
+	cancelDone := make(chan struct{})
+	go func() {
+		cache.CancelMaintenance()
+		close(cancelDone)
+	}()
+	<-cancelled
+	select {
+	case <-cancelDone:
+		t.Fatal("CancelMaintenance returned before maintenance cleanup released the repo")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(releaseCleanup)
+	select {
+	case <-cancelDone:
+	case <-time.After(time.Second):
+		t.Fatal("CancelMaintenance did not return after maintenance cleanup completed")
+	}
+	<-maintenanceDone
+}
+
+func TestCreateWorktreeContextReturnsBusyAfterBoundedLockWait(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	cache := New(root, testLogger())
+	const (
+		workspaceID = "ws-1"
+		repoURL     = "https://github.com/org/repo.git"
+	)
+	barePath := cache.BarePath(workspaceID, repoURL)
+	if err := os.MkdirAll(barePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(barePath, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	lock := cache.lockForRepo(barePath)
+	lock.Lock()
+	defer lock.Unlock()
+
+	_, err := cache.CreateWorktreeContext(context.Background(), WorktreeParams{
+		WorkspaceID:     workspaceID,
+		RepoURL:         repoURL,
+		WorkDir:         t.TempDir(),
+		LockWaitTimeout: 20 * time.Millisecond,
+	})
+	if !errors.Is(err, ErrRepoBusy) {
+		t.Fatalf("CreateWorktreeContext error = %v, want ErrRepoBusy", err)
+	}
+}
+
+func TestCreateWorktreeContextCancelsRunningGitProcessTree(t *testing.T) {
+	binDir := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "git-descendant-survived")
+	script := filepath.Join(binDir, "git")
+	body := "#!/bin/sh\n(sleep 0.5; echo leaked > \"$MULTICA_TEST_GIT_MARKER\") &\nwait\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("MULTICA_TEST_GIT_MARKER", marker)
+
+	root := t.TempDir()
+	cache := New(root, testLogger())
+	const (
+		workspaceID = "ws-1"
+		repoURL     = "https://github.com/org/repo.git"
+	)
+	barePath := cache.BarePath(workspaceID, repoURL)
+	if err := os.MkdirAll(barePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(barePath, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := cache.CreateWorktreeContext(ctx, WorktreeParams{
+		WorkspaceID: workspaceID,
+		RepoURL:     repoURL,
+		WorkDir:     t.TempDir(),
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CreateWorktreeContext error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("CreateWorktreeContext took %s after cancellation", elapsed)
+	}
+
+	time.Sleep(600 * time.Millisecond)
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("Git descendant survived checkout cancellation, stat error = %v", err)
 	}
 }
 
@@ -854,19 +1100,22 @@ func TestCreateWorktreeExcludesOpenCodeSkills(t *testing.T) {
 	if !strings.Contains(exclude, ".opencode\n") {
 		t.Fatalf("expected .git/info/exclude to contain .opencode, got:\n%s", exclude)
 	}
+	if !strings.Contains(exclude, ".codeartsdoer\n") {
+		t.Fatalf("expected .git/info/exclude to contain .codeartsdoer, got:\n%s", exclude)
+	}
 	if strings.Contains(exclude, ".config/opencode") {
 		t.Fatalf("expected .git/info/exclude to not contain stale .config/opencode, got:\n%s", exclude)
 	}
 }
 
-// TestCreateWorktreeExcludesCodebuddySidecars is the regression guard for
+// TestCreateWorktreeExcludesAgentSidecars is the regression guard for
 // PR #5224's review feedback: once the daemon started writing
 // .codebuddy/skills/ and CODEBUDDY.md into the task workdir (instead of
 // reusing Claude's .claude/CLAUDE.md, which were already excluded), the
 // repo-cache worktree needed the new CodeBuddy sidecar paths added to
 // .git/info/exclude too — otherwise these daemon-injected files show up in
 // `git status` and risk being committed by the agent.
-func TestCreateWorktreeExcludesCodebuddySidecars(t *testing.T) {
+func TestCreateWorktreeExcludesAgentSidecars(t *testing.T) {
 	t.Parallel()
 	sourceRepo := createTestRepo(t)
 	cacheRoot := t.TempDir()
@@ -894,6 +1143,11 @@ func TestCreateWorktreeExcludesCodebuddySidecars(t *testing.T) {
 	}
 	if !strings.Contains(exclude, "CODEBUDDY.md\n") {
 		t.Fatalf("expected .git/info/exclude to contain CODEBUDDY.md, got:\n%s", exclude)
+	}
+	for _, pattern := range []string{".pi\n", ".omp\n"} {
+		if !strings.Contains(exclude, pattern) {
+			t.Fatalf("expected .git/info/exclude to contain %q, got:\n%s", pattern, exclude)
+		}
 	}
 }
 
@@ -1957,5 +2211,42 @@ func TestBarePathIsIndependentOfExistence(t *testing.T) {
 	}
 	if cache.Lookup("ws-1", "https://example.com/acme/widgets.git") != "" {
 		t.Error("Lookup must still report an uncached repo as absent")
+	}
+}
+
+// TestTaskKeyMatchesExecenvContract pins this package's copy of the task-segment
+// rule. execenv, repocache and the agent handler each carry one — execenv owns
+// the canonical taskKey, and the handler has a contract test against
+// PredictRootDir, but this copy had none and could drift silently.
+//
+// Both properties matter. The segment must come from the id's random TAIL:
+// UUIDv7 leads with a millisecond timestamp, so a leading slice is identical
+// for every task created in the same ~65.5s window, which gave two concurrent
+// tasks of one agent the same branch name (#7326). And it must stay SHORT: a
+// branch name becomes a path under .git/refs/heads/ inside the task checkout,
+// where Windows enforces MAX_PATH.
+func TestTaskKeyMatchesExecenvContract(t *testing.T) {
+	t.Parallel()
+	const id = "01a01ec0-e69d-7000-8000-0123456789ab"
+	if got, want := taskKey(id), "0123456789ab"; got != want {
+		t.Fatalf("taskKey(%q) = %q, want %q — the segment must be the random tail, not the timestamp head", id, got, want)
+	}
+	if got := taskKey(id); len(got) != taskKeyLen {
+		t.Fatalf("taskKey len = %d, want %d — long segments overflow MAX_PATH on Windows", len(got), taskKeyLen)
+	}
+	if got := taskKey("abc"); got != "abc" {
+		t.Fatalf("taskKey on a sub-length input = %q, want it returned as-is", got)
+	}
+}
+
+// TestBranchNameDistinctForSharedUUIDv7Prefix is the branch-name half of the
+// #7326 regression: two tasks created inside one timestamp window must not ask
+// git for the same ref.
+func TestBranchNameDistinctForSharedUUIDv7Prefix(t *testing.T) {
+	t.Parallel()
+	a := fmt.Sprintf("agent/%s/%s", sanitizeName("Windows Codex"), taskKey("01a01ec0-e69d-7000-8000-000000000001"))
+	b := fmt.Sprintf("agent/%s/%s", sanitizeName("Windows Codex"), taskKey("01a01ec0-f014-7000-8000-000000000002"))
+	if a == b {
+		t.Fatalf("both tasks resolved to branch %q", a)
 	}
 }

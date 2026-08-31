@@ -92,9 +92,9 @@ func NewOutboundReplier(cfg OutboundReplierConfig) *OutboundReplier {
 		logger = slog.Default()
 	}
 	r := &OutboundReplier{
-		senders:   cfg.Senders,
-		languages: cfg.Languages,
-		appURL:    strings.TrimRight(cfg.AppURL, "/"),
+		senders:     cfg.Senders,
+		languages:   cfg.Languages,
+		appURL:      strings.TrimRight(cfg.AppURL, "/"),
 		bindingPath: normalizeBindingPath(cfg.BindingPath),
 		logger:      logger,
 	}
@@ -140,6 +140,11 @@ func (r *OutboundReplier) Reply(ctx context.Context, inst engine.ResolvedInstall
 	case engine.OutcomeFreshPending:
 		if err := r.post(ctx, inst, msg, c.FreshPending); err != nil {
 			r.logger.WarnContext(ctx, "wecom replier: fresh-start confirmation failed",
+				"installation_id", util.UUIDToString(inst.ID), "error", err)
+		}
+	case engine.OutcomeChatStarted:
+		if err := r.post(ctx, inst, msg, c.ChatStarted); err != nil {
+			r.logger.WarnContext(ctx, "wecom replier: new-chat confirmation failed",
 				"installation_id", util.UUIDToString(inst.ID), "error", err)
 		}
 	case engine.OutcomeIssueUsage:

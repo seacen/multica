@@ -17,26 +17,34 @@
 // active connection per installation across processes) already holds without
 // wecom-specific code.
 //
-// Maintenance: this package is COMMUNITY-MAINTAINED. @leroy-chen contributed it
-// and co-owns it with @seacen — they are the first stop for WeCom-specific bugs
-// and behavior questions, on a best-effort volunteer basis. The Multica team
-// keeps this package compiling and its tests green through shared-layer
-// refactors, but does not use WeCom and cannot verify behavior against the real
-// platform; that part depends on the code owners. If the integration breaks in a
-// way that cannot be fixed without real WeCom access and no fix lands for a few
-// releases, it may be deprecated rather than left quietly broken. Changing the
-// shared channel engine? Keep this adapter building — and loop in the code
-// owners for anything that changes WeCom-visible behavior.
+// Maintenance: this package is COMMUNITY-MAINTAINED. Its maintainers, the
+// support boundary and the retirement rule are published at
+// https://multica.ai/docs/community-maintained
+// (apps/docs/content/docs/community-maintained.mdx, four locales). That page
+// is the single source of truth — record ownership changes there, not here.
+// Changing the shared channel engine? Keep this adapter building, and loop in
+// its maintainers for anything that changes WeCom-visible behavior.
 //
 // Inbound handles text, the transcript WeCom returns for a voice note,
 // photos, files, videos and 图文混排 (media_ingest.go downloads and decrypts
 // what a callback points at); a kind it cannot read still gets a short
 // receipt.
 //
-// Outbound no longer requires a single backend replica. The send path is still
-// the in-process WebSocket in sendersRegistry, but replies reach it through
-// channel_outbound_queue: any replica enqueues, and the one holding the bot's
-// connection lease drains. See channel/outbox.
+// Outbound file delivery cannot report back to the agent that produced the
+// file. `multica attachment upload` returns once the object is in storage and
+// bound to the reply, while the send into the room runs on EventChatDone —
+// after the run has ended. A delivery that is shed, refused by WeCom, or lost
+// with the socket is therefore told to the person in the chat
+// (outbound_media.go) and never to the agent, which has already exited.
+// Routing that outcome back into a later turn is its own piece of work.
+//
+// Outbound no longer requires a single backend replica. The only send path is
+// still the in-process WebSocket in sendersRegistry, held by whichever replica
+// owns that bot's lease, so a reply produced on another replica is routed to
+// the lease holder over the Redis Stream relay (relay_outbound.go). Where
+// there is no relay to route it — legacy relay mode, or no Redis at all — the
+// reply is dropped, and a WeCom-enabled backend has to run as a single
+// replica. See SELF_HOSTING.md.
 package wecom
 
 import (

@@ -16,7 +16,6 @@ import (
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
 	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
-	"github.com/multica-ai/multica/server/internal/integrations/channel/outbox"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
@@ -178,12 +177,6 @@ type bubbleRig struct {
 	// the run behind a batch without reaching into the store.
 	boundRuns map[engine.RunBatchID]string
 
-	// queue is where an answer goes when it does NOT go into a bubble. After
-	// the outbound queue landed, a fall-back is a row rather than a push, so a
-	// test asserting "no bubble, so it went out as an ordinary message" reads
-	// this instead of the connection.
-	queue *recordingEnqueueStore
-
 	// logs is what the manager wrote while the test ran. Set only by the rigs
 	// whose subject is a decision NOT to send: a refusal is invisible in the
 	// frames, so the log line is the only thing that separates it from a
@@ -244,12 +237,7 @@ func newBubbleRig(t *testing.T) *bubbleRig {
 		// No guard: these tests drive the endings themselves.
 		GuardAfter: -1,
 	})
-	rig.queue = &recordingEnqueueStore{}
-	producer, err := outbox.NewProducer(channelTypeWecom, rig.queue, nil, nil)
-	if err != nil {
-		t.Fatalf("NewProducer: %v", err)
-	}
-	rig.out = NewOutbound(q, reg, streams, producer, nil)
+	rig.out = NewOutbound(q, reg, streams, nil)
 	// Both halves go on a real bus, subscribed the way boot subscribes them.
 	// Driving the endings through Publish rather than by calling the handlers
 	// keeps the tests honest about WHICH events this manager listens for: an
@@ -258,15 +246,6 @@ func newBubbleRig(t *testing.T) *bubbleRig {
 	rig.bus = events.New()
 	rig.typing.Register(rig.bus)
 	return rig
-}
-
-// drainQueue delivers whatever this rig enqueued over its own socket, the way
-// the lease holder's consumer would. A fall-back answer — one whose bubble
-// could not be sealed — is an ordinary chat-addressed message, so it leaves as
-// a queue row; this is what turns that row back into the push the user sees.
-func (r *bubbleRig) drainQueue(t *testing.T) {
-	t.Helper()
-	r.queue.rows = drainQueue(t, r.queue, r.senders)
 }
 
 const bubbleSession = "22222222-2222-2222-2222-222222222222"
@@ -365,12 +344,10 @@ func (r *bubbleRig) answer(t *testing.T, content, taskName string) {
 	}); err != nil {
 		t.Fatalf("processEvent: %v", err)
 	}
-	// An answer that did not land in a bubble is an ordinary message, so it
-	// leaves as a queue row. Draining here mirrors what boot wires: enqueueing
-	// wakes this installation's consumer, and on a rig with one socket that
-	// consumer is this socket. Without it every assertion about a fall-back
-	// would be reading a chat the answer had not reached yet.
-	r.drainQueue(t)
+	// An answer that did not land in a bubble is an ordinary message, and an
+	// ordinary message is a push on this installation's socket. So a fall-back
+	// is readable on the connection the moment this returns — there is no
+	// durable hop in between to drain.
 }
 
 // failed publishes the task:failed FailTask broadcasts, retry_pending and all.
