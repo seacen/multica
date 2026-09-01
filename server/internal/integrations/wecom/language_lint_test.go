@@ -20,6 +20,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"unicode"
@@ -134,4 +135,62 @@ func hasHan(s string) bool {
 		}
 	}
 	return false
+}
+
+// TestEveryCopyPackFieldHasAReader — a copy field nothing renders is worse
+// than a missing one. It reads as available: the next person adding a failure
+// notice finds three ready-made fields, writes against them, and ships a
+// notice nobody ever sees. Meanwhile every new locale has to translate lines
+// that reach no screen, and the pin table in locale_wiring_test.go keeps them
+// looking alive by asserting their wording.
+//
+// That is not hypothetical. TaskFailedNotice, TaskFailedAgentFallback and
+// TaskFailedReason were rendered only by the DB outbound queue's
+// outbox_sender.go. The queue was withdrawn, its renderer went with it, and
+// the three fields stayed — with both locales filled in, pinned by a test, and
+// zero readers. Nothing was red.
+//
+// A reader is a selector: cp.Foo, c.Progress.Bar, pack.InboxTypeLabels[k].
+// Filling a field in (strings.go's two pack literals) is a WRITE and does not
+// count — that is precisely the state this catches.
+func TestEveryCopyPackFieldHasAReader(t *testing.T) {
+	t.Parallel()
+
+	read := map[string]bool{}
+	fset := token.NewFileSet()
+	for _, name := range packageGoFiles(t) {
+		f, err := parser.ParseFile(fset, filepath.Clean(name), nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			if sel, ok := n.(*ast.SelectorExpr); ok {
+				read[sel.Sel.Name] = true
+			}
+			return true
+		})
+	}
+
+	var orphans []string
+	var walk func(reflect.Type, string)
+	walk = func(typ reflect.Type, prefix string) {
+		for i := range typ.NumField() {
+			field := typ.Field(i)
+			if field.Type.Kind() == reflect.Struct {
+				walk(field.Type, prefix+field.Name+".")
+				continue
+			}
+			if !read[field.Name] {
+				orphans = append(orphans, prefix+field.Name)
+			}
+		}
+	}
+	walk(reflect.TypeOf(copyPack{}), "copyPack.")
+
+	for _, name := range orphans {
+		t.Errorf("%s is filled in for every locale and read by nothing outside the tests.\n"+
+			"Either delete it (and its line in locale_wiring_test.go's pin table), or wire the "+
+			"surface that says it. A field with no sender is a promise to the reader that no code keeps.",
+			name)
+	}
 }

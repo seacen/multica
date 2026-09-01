@@ -45,6 +45,13 @@
 // there is no relay to route it — legacy relay mode, or no Redis at all — the
 // reply is dropped, and a WeCom-enabled backend has to run as a single
 // replica. See SELF_HOSTING.md.
+//
+// Every aibot_send_msg leaves under a per-chat quota gate (rate_limit.go).
+// WeCom refuses an over-quota push and a refused reply is a silence, so a
+// burst of them is spaced out rather than lost, and a frame the platform
+// throttles anyway is retried once. The gate holds no shared state: the same
+// lease that makes one replica the only sender makes that replica's own count
+// the platform's count.
 package wecom
 
 import (

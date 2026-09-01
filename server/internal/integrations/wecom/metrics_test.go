@@ -69,6 +69,7 @@ func (m *countingMetrics) RecordOutboundSkipped(reason string) {
 	m.bump("outbound_skipped")
 	m.bump("outbound_skipped:" + reason)
 }
+func (m *countingMetrics) RecordOutboundTruncated()   { m.bump("outbound_truncated") }
 func (m *countingMetrics) RecordAttachmentDelivered() { m.bump("attachment_delivered") }
 func (m *countingMetrics) RecordAttachmentDropped(reason string) {
 	m.bump("attachment_dropped")
@@ -485,6 +486,71 @@ func TestAnAnswerSentAsANewMessageIsCountedAsFallenBack(t *testing.T) {
 	}
 	if got := mx.get("stream_finished"); got != 0 {
 		t.Fatalf("stream_finished = %d, want 0 — a refused closing frame was counted as a bubble that worked", got)
+	}
+}
+
+// TestAFailureNoticeSentAsANewMessageIsCountedAsFallenBack — the same ending
+// by the other closer.
+//
+// The answer is not the only thing that seals a bubble. task:failed,
+// task:cancelled and the nine-minute guard all write a closing frame through
+// TypingIndicatorManager.writeClosing, and all three fall back to a plain
+// message when the server refuses it. Their successes have always been counted
+// — sendersRegistry.stream records stream_finished for every closer — so the
+// ratio the help text tells an operator to read had one feeder on the numerator
+// and two on the denominator. A WeCom-side change that refused every closing
+// frame would have moved the ratio for answers and left the failure and
+// cancellation notices invisible, which is the case an operator most needs to
+// see: those notices are the only thing that ever tells a user a run did not
+// go through.
+//
+// REVERSE VERIFICATION: put RecordStreamFellBack back in Outbound.finishStream
+// and take it out of sendersRegistry.stream. The sibling test above still
+// passes — the answer path counts either way — and this one fails with
+// stream_fell_back = 0. `go build`, `go vet` and every other test in the
+// package stay green through that move: nothing else in the tree reads this
+// counter.
+func TestAFailureNoticeSentAsANewMessageIsCountedAsFallenBack(t *testing.T) {
+	t.Parallel()
+	mx := newCountingMetrics()
+	rig := newBubbleRig(t)
+	rig.senders.WithMetrics(mx)
+	rig.conn.refuseClosingCode = errcodeStreamExpired
+
+	rig.ran(t, "REQ-M3", 1, "task-1")
+	rig.failed(t, "task-1", false)
+
+	// The user is still told the run failed, which is why nobody reports this.
+	if pushes := rig.conn.pushes(t); len(pushes) != 1 {
+		t.Fatalf("the refused bubble sent %d failure notices, want 1 — this test's premise is gone", len(pushes))
+	}
+	if got := mx.get("stream_fell_back"); got != 1 {
+		t.Fatalf("stream_fell_back = %d, want 1 — every failure notice on this deployment could be "+
+			"arriving as a separate message and the finished/fell_back ratio would look healthy", got)
+	}
+	if got := mx.get("stream_finished"); got != 0 {
+		t.Fatalf("stream_finished = %d, want 0 — a refused closing frame was counted as a bubble that worked", got)
+	}
+}
+
+// TestAFailureNoticeThatSealsTheBubbleIsCountedAsFinished is the other half of
+// the pair, and the reason the one above matters: both closers already feed the
+// denominator, so a fall-back counted at only one of them is not a gap in
+// coverage but a ratio that reads backwards.
+func TestAFailureNoticeThatSealsTheBubbleIsCountedAsFinished(t *testing.T) {
+	t.Parallel()
+	mx := newCountingMetrics()
+	rig := newBubbleRig(t)
+	rig.senders.WithMetrics(mx)
+
+	rig.ran(t, "REQ-M4", 1, "task-1")
+	rig.failed(t, "task-1", false)
+
+	if got := mx.get("stream_finished"); got != 1 {
+		t.Fatalf("stream_finished = %d, want 1", got)
+	}
+	if got := mx.get("stream_fell_back"); got != 0 {
+		t.Fatalf("stream_fell_back = %d, want 0 — a notice that sealed its bubble was counted as a fall-back", got)
 	}
 }
 

@@ -17,8 +17,10 @@ package wecom
 // the defect.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"regexp"
 	"strconv"
 	"strings"
@@ -336,4 +338,146 @@ func tail(s string, n int) string {
 		return s
 	}
 	return s[len(s)-n:]
+}
+
+// ---- when it breaks in the middle ----
+//
+// The tests above are about the answer arriving whole. These are about the
+// operator's half of the same invariant: what gets recorded when it does not.
+//
+// A long answer goes out as several messages, and a failure on any but the
+// first leaves the ones before it in the chat. WeCom has no unsend, so the
+// person is reading the opening of an answer whose remainder exists nowhere,
+// and they have no way to know it stops early.
+//
+// Both routes reach that screen. Under a bubble the head goes into the sealed
+// frame and the rest follow as messages; with no bubble left, sendTextCtx
+// splits and sends them all. They used to disagree completely about what had
+// happened — the bubble route recorded a plain delivered, the message route
+// recorded a drop — so the same thing on the person's screen moved opposite
+// counters depending on an implementation detail nobody outside can see. An
+// operator reading the drop as "resend it" would print the opening twice.
+//
+// So: delivered, because words did reach the person and the denominator has to
+// keep counting them, PLUS truncated, because that is the part neither of the
+// other counters can say. Both routes, the same pair.
+
+// truncationRig is a bubbleRig whose Outbound and registry report to one
+// counting sink, and whose log the test can read. newBubbleRig wires neither,
+// because everything else it is used for is about frames.
+func truncationRig(t *testing.T) (*bubbleRig, *countingMetrics, *bytes.Buffer) {
+	t.Helper()
+	rig := newBubbleRig(t)
+	mx := newCountingMetrics()
+	logs := &bytes.Buffer{}
+	rig.senders.WithMetrics(mx)
+	rig.out = NewOutbound(rig.q, rig.senders, rig.streams,
+		slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		WithOutboundMetrics(mx))
+	return rig, mx, logs
+}
+
+// assertTruncated is the pair both routes have to record, stated once.
+func assertTruncated(t *testing.T, mx *countingMetrics, logs *bytes.Buffer) {
+	t.Helper()
+	if got := mx.get("outbound_truncated"); got != 1 {
+		t.Errorf("truncated = %d, want 1 — the person is reading part of an answer and "+
+			"nothing says so. log:\n%s", got, logs.String())
+	}
+	if got := mx.get("outbound_delivered"); got != 1 {
+		t.Errorf("delivered = %d, want 1 — words DID reach the person, and a truncated reply "+
+			"missing from the denominator makes the rate unreadable. log:\n%s", got, logs.String())
+	}
+	if got := mx.get("outbound_dropped"); got != 0 {
+		t.Errorf("dropped = %d, want 0 — the opening of the answer is in the chat, and an "+
+			"operator acting on a drop would resend it and print that opening twice", got)
+	}
+	if !strings.Contains(logs.String(), "only part of a long answer reached the user") {
+		t.Errorf("nothing in the log says the answer stopped early:\n%s", logs.String())
+	}
+}
+
+// TestABubbleAnswerThatBreaksAfterTheBubbleIsCountedTruncated — the bubble
+// route. The head seals the bubble, the first message under it is refused.
+//
+// REVERSE VERIFICATION: make sendRest swallow its error again (drop the
+// return, and the o.truncated call in deliverAnswer with it) and this fails on
+// truncated = 0 while delivered stays 1 — which is exactly the reading that
+// hid the bug: a third of an answer on the screen, filed as a whole reply
+// delivered. `go build` and `go vet` are silent either way; so is every other
+// test in this package, including the long-answer tests right above, because
+// they assert on what the socket carried and not on what was recorded.
+func TestABubbleAnswerThatBreaksAfterTheBubbleIsCountedTruncated(t *testing.T) {
+	rig, mx, logs := truncationRig(t)
+	rig.conn.refusePushesFrom = 1 // nothing under the bubble gets through
+
+	rig.ran(t, "REQ-TRUNC-B", 1, "task-1")
+	rig.answer(t, aLongAnswer(), "task-1")
+
+	// The premise: the bubble was sealed and nothing followed it.
+	sealed := 0
+	for _, s := range rig.conn.streamFrames(t) {
+		if s["finish"] == true {
+			sealed++
+		}
+	}
+	if sealed != 1 {
+		t.Fatalf("the bubble was sealed %d time(s), want 1 — this test's premise is gone", sealed)
+	}
+	if got := rig.conn.readablePushes(); got != 0 {
+		t.Fatalf("%d message(s) landed under the bubble, want 0 — the answer did not break", got)
+	}
+	assertTruncated(t, mx, logs)
+}
+
+// TestAPlainAnswerThatBreaksMidwayIsCountedTruncated — the same screen by the
+// other route. No bubble, so the whole answer goes down sendTextCtx, which
+// splits it; the server takes the first piece and refuses the second.
+//
+// Driven through handleEvent rather than processEvent because the drop is
+// classified there: an error returned from processEvent is what USED to move
+// outbound_dropped for this exact case, and a test calling processEvent
+// directly could not tell that apart from no drop at all.
+//
+// REVERSE VERIFICATION: remove the errors.Is(err, errPartiallySent) branch
+// from sendAsMessage and this fails with dropped = 1, delivered = 0,
+// truncated = 0 — the old reading, and the opposite of what the sibling test
+// above records for the same thing on the person's screen. Build and vet stay
+// silent.
+func TestAPlainAnswerThatBreaksMidwayIsCountedTruncated(t *testing.T) {
+	rig, mx, logs := truncationRig(t)
+	rig.conn.refusePushesFrom = 2 // the first piece lands, the second does not
+	// The run exists; the BUBBLE does not — the case a restart mid-run leaves
+	// behind. Filed directly, the way TestALongAnswerWithNoBubbleStillArrives
+	// Whole does, so the origin gate does not read the run as reaped.
+	rig.q.fileTask(t, taskUUID(t, "task-1"))
+
+	rig.out.handleEvent(events.Event{
+		Type:          protocol.EventChatDone,
+		ChatSessionID: bubbleSession,
+		TaskID:        taskUUID(t, "task-1"),
+		Payload:       protocol.ChatDonePayload{Content: aLongAnswer()},
+	})
+
+	if got := rig.conn.readablePushes(); got != 1 {
+		t.Fatalf("the person can read %d message(s), want exactly 1 — this test is about an "+
+			"answer that broke after the first piece", got)
+	}
+	assertTruncated(t, mx, logs)
+}
+
+// TestALongAnswerThatArrivesWholeIsNotCountedTruncated — the guard. A counter
+// that fires on every long answer says nothing about any of them.
+func TestALongAnswerThatArrivesWholeIsNotCountedTruncated(t *testing.T) {
+	rig, mx, logs := truncationRig(t)
+
+	rig.ran(t, "REQ-TRUNC-OK", 1, "task-1")
+	rig.answer(t, aLongAnswer(), "task-1")
+
+	if got := mx.get("outbound_truncated"); got != 0 {
+		t.Errorf("truncated = %d on an answer that arrived whole. log:\n%s", got, logs.String())
+	}
+	if got := mx.get("outbound_delivered"); got != 1 {
+		t.Errorf("delivered = %d, want 1", got)
+	}
 }

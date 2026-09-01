@@ -60,6 +60,13 @@ package wecom
 // the new process, at the cost of a row per bubble and a sweep to retire them,
 // to save a fallback message on the restart that lands mid-run.
 //
+// The lease is what makes that safe, and the relay does not extend it to the
+// bubble: an answer produced off-lease is routed to the socket holder and sent
+// there as an ordinary message, past the round this store is holding for it, so
+// the bubble runs to streamGuardAfter and promises a reply the reader already
+// has. See the replica topology in outbound.go, which is where that gap is
+// stated and where closing it would go.
+//
 // A RECONNECT IS NOT A RESTART, and the difference is why this store is built
 // once at boot, outside the connection loop (router.go). A handle outlives the
 // socket it was made on, and WeCom scopes a callback's req_id to the turn
@@ -157,8 +164,9 @@ const (
 	// used to be.
 	roundOwesAnEnding
 	// roundToldAlready — the answer landed, another publisher's failure got
-	// here first, or the words are going out on another goroutine right now.
-	// Nothing to add.
+	// here first, an earlier delivery went out and nobody could confirm it
+	// (I4), or the words are going out on another goroutine right now. Nothing
+	// to add.
 	roundToldAlready
 )
 
@@ -284,7 +292,8 @@ func (h streamHandle) address() roundAddress {
 //
 //	I1. NOTHING IS RECORDED AS SAID UNTIL IT HAS BEEN SAID. A run reaches told,
 //	    and a promise leaves owed, only after a delivery reports that the words
-//	    were accepted for sending.
+//	    were accepted for sending — or, under I4, that nobody can say they were
+//	    not.
 //	I2. A RUN'S ENDING IS MATCHED BY THE RUN'S OWN ID — never by position,
 //	    never by session. A promise another round is waiting on is not this
 //	    run's to spend, and a note another round left is not this run's reason
@@ -298,6 +307,21 @@ func (h streamHandle) address() roundAddress {
 //	    was owed nothing here, and a debt filed against it would be
 //	    indistinguishable from the inbound path's own record of the round —
 //	    which is what knowsRound reads as proof of where a question was asked.
+//	I4. AN OUTCOME NOBODY COULD CONFIRM IS NOT A FAILURE. A delivery comes back
+//	    with one of THREE things, not two: the words were accepted, they
+//	    provably never left this process, or the transport gave no verdict at
+//	    all — an ack that never came, a write that raised after entering the
+//	    socket, a context cut short while either was pending. Only the middle
+//	    one is the failure I3 speaks of. An unknown is recorded the way an
+//	    accepted delivery is, because the alternative is to say one run's
+//	    ending a second time to somebody who is already reading the first: the
+//	    words may be on their screen, and nothing that arrives later will ever
+//	    settle whether they are. Which errors those are is NOT decided here —
+//	    unconfirmedReason (outbound_outcome.go) is this package's one
+//	    definition of "unknown", and every other send path consults it before
+//	    calling a send lost. The ledger consults the same one, so a reconnect
+//	    (errNoLiveConnection, provably nothing written) stays a retry under I3
+//	    while an ack timeout stops being one.
 //
 // sayEnding is the only way the ledger is written, and it takes the delivery as
 // an argument rather than handing out the right to speak. A caller cannot hold
@@ -432,8 +456,9 @@ type endedRound struct {
 	// answered. Bounded: a batch old enough to have fallen off cannot still
 	// have a message in flight for it.
 	finished []engine.RunBatchID
-	// told lists the RUNS whose ending has already been said — a bubble
-	// sealed, a promise kept, a plain message sent. It is what makes a second
+	// told lists the RUNS that have been spoken for — a bubble sealed, a
+	// promise kept, a plain message sent, or an attempt at any of those whose
+	// outcome the transport never settled (I4). It is what makes a second
 	// publisher of one run's failure silent, and it has to be per run for the
 	// same reason owed is: the existence of a note says only that SOMETHING in
 	// this session has been spoken for. Keyed by session, a second run's
@@ -450,7 +475,7 @@ type endedRound struct {
 	speaking []string
 }
 
-// isTold reports whether this run's ending has already been said.
+// isTold reports whether this run has already been spoken for.
 func (e endedRound) isTold(taskID string) bool {
 	if taskID == "" {
 		return false
@@ -932,8 +957,8 @@ func (s *streamStore) markUnusable(sessionID pgtype.UUID, streamID string) bool 
 //	say returns nil            — the words were accepted for sending. The
 //	                             promise is settled, the run goes on told, and
 //	                             a guard's ending files the promise it just made.
-//	say returns an error       — nothing reached the user, so nothing is told
-//	                             (I1) and the next publisher of the same news
+//	say returns a DEFINITE     — nothing reached the user, so nothing is told
+//	error                        (I1) and the next publisher of the same news
 //	                             can still say it. A claimed promise returns to
 //	                             where it sat, and a round this store was
 //	                             holding is left owed an ending even if it was
@@ -942,6 +967,11 @@ func (s *streamStore) markUnusable(sessionID pgtype.UUID, streamID string) bool 
 //	                             is left exactly as it was found: untouched.
 //	                             errNothingToSay is the deliberate case and is
 //	                             recorded the same way.
+//	say returns an UNCONFIRMED — recorded exactly as nil is (I4). The words may
+//	error                        be on the user's screen and no later event can
+//	                             settle whether they are, so the run is spoken
+//	                             for and a repeat stays quiet rather than
+//	                             telling them the same thing twice.
 //
 // The address say returns is where it actually spoke, which is how a delivery
 // that found its own chat in the binding row teaches the note an address it did
@@ -987,8 +1017,20 @@ func (s *streamStore) sayEnding(
 		return turn.Verdict, nil
 	}
 	addr, err := say(turn)
-	s.endEnding(pending, addr, err == nil)
+	s.endEnding(pending, addr, spokenFor(err))
 	return turn.Verdict, err
+}
+
+// spokenFor reads a delivery's own error the way I4 requires: true when this
+// run has been spoken for as far as anyone can tell, false only for a failure
+// that provably put nothing in front of the user.
+//
+// The set of unknowns is not this file's to define. unconfirmedReason is the
+// package's single definition of it (outbound_outcome.go), consulted by every
+// other send path before it files a drop, and the ledger has to agree with them
+// about one error or the same send is a retry here and a settled outcome there.
+func spokenFor(err error) bool {
+	return err == nil || unconfirmedReason(err) != ""
 }
 
 // beginEndingLocked finds the round and reserves its ending. It is half of
@@ -1024,20 +1066,30 @@ func (s *streamStore) beginEndingLocked(key string, k roundKey, ending roundEndi
 	// that actually went out under both, which endEnding records as the alias.
 	worthResolving = worthResolving || note.isOwed() || len(note.speaking) > 0
 
+	taskID := k.taskID
+	if note.isTold(taskID) || note.isSpeaking(taskID) {
+		// ASKED BEFORE THE ADDRESS, and that order is the whole of it. The
+		// not-twice rule is about the RUN — an ending already said, or on the
+		// wire right now on another goroutine — and it holds whether or not
+		// this store knows where the words went. A round bound to a run but
+		// never painted (the opening frame refused, or the flush arriving
+		// ahead of the goroutine that paints) leaves the note addressless
+		// while its ending is being said, and asking the address first sends
+		// the second publisher off to find its own chat and say the same thing
+		// there. An empty id matches nothing (indexOfRun), so a batch key
+		// falls through to the branches below untouched.
+		return roundTurn{Addr: note.addr, Verdict: roundToldAlready}, pendingEnding{}, false
+	}
 	if !note.addr.known() {
 		// Nowhere to speak. Not a refusal — the caller finds its own chat.
-		return s.forgottenLocked(key, k.taskID, ending, worthResolving)
+		return s.forgottenLocked(key, taskID, ending, worthResolving)
 	}
-	taskID := k.taskID
 	if k.byBatch || taskID == "" {
 		// A batch that matched no open round has nothing left to end, and an
 		// unnamed ending claims nothing for the same reason no unnamed promise
 		// is ever filed: there is no round it could be speaking for. Not
 		// forgotten either — a caller told to go and find a chat would announce
 		// an ending it cannot attribute to any round in it.
-		return roundTurn{Addr: note.addr, Verdict: roundToldAlready}, pendingEnding{}, false
-	}
-	if note.isTold(taskID) || note.isSpeaking(taskID) {
 		return roundTurn{Addr: note.addr, Verdict: roundToldAlready}, pendingEnding{}, false
 	}
 	at := indexOfRun(note.owed, taskID)
@@ -1081,19 +1133,21 @@ func (s *streamStore) forgottenLocked(key, taskID string, ending roundEnding, wo
 }
 
 // endEnding is the other half of sayEnding: it records the delivery's account
-// of itself, and it is where all three invariants are actually paid.
+// of itself, and it is where all four invariants are actually paid.
 //
-// delivered is the whole of the decision. False reaches told for nothing (I1)
-// and returns a claimed promise to exactly where it sat, which is what makes a
-// send refused during a reconnect window a retry rather than a loss. For a
-// round this store was holding it goes one step further and leaves the run owed
-// an ending it was not owed before (I3): the bubble was consumed whether or not
-// the words landed, so only a later ending can put anything under it.
+// spoken is the whole of the decision, and it is the answer to "can anybody
+// still say this run has not been told" rather than "did the words arrive"
+// (I4). False reaches told for nothing (I1) and returns a claimed promise to
+// exactly where it sat, which is what makes a send refused during a reconnect
+// window a retry rather than a loss. For a round this store was holding it goes
+// one step further and leaves the run owed an ending it was not owed before
+// (I3): the bubble was consumed whether or not the words landed, so only a
+// later ending can put anything under it.
 //
 // False for a run this store held no round for writes nothing whatsoever — see
 // held on pendingEnding for why that asymmetry is the point rather than an
 // omission.
-func (s *streamStore) endEnding(p pendingEnding, addr roundAddress, delivered bool) {
+func (s *streamStore) endEnding(p pendingEnding, addr roundAddress, spoken bool) {
 	if !p.live {
 		return
 	}
@@ -1101,7 +1155,7 @@ func (s *streamStore) endEnding(p pendingEnding, addr roundAddress, delivered bo
 	defer s.mu.Unlock()
 	note, ok := s.ended[p.key]
 	if !ok {
-		if !delivered {
+		if !spoken {
 			// Nothing was reserved in a note and nothing was said. There is no
 			// reason to start remembering this session now.
 			return
@@ -1115,7 +1169,7 @@ func (s *streamStore) endEnding(p pendingEnding, addr roundAddress, delivered bo
 		note.speaking = withoutRun(note.speaking, at)
 	}
 	note.at = s.now()
-	if !delivered {
+	if !spoken {
 		switch {
 		case p.owedAt >= 0:
 			note.owed = restoreRun(note.owed, p.owedAt, p.taskID)
@@ -1150,9 +1204,11 @@ func (s *streamStore) endEnding(p pendingEnding, addr roundAddress, delivered bo
 		// of settling one, and the one that tells nothing: the round goes on.
 		note.owed = note.owe(p.taskID)
 	case roundOver:
-		// The promise was claimed at begin and the words have landed, so it
-		// stays settled. This run has now been spoken for; a repeat of its own
-		// ending stays silent, another run's ending is not covered by it.
+		// The promise was claimed at begin and the words have landed — or have
+		// gone somewhere nobody can account for, which under I4 ends the same
+		// way — so it stays settled. This run has now been spoken for; a repeat
+		// of its own ending stays silent, another run's ending is not covered
+		// by it.
 		note.told = note.tell(p.taskID)
 		if p.alias != "" {
 			note.told = note.tell(p.alias)
@@ -1174,8 +1230,9 @@ func (s *streamStore) owesEnding(sessionID pgtype.UUID, taskID string) bool {
 	return indexOfRun(note.owed, taskID) >= 0
 }
 
-// wasTold reports whether a run's ending has been recorded as said. Read-only;
-// the other half of what owesEnding inspects.
+// wasTold reports whether a run's ending has been recorded as spoken for — said
+// outright, or attempted with no verdict to say otherwise (I4). Read-only; the
+// other half of what owesEnding inspects.
 func (s *streamStore) wasTold(sessionID pgtype.UUID, taskID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

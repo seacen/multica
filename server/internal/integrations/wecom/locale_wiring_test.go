@@ -530,10 +530,6 @@ func TestZhHansPackIsTheCopyThatAlreadyShipped(t *testing.T) {
 		// TestTheBoundGreetingNamesEveryKindTheBotActuallyRoutes is what ties
 		// it to ownText; this line is where the wording change is argued for.
 
-		"TaskFailedNotice":        "⚠️ %s处理这条消息时失败了。",
-		"TaskFailedAgentFallback": "智能体",
-		"TaskFailedReason":        "\n原因：%s",
-
 		"StreamNoReplyWithFiles": "（这轮没有文字回复，附件在下面）",
 
 		// Arrived from upstream as package constants in replier.go and were

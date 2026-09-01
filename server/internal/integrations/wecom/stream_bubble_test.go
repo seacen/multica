@@ -39,6 +39,19 @@ type bubbleConn struct {
 	// counted against the bot's shared rate limit.
 	disownAfterFrames int
 	streamWrites      int
+
+	// refusePushesFrom is the 1-based aibot_send_msg this server starts
+	// refusing; every push from there on is answered 45009 and none of them
+	// reaches the chat. Zero accepts them all.
+	//
+	// It is how a long answer breaks in the MIDDLE. An answer past the body
+	// cap goes out as several messages, and a failure on the second leaves the
+	// first one already in the chat — WeCom has no unsend, so the person is
+	// looking at the opening of an answer whose remainder exists nowhere. That
+	// is a different outcome from both "it arrived" and "it did not", and the
+	// only double here that can produce it.
+	refusePushesFrom int
+	pushWrites       int
 }
 
 func (c *bubbleConn) WriteMessage(_ int, data []byte) error {
@@ -54,6 +67,12 @@ func (c *bubbleConn) WriteMessage(_ int, data []byte) error {
 		c.streamWrites++
 		if c.disownAfterFrames > 0 && c.streamWrites > c.disownAfterFrames {
 			code = errcodeStreamExpired
+		}
+	}
+	if env.Cmd == cmdSendMsg {
+		c.pushWrites++
+		if c.refusePushesFrom > 0 && c.pushWrites >= c.refusePushesFrom {
+			code = 45009 // api freq out of limit
 		}
 	}
 	if c.refuseClosingCode != 0 && isClosingFrame(env) {
@@ -156,6 +175,18 @@ func (c *bubbleConn) pushes(t *testing.T) []map[string]any {
 		out = append(out, body)
 	}
 	return out
+}
+
+// readablePushes is how many plain messages the server ACCEPTED — what the
+// person can actually read, which is not the same as what was written at the
+// socket once refusePushesFrom is in play.
+func (c *bubbleConn) readablePushes() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.refusePushesFrom <= 0 || c.pushWrites < c.refusePushesFrom {
+		return c.pushWrites
+	}
+	return c.refusePushesFrom - 1
 }
 
 // bubbleRig is one installation with a live socket, a store, the typing

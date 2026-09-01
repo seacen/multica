@@ -33,14 +33,23 @@ import (
 type fakeOutboundQueries struct {
 	sessionBinding db.ChannelChatSessionBinding
 	sessionErr     error
-	installation   db.ChannelInstallation
-	installErr     error
-	memberBinding  db.ChannelUserBinding
-	memberErr      error
-	workspace      db.Workspace
-	workspaceErr   error
-	attachments    []db.Attachment
-	attachmentsErr error
+	// deliveryChannelType is what the turn's channel_task_delivery row says it
+	// came in on. Empty means WeCom, which is what all but a couple of these
+	// tests are about; set it to another platform's name to model the
+	// chat:done every OTHER adapter publishes onto the shared bus, which this
+	// subscriber also sees. That is a different thing from sessionErr =
+	// pgx.ErrNoRows, which is a channel turn with NO route recorded at all —
+	// the two used to be modelled by the same field and the code told them
+	// apart nowhere.
+	deliveryChannelType string
+	installation        db.ChannelInstallation
+	installErr          error
+	memberBinding       db.ChannelUserBinding
+	memberErr           error
+	workspace           db.Workspace
+	workspaceErr        error
+	attachments         []db.Attachment
+	attachmentsErr      error
 
 	// userLanguage is what every user row this fake returns says its profile
 	// language is, and userBindingID the Multica user a channel user id
@@ -107,9 +116,13 @@ func (f *fakeOutboundQueries) GetChannelTaskDelivery(context.Context, pgtype.UUI
 	if f.sessionErr != nil {
 		return db.ChannelTaskDelivery{}, f.sessionErr
 	}
+	channelType := f.deliveryChannelType
+	if channelType == "" {
+		channelType = channelTypeWecom
+	}
 	return db.ChannelTaskDelivery{
 		BindingID: f.sessionBinding.ID, InstallationID: f.sessionBinding.InstallationID,
-		ChannelType: channelTypeWecom, ChannelChatID: f.sessionBinding.ChannelChatID,
+		ChannelType: channelType, ChannelChatID: f.sessionBinding.ChannelChatID,
 		ChatType:         f.sessionBinding.ChatType,
 		ChannelMessageID: f.sessionBinding.LastMessageID, ChannelThreadID: f.sessionBinding.LastThreadID,
 		RouteRevision: f.sessionBinding.RouteRevision, Config: f.sessionBinding.Config,
@@ -231,14 +244,27 @@ func (f *fakeOutboundQueries) originAsked() []string { return f.originAskedFor }
 
 func newOutboundWithConn(t *testing.T, q outboundQueries) (*Outbound, pgtype.UUID, *recordingConn) {
 	t.Helper()
+	o, instID, conn, _ := newOutboundWithConnMetrics(t, q)
+	return o, instID, conn
+}
+
+// newOutboundWithConnMetrics is newOutboundWithConn plus the counting sink, for
+// the cases whose whole subject is a turn that sends nothing. "No frames" is
+// the same observation for a completion this adapter declined and for one it
+// never reached a decision about — a fixture that stops early at a gate looks
+// exactly like a fixture that ran the branch it is named after. The skip reason
+// is what tells the two apart.
+func newOutboundWithConnMetrics(t *testing.T, q outboundQueries) (*Outbound, pgtype.UUID, *recordingConn, *countingMetrics) {
+	t.Helper()
 	reg := newSendersRegistry()
 	instID := mustTestUUID(t)
 	conn := &recordingConn{}
 	reg.set(instID, conn.autoAck(newWSSender(conn, nil)))
+	mx := newCountingMetrics()
 	// No round store: these tests read frames, and a turn with no open bubble
 	// takes the ordinary message path. The cases about the bubble itself run on
 	// newBubbleRig (stream_bubble_test.go), which wires one.
-	return NewOutbound(q, reg, nil, slog.Default()), instID, conn
+	return NewOutbound(q, reg, nil, slog.Default(), WithOutboundMetrics(mx)), instID, conn, mx
 }
 
 func TestProcessEvent_DeliversChatReplyToBoundChat(t *testing.T) {
@@ -276,28 +302,53 @@ func TestProcessEvent_DeliversChatReplyToBoundChat(t *testing.T) {
 	}
 }
 
-func TestProcessEvent_NonWecomSessionIsNoop(t *testing.T) {
-	t.Parallel()
-	q := &fakeOutboundQueries{sessionErr: pgx.ErrNoRows}
-	o, _, conn := newOutboundWithConn(t, q)
-	if err := o.processEvent(context.Background(), events.Event{ChatSessionID: "22222222-2222-2222-2222-222222222222", Payload: protocol.ChatDonePayload{Content: "x"}}); err != nil {
-		t.Fatalf("processEvent: %v", err)
-	}
-	if len(conn.frames) != 0 {
-		t.Errorf("expected no send for a non-wecom session, got %d frames", len(conn.frames))
-	}
-}
-
+// A completion the agent finished with nothing in, on a WeCom round with no
+// bubble left to seal: there is nobody to answer and nothing to answer with, so
+// the turn ends in silence and says so as skipNothingToSay.
+//
+// The rig has to carry a task id, a filed task and the origin stamp. Without
+// them processEvent returns at chatDoneTaskID / the origin gate, several
+// branches short of the one under test — and the frame count is zero either
+// way, so the assertion this test used to make held for a run that never got
+// near an empty completion. The skip reason is the assertion that cannot be
+// satisfied by stopping early: each exit names its own.
+//
+// NOTE for a reverse check: there is no production line to delete here — the
+// guard is against the FIXTURE regressing. Drop channelIngested (or the task
+// id) and this goes red on skipped{origin_not_channel} / dropped{task_missing}
+// while go build, go vet and gofmt stay silent, which is the shape of the
+// defect it replaces.
 func TestProcessEvent_EmptyContentIsNoop(t *testing.T) {
 	t.Parallel()
-	q := &fakeOutboundQueries{sessionBinding: db.ChannelChatSessionBinding{ChannelChatID: "CHAT_1"}}
-	o, instID, conn := newOutboundWithConn(t, q)
+	q := &fakeOutboundQueries{
+		sessionBinding:  db.ChannelChatSessionBinding{ChannelChatID: "CHAT_1"},
+		installation:    db.ChannelInstallation{Status: string(InstallationActive)},
+		channelIngested: askedOverWecom(),
+	}
+	q.fileTask(t, "33333333-3333-3333-3333-333333333333")
+	o, instID, conn, mx := newOutboundWithConnMetrics(t, q)
 	q.sessionBinding.InstallationID = instID
-	if err := o.processEvent(context.Background(), events.Event{ChatSessionID: "22222222-2222-2222-2222-222222222222", Payload: protocol.ChatDonePayload{Content: ""}}); err != nil {
+	q.installation.ID = instID
+
+	if err := o.processEvent(context.Background(), events.Event{
+		ChatSessionID: "22222222-2222-2222-2222-222222222222",
+		Payload:       protocol.ChatDonePayload{Content: "", TaskID: "33333333-3333-3333-3333-333333333333"},
+	}); err != nil {
 		t.Fatalf("processEvent: %v", err)
 	}
 	if len(conn.frames) != 0 {
 		t.Errorf("empty completion should send nothing, got %d frames", len(conn.frames))
+	}
+	if got := mx.get("outbound_skipped:nothing_to_say"); got != 1 {
+		t.Errorf("skipped{nothing_to_say} = %d, want 1 — the turn stopped somewhere earlier than the empty completion, so this case is not testing what it is named after. Where it stopped instead: dropped{task_missing}=%d, skipped{origin_not_channel}=%d, skipped{no_delivery_row}=%d, skipped{installation_inactive}=%d",
+			got,
+			mx.get("outbound_dropped:task_missing"),
+			mx.get("outbound_skipped:origin_not_channel"),
+			mx.get("outbound_skipped:no_delivery_row"),
+			mx.get("outbound_skipped:installation_inactive"))
+	}
+	if got := mx.get("outbound_dropped"); got != 0 {
+		t.Errorf("dropped = %d, want 0 — an agent with nothing to add is not a failed delivery", got)
 	}
 }
 

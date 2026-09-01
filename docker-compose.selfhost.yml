@@ -183,6 +183,11 @@ services:
       # subscribe credentials at connection time, and to seal the secret when
       # an installation is created from the WeCom settings tab.
       MULTICA_WECOM_SECRET_KEY: ${MULTICA_WECOM_SECRET_KEY:-}
+      # The WeCom-issued caller id the scan-code install flow sends as
+      # ?source=. Empty (the default) uses the built-in "multica"; set it only
+      # if WeCom issued your organisation its own source. Nothing but the QR
+      # install endpoints reads it.
+      MULTICA_WECOM_SOURCE_ID: ${MULTICA_WECOM_SOURCE_ID:-}
       # Comma-separated ranges the inbound media fetcher may dial even though
       # they look reserved. Empty (the default) keeps the SSRF guard as strict
       # as it ships; set it only behind a fake-IP proxy whose pool would

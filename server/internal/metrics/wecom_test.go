@@ -238,6 +238,7 @@ func TestWecomOutboundMetricsAreExported(t *testing.T) {
 	m.RecordOutboundDelivered()
 	m.RecordOutboundDropped("no_live_connection")
 	m.RecordOutboundSkipped("origin_not_channel")
+	m.RecordOutboundTruncated()
 	m.RecordAttachmentDelivered()
 	m.RecordAttachmentDropped("platform_refused")
 	m.RecordAttachmentDeliveryShed()
@@ -262,6 +263,7 @@ func TestWecomOutboundMetricsAreExported(t *testing.T) {
 		"multica_wecom_outbound_delivered_total",
 		"multica_wecom_outbound_dropped_total",
 		"multica_wecom_outbound_skipped_total",
+		"multica_wecom_outbound_truncated_total",
 		"multica_wecom_outbound_attachment_delivered_total",
 		"multica_wecom_outbound_attachment_dropped_total",
 		"multica_wecom_outbound_attachment_delivery_shed_total",

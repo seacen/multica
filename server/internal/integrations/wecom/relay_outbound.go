@@ -993,8 +993,45 @@ func (o *Outbound) deliverRelayed(ctx context.Context, f relayFrame) deliveryOut
 	if sender == nil {
 		return outcomeNotOurs // the replica holding the lease will take it
 	}
-	if f.Content != "" {
+	// hasVisibleChar, not `!= ""`, and the same predicate the local path uses
+	// (outbound.go). A completion of "\n" carrying a file is words to neither
+	// of them: the local path sends nothing and lets the file carry the
+	// reply's outcome, and a frame routed here has to reach the same two
+	// conclusions or which replica held the socket decides whether the user
+	// sees a blank message and whether the text or the file is what the reply
+	// counter is counting.
+	if hasVisibleChar(f.Content) {
 		if err := sender.sendTextCtx(ctx, f.ChatID, f.ChatType, f.Content); err != nil {
+			// WHETHER THIS FRAME IS FINISHED IS SETTLED BEFORE ANY COUNTER
+			// MOVES. A frame that is owed another offer is still in flight,
+			// and counting it here counts it once per attempt: the dispatcher
+			// re-offers a provably-unsent frame across the whole retry chain
+			// (RelayConfig.retryPlan is eleven entries on the production
+			// defaults) and the publisher's watchOutcomes settles it once
+			// more afterwards, so one reply lands on outbound_dropped twelve
+			// or thirteen times — and if a later offer succeeds, on
+			// outbound_delivered as well. That is precisely the "one reply
+			// counted as delivered and dropped at the same time" defect shed's
+			// comment above says this package no longer has.
+			//
+			// So the counters below record an outcome only for a frame that
+			// will not be offered again; a frame still in flight is owed its
+			// outcome by the single owner that can settle it after the fact —
+			// the publisher's watchOutcomes, which counts a delivery nobody
+			// took exactly once.
+			//
+			// Only a failure PROVEN to precede the write releases the claim.
+			// Everything past that point — an attempted write, a verdict that
+			// never came, a context that expired while waiting, a long answer
+			// whose earlier piece was already accepted — may have reached the
+			// peer, and releasing the claim there turns a retry into a
+			// duplicate answer in the user's chat.
+			if provablyNotSent(err) {
+				o.logger.DebugContext(ctx, "wecom relay: nothing reached the wire, the frame is owed another offer",
+					"error", err, "kind", f.Kind,
+					"installation_id", f.InstallationID, "task_id", f.TaskID)
+				return outcomeProvablyNotSent
+			}
 			// The reply counters are for AGENT REPLIES — their documented
 			// unit. An inbox push routed here must not move them: the same
 			// push would otherwise count as a delivered reply, a dropped
@@ -1011,14 +1048,6 @@ func (o *Outbound) deliverRelayed(ctx context.Context, f relayFrame) deliveryOut
 				o.logger.WarnContext(ctx, "wecom relay: inbox push failed on the lease holder",
 					"error", err, "installation_id", f.InstallationID)
 			}
-			// Only a failure PROVEN to precede the write releases the claim.
-			// Everything past that point — an attempted write, a verdict that
-			// never came, a context that expired while waiting — may have
-			// reached the peer, and releasing the claim there turns a retry
-			// into a duplicate answer in the user's chat.
-			if provablyNotSent(err) {
-				return outcomeProvablyNotSent
-			}
 			return outcomeDone
 		}
 		if f.Kind == relayKindReply {
@@ -1034,7 +1063,16 @@ func (o *Outbound) deliverRelayed(ctx context.Context, f relayFrame) deliveryOut
 			ChatID:         f.ChatID,
 			ChatType:       f.ChatType,
 			SessionID:      f.SessionID,
-		}, f.Content == "")
+			// Resolved here, by the same expression the local path uses
+			// (outbound.go). This is the SECOND caller of the attachment
+			// target, and the field exists because delivery runs detached with
+			// no request context left to read a profile with — a zero Locale
+			// is not "unset", it falls through copyFor to the deployment's own
+			// language, so leaving it out makes one reader's failure notice
+			// arrive in whichever language the replica holding the socket
+			// happens to be configured for.
+			Locale: localeFor(ctx, o.q, instID, f.ChatType, f.ChatID),
+		}, !hasVisibleChar(f.Content))
 	}
 	return outcomeDone
 }
@@ -1059,10 +1097,18 @@ func (o *Outbound) ownsSocket(installationID string) bool {
 // context error is ambiguous — request() returns one both from its pre-write
 // check and from the post-write wait — so it is treated as possibly sent,
 // which costs an un-retried delivery rather than a duplicate.
+//
+// The question is asked of the SEND, not of the frame that failed. An answer
+// past the 20480-byte cap goes out as several frames, and a failure on the
+// second of them says nothing about the first, which the user is already
+// reading — errPartiallySent is how ws_sender says so, and retrying such a
+// send would repeat what already landed.
 func provablyNotSent(err error) bool {
 	var apiErr *wecomAPIError
 	switch {
 	case err == nil:
+		return false
+	case errors.Is(err, errPartiallySent):
 		return false
 	case errors.As(err, &apiErr):
 		return false

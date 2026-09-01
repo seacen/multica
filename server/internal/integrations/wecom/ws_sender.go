@@ -102,6 +102,13 @@ type wsSender struct {
 	// standing still for five seconds.
 	ackTimeout time.Duration
 
+	// quota holds this connection's aibot_send_msg allowance, per target chat,
+	// and retryBackoff is what a throttled push waits before its one retry.
+	// One quota per socket is the whole accounting — see rate_limit.go for why
+	// nothing has to be shared between replicas.
+	quota        *sendQuota
+	retryBackoff time.Duration
+
 	// seq numbers outbound frames in the order they reach the socket.
 	// Guarded by the writer slot (wmu), which is the point at which the ping
 	// loop, agent replies, inbox pushes and stream frames become ordered — so
@@ -117,13 +124,15 @@ func newWSSender(conn wsConn, log *slog.Logger) *wsSender {
 		log = slog.Default()
 	}
 	return &wsSender{
-		conn:       conn,
-		log:        log,
-		wmu:        make(chan struct{}, 1),
-		replies:    make(map[string]*replyWaiter),
-		waiters:    make(map[string]*ackWaiter),
-		streams:    make(map[string]*streamAcks),
-		ackTimeout: ackTimeout,
+		conn:         conn,
+		log:          log,
+		wmu:          make(chan struct{}, 1),
+		replies:      make(map[string]*replyWaiter),
+		waiters:      make(map[string]*ackWaiter),
+		streams:      make(map[string]*streamAcks),
+		ackTimeout:   ackTimeout,
+		quota:        newSendQuota(),
+		retryBackoff: sendRetryBackoff,
 	}
 }
 
@@ -724,27 +733,53 @@ func (s *wsSender) sendText(chatID string, chatTypeInt int, content string) erro
 // A piece that fails stops the rest: the pieces after it are the tail of an
 // answer whose head did not arrive, and sending them alone would read as the
 // bot replying to nothing.
+//
+// A failure past the FIRST piece is wrapped in errPartiallySent, because the
+// caller's question — may this send be tried again? — has a different answer
+// once part of the answer is in the chat.
 func (s *wsSender) sendTextCtx(ctx context.Context, chatID string, chatTypeInt int, content string) error {
 	pieces := splitForWire(content)
 	if len(pieces) == 1 {
 		return s.sendOneTextCtx(ctx, chatID, chatTypeInt, pieces[0])
 	}
-	for _, piece := range pieces {
+	for i, piece := range pieces {
 		if err := s.sendOneTextCtx(ctx, chatID, chatTypeInt, piece); err != nil {
+			if i > 0 {
+				return fmt.Errorf("%w: %w", errPartiallySent, err)
+			}
 			return err
 		}
 	}
 	return nil
 }
 
+// errPartiallySent marks a long answer whose LATER piece failed after an
+// earlier one was accepted by the server.
+//
+// It exists for one caller decision. Everything else on this path asks "did
+// this frame reach the peer", and for the failing piece the honest answer may
+// still be no — but the SEND is not the frame. splitForWire cuts one answer
+// into several aibot_send_msg frames, and by the time piece two fails, piece
+// one is already in the user's chat. A caller that reads the failure as "this
+// send put nothing on the wire" and retries the whole content prints the first
+// piece a second time, which is the one outcome a retry exists to avoid.
+//
+// So this is deliberately NOT a claim about the failing frame — provablyNotSent
+// asks about the send as a whole, and this answers that question.
+var errPartiallySent = errors.New("wecom: an earlier piece of this answer was already accepted")
+
 // sendOneTextCtx writes exactly one aibot_send_msg frame and reads its ack.
 // Nothing here may exceed the cap: splitForWire is the only thing standing
 // between an agent's answer and a 45002 refusal.
+//
+// Through sendMsgFrame rather than request directly, so this piece counts
+// against the chat's quota and gets its retry if WeCom throttles it — a long
+// answer is where a single reply spends several of those allowances at once
+// (rate_limit.go).
 func (s *wsSender) sendOneTextCtx(ctx context.Context, chatID string, chatTypeInt int, content string) error {
 	body, err := sendMsgTextBody(chatID, chatTypeInt, content)
 	if err != nil {
 		return err
 	}
-	_, err = s.request(ctx, cmdSendMsg, body)
-	return err
+	return s.sendMsgFrame(ctx, chatID, body)
 }

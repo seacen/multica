@@ -752,6 +752,28 @@ func channelMessageFromCallback(botID, botDisplayName string, mc aibotMsgCallbac
 		if control.Kind == engine.ControlCommandFreshSession && control.Body == "" {
 			command = text
 		}
+	} else if bare, ok := engine.ParseControlCommand(command); ok &&
+		bare.Kind == engine.ControlCommandNewChat && bare.Body == "" && mc.Quote.render() != "" {
+		// A bare /new behind a quote. normalizeWeComControlLayout declined this
+		// message on purpose — a directive with nothing after it and no file of
+		// the sender's own is the shared pending sentinel rather than a turn —
+		// so the quote block routableText rendered is still sitting above the
+		// directive, and Router is the one that has to consume it.
+		//
+		// Router consumes a body it recognises AS the directive, and for /new
+		// the test it uses is Text == CommandText (router.go, the
+		// ControlCommandNewChat branch). The quote block breaks that equality,
+		// so the literal "/new" survived into the body of the chat that command
+		// had just created — the first line the new session ever held, and part
+		// of the context every later turn in that room reads.
+		//
+		// So hand the directive over undecorated and let Router empty it. The
+		// quote goes with it: nothing was asked, so there is no question for it
+		// to be the subject of. That is what a bare /clear behind a quote
+		// already ends up as — its Router branch rewrites Text unconditionally
+		// and never needed the adapter's help, which is why only /new is
+		// handled here.
+		text = command
 	}
 
 	wm := InboundMessage{

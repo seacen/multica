@@ -59,6 +59,7 @@ type WecomMetrics struct {
 	OutboundDelivered     prometheus.Counter
 	OutboundDropped       *prometheus.CounterVec
 	OutboundSkipped       *prometheus.CounterVec
+	OutboundTruncated     prometheus.Counter
 	AttachmentDelivered   prometheus.Counter
 	AttachmentDropped     *prometheus.CounterVec
 	AttachmentSheds       prometheus.Counter
@@ -104,8 +105,11 @@ func NewWecomMetrics() *WecomMetrics {
 		}, []string{"reason"}),
 		OutboundSkipped: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "multica", Subsystem: "wecom", Name: "outbound_skipped_total",
-			Help: "Completions this adapter was never going to deliver to WeCom, by reason. Kept apart from dropped because none of these is a delivery failure: origin_not_channel is a question typed in Multica on a WeCom-bound session, installation_inactive means there is no longer an installation to deliver through, nothing_to_say is an empty completion carrying no file. Counting them as drops would make ordinary web usage read as a WeCom outage.",
+			Help: "Completions this adapter was never going to deliver to WeCom, by reason. Kept apart from dropped because none of these is a delivery failure: origin_not_channel is a question typed in Multica on a WeCom-bound session, installation_inactive means there is no longer an installation to deliver through, nothing_to_say is an empty completion carrying no file, not_wecom_turn is another platform's chat:done arriving on the shared event bus. Counting them as drops would make ordinary web usage read as a WeCom outage. One reason here IS worth acting on: no_delivery_row means a turn whose input came in over a channel has no row saying which one, which in a steady-state deployment cannot happen — it is an in-flight task from a build that predates the row, so somebody asked and is getting no answer. Drain or backfill the channel tasks still running before swapping the image.",
 		}, []string{"reason"}),
+		OutboundTruncated: counter("outbound_truncated_total",
+			"Replies the user can read the beginning of and no more: an answer past the 20480-byte body cap goes out as several messages, and a piece after the first failed with the ones before it already in the chat. Also counted in outbound_delivered_total, so read it as a fraction of that rather than adding it — the reply DID reach the user, just not all of it, which is why it is neither a drop (an operator resending would print the opening twice) nor a plain delivery.",
+		),
 		AttachmentDelivered: counter("outbound_attachment_delivered_total",
 			"Files put in front of a WeCom user. Counts FILES; the outbound_delivered/dropped/skipped trio counts REPLIES."),
 		AttachmentDropped: prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -135,7 +139,7 @@ func (m *WecomMetrics) Collectors() []prometheus.Collector {
 		m.CallbacksQueued, m.CallbackQueueBlocked,
 		m.StreamFinished, m.StreamFellBack,
 		m.MediaFailures,
-		m.OutboundDelivered, m.OutboundDropped, m.OutboundSkipped,
+		m.OutboundDelivered, m.OutboundDropped, m.OutboundSkipped, m.OutboundTruncated,
 		m.AttachmentDelivered, m.AttachmentDropped, m.AttachmentSheds,
 		m.OutboundUnconfirmed, m.AttachmentUnconfirmed,
 		m.RelayShed,
@@ -155,6 +159,7 @@ func (m *WecomMetrics) RecordOutboundDropped(reason string) {
 func (m *WecomMetrics) RecordOutboundSkipped(reason string) {
 	m.OutboundSkipped.WithLabelValues(reason).Inc()
 }
+func (m *WecomMetrics) RecordOutboundTruncated()   { m.OutboundTruncated.Inc() }
 func (m *WecomMetrics) RecordAttachmentDelivered() { m.AttachmentDelivered.Inc() }
 func (m *WecomMetrics) RecordAttachmentDropped(reason string) {
 	m.AttachmentDropped.WithLabelValues(reason).Inc()

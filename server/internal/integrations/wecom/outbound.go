@@ -33,6 +33,17 @@ package wecom
 // the socket; a round whose bubble lives elsewhere finds none here and takes
 // the addressed path, which is where the relay is.
 //
+// They never MEET either, and that is a known gap rather than a property of the
+// topology. The replica that takes a relayed reply is by definition the one
+// holding the socket, which is the one with the bubble — and deliverRelayed
+// pushes the words as an ordinary message without ever looking for it
+// (relay_outbound.go). So on a multi-replica deployment the answer arrives, the
+// bubble it belonged in stays open, and streamGuardAfter later seals it with
+// "还在处理，完成后我再单独回复你": a promise of a separate reply the reader
+// already has, sitting above it. Replies are delivered either way; the in-place
+// bubble is a single-replica experience until a relayed reply is routed through
+// the ending ledger on the replica that takes it (stream_store.go).
+//
 // Sessions with no wecom binding are ignored so this coexists with the Slack /
 // Lark subscribers on the shared bus.
 
@@ -393,7 +404,15 @@ func (o *Outbound) deliverAnswer(ctx context.Context, e events.Event, taskID pgt
 				// The rest of the answer goes directly under the bubble, ahead of
 				// any files: it is the same answer, and a file arriving between two
 				// halves of a sentence reads as an interruption.
-				o.sendRest(ctx, t.Handle, rest)
+				//
+				// A piece that fails here leaves the user reading the head of an
+				// answer whose tail is nowhere, and that is recorded rather than
+				// warned about and forgotten — the plain path reaches the same
+				// screen through errPartiallySent and records the same pair, so
+				// the two agree on what the person actually got.
+				if err := o.sendRest(ctx, t.Handle, rest); err != nil {
+					o.truncated(ctx, e.ChatSessionID, err)
+				}
 				o.delivered()
 				return answerOutcome{addr: t.Handle.address(), spoke: true}, nil
 			}
@@ -474,14 +493,24 @@ func (o *Outbound) sendAsMessage(ctx context.Context, e events.Event, taskID pgt
 	delivery, err := o.q.GetChannelTaskDelivery(ctx, taskID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// No route was recorded for this turn: it never came in over a
-			// channel, or it came in over one that keeps no delivery row.
+			// No route was recorded for a turn whose input DID come in over a
+			// channel — the origin gate has already established that much. In
+			// a steady-state deployment there is no such turn: the delivery
+			// row is written inside the same transaction that enqueues a
+			// channel task. What produces one is an upgrade, and the answer it
+			// belongs to is going nowhere, so the branch is counted and warned
+			// about rather than left as a quiet return. See skipNoDeliveryRow.
+			o.skippedFor(ctx, e.ChatSessionID, skipNoDeliveryRow)
 			return answerOutcome{}, errNothingToSay
 		}
 		return answerOutcome{}, fmt.Errorf("wecom: lookup task delivery: %w", err)
 	}
 	if delivery.ChannelType != channelTypeWecom {
-		// Not a wecom turn (Slack / Lark / web-only).
+		// Not a wecom turn (Slack / Lark). Named rather than silent so it does
+		// not share an exit with the branch above it: the two are one
+		// errNothingToSay from outside, and one of them means somebody is
+		// waiting.
+		o.skippedFor(ctx, e.ChatSessionID, skipNotWecomTurn)
 		return answerOutcome{}, errNothingToSay
 	}
 	binding := wecomBindingFromTaskDelivery(delivery)
@@ -550,7 +579,22 @@ func (o *Outbound) sendAsMessage(ctx context.Context, e events.Event, taskID pgt
 		return answerOutcome{addr: addr}, nil
 	}
 	if err := sender.sendTextCtx(ctx, addr.ChatID, addr.ChatType, content); err != nil {
-		return answerOutcome{addr: addr}, err
+		if !errors.Is(err, errPartiallySent) {
+			return answerOutcome{addr: addr}, err
+		}
+		// An earlier piece of this answer is already in the chat. The person
+		// has words on their screen and the rest of the answer is not coming,
+		// which is neither of the two endings the caller would otherwise pick:
+		// returning the error records a drop, and an operator reading that as
+		// "resend it" would print the opening a second time.
+		//
+		// So it settles here, the same way the bubble path settles a failed
+		// sendRest — delivered, plus the count that says only part of it
+		// arrived. Reporting spoke means the files that follow are not the
+		// whole answer, which is true: some of the words got there. And a nil
+		// error is what stops the round being left owed an ending, whose next
+		// claimant would repeat the whole answer under the half already read.
+		o.truncated(ctx, e.ChatSessionID, err)
 	}
 	o.delivered()
 	return answerOutcome{addr: addr, spoke: true}, nil
@@ -594,14 +638,13 @@ func chatDoneTaskID(e events.Event) (pgtype.UUID, bool) {
 // so it is logged with the one detail that explains it: whether the stream is
 // beyond saving (past its window, bad req_id) or the socket simply blinked.
 //
-// The success is counted inside sendersRegistry.stream, which every bubble
-// closer goes through; the fall-back is counted here, next to the attempt that
-// failed, rather than in the caller. Counted at all because from outside the
-// two endings are indistinguishable: the user gets the answer either way, and
-// nobody reports "the bubble I was watching turned into a separate message". A
-// bubble that has stopped working at all — a WeCom-side change to the stream
-// frame, a req_id convention that drifted — shows up as this number climbing
-// to meet stream_finished, and nowhere else.
+// Both endings are counted inside sendersRegistry.stream, which every bubble
+// closer goes through — this one and the typing indicator's. Counted at all
+// because from outside the two are indistinguishable: the user gets the answer
+// either way, and nobody reports "the bubble I was watching turned into a
+// separate message". A bubble that has stopped working at all — a WeCom-side
+// change to the stream frame, a req_id convention that drifted — shows up as
+// stream_fell_back climbing to meet stream_finished, and nowhere else.
 //
 // senders is non-nil here: takeStream returns false without it.
 func (o *Outbound) finishStream(ctx context.Context, h streamHandle, text string) error {
@@ -609,7 +652,6 @@ func (o *Outbound) finishStream(ctx context.Context, h streamHandle, text string
 	if err == nil {
 		return nil
 	}
-	o.senders.mx().RecordStreamFellBack()
 	o.logger.WarnContext(ctx, "wecom outbound: in-place reply failed, sending a new message instead",
 		"installation_id", uuidStringPub(h.InstallationID),
 		"stream_unusable", streamUnusable(err), "error", err)
@@ -636,15 +678,24 @@ func splitForBubble(text string) (head string, rest []string) {
 // One at a time and in order, because that is the order they are meant to be
 // read in. A piece that fails stops the rest for the same reason: what follows
 // it only makes sense after it.
-func (o *Outbound) sendRest(ctx context.Context, h streamHandle, rest []string) {
+//
+// It returns that failure rather than swallowing it. The bubble is already
+// sealed by the time this runs, so the caller cannot un-send anything — but it
+// is the only thing that knows the reply is now half an answer, and half an
+// answer counted as a whole one is the reason this returned nothing for as long
+// as it did. The error names which piece stopped, because "the answer broke
+// after the first message" and "it broke on the last of nine" are different
+// amounts of the answer lost.
+func (o *Outbound) sendRest(ctx context.Context, h streamHandle, rest []string) error {
 	for i, piece := range rest {
 		if err := o.senders.sendTextCtx(ctx, h.InstallationID, h.ChatID, h.ChatType, piece); err != nil {
 			o.logger.WarnContext(ctx, "wecom outbound: could not send the rest of a long answer",
 				"installation_id", uuidStringPub(h.InstallationID),
 				"piece", i+2, "of", len(rest)+1, "error", err)
-			return
+			return fmt.Errorf("wecom: piece %d of %d: %w", i+2, len(rest)+1, err)
 		}
 	}
+	return nil
 }
 
 // chatDoneContent extracts the reply text from an EventChatDone payload

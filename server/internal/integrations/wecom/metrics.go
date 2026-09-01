@@ -63,10 +63,16 @@ type Metrics interface {
 	RecordCallbackQueueBlocked()
 
 	// RecordStreamFinished / FellBack — how the bubble ended. A fall-back is
-	// an answer that arrived as a new message because the bubble could not
-	// take the closing frame; the answer is not lost, but the experience is
+	// an ending that arrived as a new message because the bubble could not
+	// take the closing frame; the words are not lost, but the experience is
 	// the one the bubble was built to replace. The ratio between the two is
 	// the signal; the count of bubbles opened is not, so it is not collected.
+	//
+	// Both are fed from the one line in sendersRegistry.stream, and they have
+	// to stay that way for the ratio to mean anything: every closer goes
+	// through it — the answer, and the failure and cancellation notices the
+	// typing indicator writes — so a ratio read off these two covers the same
+	// population on both sides.
 	RecordStreamFinished()
 	RecordStreamFellBack()
 
@@ -92,6 +98,24 @@ type Metrics interface {
 	// apart from dropped on purpose: counting a web-UI question's answer as a
 	// failed WeCom delivery makes ordinary web usage look like an outage.
 	RecordOutboundSkipped(reason string)
+	// RecordOutboundTruncated — one reply the user can read the beginning of
+	// and no more. An answer past the 20480-byte body cap goes out as several
+	// messages, and a piece after the first can fail with the ones before it
+	// already in the chat.
+	//
+	// Its own counter because neither of the other two can say this. Dropped
+	// says nobody was told anything, and an operator reading it as "resend
+	// that" would print the opening of the answer twice; delivered on its own
+	// says the whole answer arrived. The reply is ALSO counted as delivered,
+	// which is what keeps the denominator meaning "replies that reached the
+	// user" — so this is read as a fraction of delivered, not added to it.
+	//
+	// Both routes an answer can take feed it, which is the point: before this
+	// existed, a long answer that broke halfway was recorded as delivered when
+	// the round had a bubble and as dropped when it did not — the same thing
+	// on the user's screen, counted two opposite ways depending on an
+	// implementation detail they cannot see.
+	RecordOutboundTruncated()
 
 	// RecordAttachmentDelivered / RecordAttachmentDropped count FILES, one per
 	// file, while the three above count REPLIES, one per reply. The two units
@@ -164,6 +188,7 @@ func (nopMetrics) RecordMediaFailure(string)          {}
 func (nopMetrics) RecordOutboundDelivered()           {}
 func (nopMetrics) RecordOutboundDropped(string)       {}
 func (nopMetrics) RecordOutboundSkipped(string)       {}
+func (nopMetrics) RecordOutboundTruncated()           {}
 func (nopMetrics) RecordAttachmentDelivered()         {}
 func (nopMetrics) RecordAttachmentDropped(string)     {}
 func (nopMetrics) RecordAttachmentDeliveryShed()      {}

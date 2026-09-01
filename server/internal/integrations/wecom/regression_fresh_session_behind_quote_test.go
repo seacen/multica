@@ -1,10 +1,14 @@
 package wecom
 
-// regression_fresh_session_behind_quote_test.go — "/clear" is how a person tells
-// the bot to forget the previous conversation and start over. In a busy room
-// the way you ask about one specific message is to 引用 it and type your
-// question underneath, so "quote a message + /clear 重新分析" is the ordinary
-// shape of the request, not an exotic one.
+// regression_fresh_session_behind_quote_test.go — "/clear" and "/new" are how a
+// person tells the bot to forget the previous conversation and start over. In a
+// busy room the way you ask about one specific message is to 引用 it and type
+// your question underneath, so "quote a message + /clear 重新分析" is the
+// ordinary shape of the request, not an exotic one.
+//
+// Both directives are covered here, and the two must be read together: they
+// share this adapter's quote recomposition but are consumed by two different
+// Router branches, so a case that holds for one says nothing about the other.
 //
 // The quote is rendered ABOVE the user's own line in the stored body, so
 // anything that reads the command off the front of that body reads the quoted
@@ -245,6 +249,75 @@ func TestAQuotedClearCommandDoesNotRestartSomebodyElsesSession(t *testing.T) {
 	}
 	if runs[0] {
 		t.Error("a /clear inside a quote restarted the session: one person's old message must not throw away the room's context the moment somebody quotes it")
+	}
+}
+
+// TestAControlDirectiveBehindAQuoteNeverReachesTheAgent covers both directives
+// in one table, which is the point of it: /clear and /new share this adapter's
+// quote recomposition and then part company inside Router — /clear's branch
+// rewrites the body unconditionally, /new's rewrites it only when the body IS
+// the directive (Text == CommandText). Rendering the quote above the sender's
+// line breaks that equality, so a bare /new arrived with the literal "/new"
+// still in the body and it became the first line the new session ever held —
+// context every later turn in that chat reads.
+//
+// The bare and the carrying forms are both here because they take different
+// routes: a directive with words after it is normalized by the adapter, one
+// with nothing after it is left for Router as the shared pending sentinel.
+//
+// NOTE for a reverse check: delete the `else if` arm in ws_frame.go that hands
+// a bare ControlCommandNewChat over undecorated, and "bare new" here is the
+// ONLY thing in the package that goes red — go build, go vet and gofmt all
+// stay silent, because the leak is a plausible string flowing through
+// correct-looking code rather than anything a compiler can see.
+func TestAControlDirectiveBehindAQuoteNeverReachesTheAgent(t *testing.T) {
+	const quoted = "Q3 毛利率 42.1%"
+
+	for _, tc := range []struct {
+		name string
+		// own is what the sender typed under the quote.
+		own string
+		// directive is the literal that must not survive into the body.
+		directive string
+		// wantQuoted is whether the quoted figure belongs in the body: it is
+		// the subject of a question, and there is no question in a bare
+		// directive.
+		wantQuoted bool
+		// startsAChat is /new (StartSession) rather than /clear (which either
+		// appends or marks the session pending).
+		startsAChat bool
+	}{
+		{name: "clear carrying a question", own: "/clear 重新分析这个数", directive: "/clear", wantQuoted: true},
+		{name: "bare clear", own: "/clear", directive: "/clear"},
+		{name: "new carrying a question", own: "/new 重新分析这个数", directive: "/new", wantQuoted: true, startsAChat: true},
+		{name: "bare new", own: "/new", directive: "/new", startsAChat: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, conn, _, binder := freshSessionRig(t)
+
+			frame := groupQuotingFrame("msg-"+tc.name, tc.own, quoted)
+			if err := c.dispatchFrame(context.Background(), frame, conn.autoAck(newWSSender(conn, nil)), slog.Default()); err != nil {
+				t.Fatalf("dispatchFrame: %v", err)
+			}
+
+			body := binder.appendIn.Body
+			if tc.startsAChat {
+				body = binder.startIn.Body
+				if binder.startIn.BindingKey == "" {
+					t.Fatalf("%q behind a quote never reached StartSession — the rig is not exercising the /new path", tc.own)
+				}
+			}
+			if strings.Contains(body, tc.directive) {
+				t.Errorf("stored body = %q — %q survived into the message the agent reads, and for a new chat that literal is the first line of context every later turn in this room inherits", body, tc.directive)
+			}
+			if got := strings.Contains(body, quoted); got != tc.wantQuoted {
+				if tc.wantQuoted {
+					t.Errorf("stored body = %q — the quoted figure was dropped, so the session was asked to re-analyse a number it has never been shown", body)
+				} else {
+					t.Errorf("stored body = %q — nothing was asked, so quoting somebody else's line into the new session puts words there that its owner never typed", body)
+				}
+			}
+		})
 	}
 }
 

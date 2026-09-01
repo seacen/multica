@@ -649,9 +649,11 @@ func TestAFinishedRunsStepsNeverLandInTheNextQuestionsBubble(t *testing.T) {
 // When another replica or a reconnect takes over a conversation, WeCom refuses
 // every write to the old stream (846605 / 846608). Without refreshes that costs
 // one refusal at the end of the run. WITH refreshes it costs one every 1.5s —
-// roughly 400 on a ten-minute run — and the rate limit they spend (45009, api
-// freq out of limit) is per BOT, not per conversation, so one lost bubble in
-// one chat throttles every other user of the same bot.
+// roughly 400 on a ten-minute run, every one of them refused. What those 400
+// calls spend is not something we can state: WeCom publishes one message
+// frequency limit, per application per member (rate_limit.go), and names no
+// separate figure for a bot's stream frames. That is a reason not to spend it,
+// not a reason to read it as free.
 //
 // So the first refusal is the last one: the round is marked, the user is told
 // once where the rest of the round will appear, and nothing writes to that

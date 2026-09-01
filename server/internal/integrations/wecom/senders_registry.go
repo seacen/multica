@@ -149,14 +149,30 @@ func (r *sendersRegistry) stream(ctx context.Context, h streamHandle, content st
 		return errNoLiveConnection
 	}
 	err := sender.respondStream(ctx, h.ReqID, h.StreamID, content, finish)
-	if finish && err == nil {
-		// The answer landed in the bubble the question opened, which is the
-		// outcome this whole path exists for. Counted here rather than at one
-		// caller because every closer comes through this line — the answer,
-		// and the failure and cancellation notices the typing indicator
-		// writes — and each of them is a bubble that ended in words. Every
-		// other ending is a fall-back, counted where it happens.
-		r.mx().RecordStreamFinished()
+	if finish {
+		// How the bubble ended — BOTH halves, recorded on this one line.
+		//
+		// Every closer comes through here: the answer, and the failure and
+		// cancellation notices the typing indicator writes. A closing frame the
+		// server took is a bubble that ended in words; one it refused sends the
+		// caller to a plain message instead, which is a fall-back at every call
+		// site without exception (outbound.deliverAnswer,
+		// TypingIndicatorManager.writeClosing).
+		//
+		// The pair is recorded together because the pair is the signal — the
+		// ratio is what says whether the bubble still works at all — and a
+		// counter fed from one site while its twin is fed from two reads as a
+		// healthy ratio while a whole class of endings quietly stops using the
+		// bubble. That is what happened when the fall-back was counted in
+		// outbound.finishStream: the typing indicator's own closers never
+		// touched it, so a WeCom-side change that refused every closing frame
+		// would have shown up in the ratio only for answers, never for the
+		// failure and cancellation notices.
+		if err == nil {
+			r.mx().RecordStreamFinished()
+		} else {
+			r.mx().RecordStreamFellBack()
+		}
 	}
 	return err
 }

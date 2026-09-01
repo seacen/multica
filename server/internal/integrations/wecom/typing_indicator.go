@@ -751,7 +751,7 @@ func (m *TypingIndicatorManager) handleTaskFailed(e events.Event) {
 			if !t.HasBubble && !t.Addr.known() && bound.known() {
 				t.Addr = bound
 			}
-			return m.sayTheRunFailed(ctx, sessionID, taskID, t)
+			return m.sayTheRunFailed(ctx, sessionID, t)
 		})
 }
 
@@ -920,17 +920,13 @@ func retryPending(e events.Event) bool {
 // answers roundToldAlready and runs no delivery. That is the whole of the
 // not-twice rule, and it is per run, so a task:failed arriving behind this run's
 // own delivered answer stays quiet while a second run's failure is still told.
-func (m *TypingIndicatorManager) sayTheRunFailed(ctx context.Context, sessionID pgtype.UUID, taskID string, t roundTurn) (roundAddress, error) {
+func (m *TypingIndicatorManager) sayTheRunFailed(ctx context.Context, sessionID pgtype.UUID, t roundTurn) (roundAddress, error) {
 	if m.senders == nil {
 		return roundAddress{}, errNothingToSay
 	}
 	if t.HasBubble {
-		err := m.writeClosing(ctx, sessionID, t.Handle, copyFor(t.Handle.Locale).StreamFailed, "task failed")
-		if err == nil {
-			// Written to the socket, so the queue has no row for it and the
-			// reconciler would deliver its own notice on top.
-		}
-		return t.Handle.address(), err
+		return t.Handle.address(),
+			m.writeClosing(ctx, sessionID, t.Handle, copyFor(t.Handle.Locale).StreamFailed, "task failed")
 	}
 	addr := t.Addr
 	if !addr.known() {
@@ -940,10 +936,7 @@ func (m *TypingIndicatorManager) sayTheRunFailed(ctx context.Context, sessionID 
 		}
 		addr = found
 	}
-	err := m.sayAsPlainMessage(ctx, sessionID, addr, m.copyForAddress(ctx, addr).StreamFailed)
-	if err == nil {
-	}
-	return addr, err
+	return addr, m.sayAsPlainMessage(ctx, sessionID, addr, m.copyForAddress(ctx, addr).StreamFailed)
 }
 
 // copyForAddress picks the pack for a round whose handle is gone: the words
@@ -1137,10 +1130,12 @@ func (m *TypingIndicatorManager) fireGuard(ctx context.Context, sessionID pgtype
 // comes off the handle, captured at ingest, because by now the binding row may
 // point at a different chat.
 //
-// Both routes failing is what the returned error is for. The ledger then
-// records nothing as SAID, so this run's ending is still owed and the next
-// publisher of it — a sweeper tick, WeCom's own redelivery — says it instead of
-// finding it filed as already said.
+// Both routes failing is what the returned error is for, and WHICH of the two
+// failures it carries is what the ledger reads. A pair that provably put
+// nothing on the wire leaves this run's ending owed, so the next publisher of
+// it — a sweeper tick, WeCom's own redelivery — says it instead of finding it
+// filed as already said. A pair in which either attempt's outcome is unknown
+// reports that unknown instead, and the run is spoken for (I4, stream_store.go).
 func (m *TypingIndicatorManager) writeClosing(ctx context.Context, sessionID pgtype.UUID, h streamHandle, text, why string) error {
 	err := m.senders.stream(ctx, h, text, true)
 	if err == nil {
@@ -1150,9 +1145,21 @@ func (m *TypingIndicatorManager) writeClosing(ctx context.Context, sessionID pgt
 		"chat_session_id", util.UUIDToString(sessionID),
 		"reason", why, "unusable", streamUnusable(err), "error", err)
 	sendErr := m.senders.sendTextCtx(ctx, h.InstallationID, h.ChatID, h.ChatType, text)
-	if sendErr != nil {
-		m.log.WarnContext(ctx, "wecom typing: the fallback message was unsendable too",
-			"chat_session_id", util.UUIDToString(sessionID), "reason", why, "error", sendErr)
+	if sendErr == nil {
+		return nil
+	}
+	m.log.WarnContext(ctx, "wecom typing: the fallback message was unsendable too",
+		"chat_session_id", util.UUIDToString(sessionID), "reason", why, "error", sendErr)
+	if unconfirmedReason(sendErr) == "" && unconfirmedReason(err) != "" {
+		// Both routes failed and only the SECOND failure is definite — the
+		// registry lost its sender between the two, say, so the plain message
+		// never reached a socket. The closing frame did: it was written and
+		// nothing came back, so it may have sealed the bubble with these very
+		// words. Returning the definite error would tell the ledger nothing was
+		// said and put the run back on owed (I4, stream_store.go), and the next
+		// publisher would say the same thing underneath a bubble that already
+		// says it. The unknown is the honest account of the pair.
+		return err
 	}
 	return sendErr
 }
