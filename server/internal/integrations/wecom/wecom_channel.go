@@ -231,6 +231,20 @@ func (c *wecomChannel) Connect(ctx context.Context) (err error) {
 	// Install the sender on the package-level registry so the OutboundReplier
 	// (created at boot, not per-installation) can locate this connection by
 	// installation id and push aibot_send_msg over the same socket. Cleared
+	// on exit so a stale sender for a dead connection is never dispatched to.
+	//
+	// This registration is the ONLY writer of that registry: sendersRegistry
+	// is package-private and set() has no other production caller, so losing
+	// these three lines does not fail anything — it silently makes every
+	// outbound push resolve to nil. The bubble never opens, the answer never
+	// leaves, and the bot goes on receiving messages without ever replying.
+	// TestConnectRegistersTheSenderWhileTheConnectionIsLive is what stands
+	// between that and a green build.
+	if c.senders != nil && c.installationID.Valid {
+		c.senders.set(c.installationID, sender)
+		defer c.senders.clear(c.installationID, sender)
+	}
+
 	// Heartbeat — ping every 30s (pingInterval), the cadence WeCom's docs
 	// prescribe, via the shared writer mutex so it interleaves cleanly with
 	// other outbound frames.
