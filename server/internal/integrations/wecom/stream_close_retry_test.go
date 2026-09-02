@@ -12,6 +12,9 @@ package wecom
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -243,5 +246,43 @@ func TestATakeThatThenFailsIsOneCountedDropAndNothingMore(t *testing.T) {
 	}
 	if got := mx.get("outbound_dropped"); got != 1 {
 		t.Errorf("dropped = %d after the replay, want still 1", got)
+	}
+}
+
+// A closing frame the socket itself refuses to take — a broken pipe on the
+// write — is not a lost ack. errWriteAttempted says the frame MAY have reached
+// the peer, so the retry policy, which is for verdicts that never came, does
+// not apply: seal reports the failure at once, the answer goes out as a plain
+// message, and the user gets it exactly once.
+//
+// REVERSE VERIFICATION: make seal retry on any error (loop while err != nil
+// instead of while errors.Is(err, errStreamAckTimeout)) and this fails with
+// four closing frames on the wire instead of one.
+func TestAClosingFrameTheSocketRefusesToTakeGoesOutAsAMessageOnce(t *testing.T) {
+	t.Parallel()
+	rig, mx := retryRig(t)
+	rig.ran(t, "REQ-BROKEN", 1, "task-1")
+	rig.conn.failClosingWrite = errors.New("write: broken pipe")
+
+	rig.answer(t, "the agent reply", "task-1")
+
+	closing := 0
+	for _, f := range rig.conn.streamFrames(t) {
+		if f["finish"] == true {
+			closing++
+		}
+	}
+	if closing != 1 {
+		t.Fatalf("%d closing frames reached the socket, want 1: a write the socket refused is not retried", closing)
+	}
+	pushes := rig.conn.pushes(t)
+	if len(pushes) != 1 || !strings.Contains(fmt.Sprint(pushes[0]), "the agent reply") {
+		t.Fatalf("plain messages = %v, want exactly one carrying the answer", pushes)
+	}
+	if got := mx.get("stream_fell_back"); got != 1 {
+		t.Errorf("stream_fell_back = %d, want 1", got)
+	}
+	if got := mx.get("stream_finished"); got != 0 {
+		t.Errorf("stream_finished = %d, want 0", got)
 	}
 }

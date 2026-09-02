@@ -31,6 +31,12 @@ type bubbleConn struct {
 
 	refuseClosingCode int
 
+	// failClosingWrite makes the socket itself refuse a closing frame — the
+	// write returns this error, the way a half-closed connection reports a
+	// broken pipe. No ack is ever produced for it: nothing may have left the
+	// process, and nothing says whether it did.
+	failClosingWrite error
+
 	// disownAfterFrames makes the connection behave like a stream another
 	// replica or a reconnect has taken over: the first n stream frames land,
 	// and every one after that is refused with 846608 — a refresh, a closing
@@ -93,6 +99,10 @@ func (c *bubbleConn) WriteMessage(_ int, data []byte) error {
 	var onClosing func()
 	if isClosingFrame(env) {
 		c.closingWrites++
+		if c.failClosingWrite != nil {
+			c.mu.Unlock()
+			return c.failClosingWrite
+		}
 		if c.refuseClosingCode != 0 {
 			code = c.refuseClosingCode
 		}
