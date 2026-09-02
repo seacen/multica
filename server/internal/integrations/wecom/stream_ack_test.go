@@ -139,9 +139,13 @@ func TestAFrameAfterTheClosingFrameNeverReachesTheWire(t *testing.T) {
 	}
 }
 
-// A closing frame must be able to jump an opening frame whose ack is still in
-// flight, or the answer is held hostage by a spinner.
-func TestTheClosingFrameJumpsAnUnackedOpeningFrame(t *testing.T) {
+// A closing frame must NOT jump an opening frame whose ack is still in
+// flight. Measured against the live bot (STRATEGY §6.4): two frames of one
+// req_id on the wire are answered in whatever order the server likes, and the
+// second is refused with 6000 for colliding with the first — so a jumped
+// answer can be refused while its verdict is read off the opening frame's
+// "accepted". The closing frame waits its turn instead.
+func TestTheClosingFrameWaitsForTheUnackedOpeningFrame(t *testing.T) {
 	t.Parallel()
 	conn := &silentConn{}
 	sender := newWSSender(conn, nil)
@@ -158,34 +162,78 @@ func TestTheClosingFrameJumpsAnUnackedOpeningFrame(t *testing.T) {
 	go func() {
 		closing <- sender.respondStream(context.Background(), reqID, "S-3", "the answer", true)
 	}()
-	waitForFrames(t, conn, 2)
 
-	// The opening frame's caller is released with "superseded" rather than
-	// left to time out.
+	// While the opening frame's verdict is outstanding the answer stays off
+	// the wire.
+	time.Sleep(150 * time.Millisecond)
+	if n := conn.count(); n != 1 {
+		t.Fatalf("%d frames on the wire with the opening frame unacked, want 1: the closing frame jumped", n)
+	}
 	select {
 	case err := <-opening:
-		if !errors.Is(err, errStreamSuperseded) {
-			t.Fatalf("displaced opening frame reported %v, want errStreamSuperseded", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("the opening frame was never released")
+		t.Fatalf("opening frame returned %v before its verdict arrived", err)
+	default:
 	}
 
-	// Two acks come back, in write order. The first belongs to the opening
-	// frame and must not settle the answer.
-	sender.deliverAck(reqID, 0, "")
+	// The opening frame's verdict arrives, and only now does the answer go.
 	sender.deliverAck(reqID, 0, "")
 	select {
-	case err := <-closing:
+	case err := <-opening:
 		if err != nil {
-			t.Fatalf("closing frame: %v", err)
+			t.Fatalf("opening frame: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the opening frame never read its verdict")
+	}
+	waitForFrames(t, conn, 2)
+	if got := conn.streamBody(t, 1)["finish"]; got != true {
+		t.Errorf("second frame finish = %v, want true", got)
+	}
+
+	// The closing frame reads ITS verdict — a refusal here, the case that
+	// used to be lost.
+	sender.deliverAck(reqID, errcodeStreamExpired, "stream expired")
+	select {
+	case err := <-closing:
+		if !streamUnusable(err) {
+			t.Fatalf("closing frame reported %v; want the server's 846608 refusal so the answer falls back to a plain message", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("the closing frame never read its verdict")
 	}
+}
 
-	if got := conn.streamBody(t, 1)["finish"]; got != true {
-		t.Errorf("second frame finish = %v, want true", got)
+// The wait is bounded: an opening frame nobody ever answers times out on its
+// own budget, and the closing frame goes out right behind it rather than
+// hanging the answer on a spinner. The late verdict, should it come, is then
+// handled by the count (TestALateVerdictIsNotHandedToTheNextFrame).
+func TestTheClosingFrameGoesOutOnceTheOpeningFrameTimesOut(t *testing.T) {
+	t.Parallel()
+	conn := &silentConn{}
+	sender := newWSSender(conn, nil)
+	sender.ackTimeout = 300 * time.Millisecond
+	const reqID = "REQ-3b"
+
+	opening := make(chan error, 1)
+	go func() {
+		opening <- sender.respondStream(context.Background(), reqID, "S-3b", streamThinkingPlaceholder, false)
+	}()
+	waitForFrames(t, conn, 1)
+
+	started := time.Now()
+	closing := make(chan error, 1)
+	go func() {
+		closing <- sender.respondStream(context.Background(), reqID, "S-3b", "the answer", true)
+	}()
+	waitForFrames(t, conn, 2)
+	if waited := time.Since(started); waited < 200*time.Millisecond {
+		t.Fatalf("the closing frame reached the wire after %v, before the opening frame's %v budget ran out", waited, sender.ackTimeout)
+	}
+	if err := <-opening; !errors.Is(err, errStreamAckTimeout) {
+		t.Fatalf("opening frame reported %v, want errStreamAckTimeout", err)
+	}
+	if err := <-closing; !errors.Is(err, errStreamAckTimeout) {
+		t.Fatalf("closing frame reported %v, want errStreamAckTimeout (nothing answered it either)", err)
 	}
 }
 

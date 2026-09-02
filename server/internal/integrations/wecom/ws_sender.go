@@ -179,15 +179,11 @@ func (e *wecomAPIError) Error() string {
 	return fmt.Sprintf("wecom: %s rejected errcode=%d errmsg=%s", e.Cmd, e.Code, e.Msg)
 }
 
-// ackSuperseded is the pseudo-code handed to a waiter whose frame was
-// displaced by a closing frame on the same stream.
-const ackSuperseded = -1
-
 var (
 	// errStreamBusy — a mid-stream frame was skipped because the previous
 	// frame on this req_id has not been acked. This is the backpressure the
-	// official SDK calls replyStreamNonBlocking: non-final frames yield,
-	// closing frames never do.
+	// official SDK calls replyStreamNonBlocking: non-final frames yield.
+	// Closing frames do not yield either — they queue (awaitAck).
 	errStreamBusy = errors.New("wecom: previous stream frame still unacked")
 
 	// errStreamAckTimeout — the frame went out and no verdict came back. The
@@ -195,8 +191,8 @@ var (
 	// against a possible silence rather than assuming failure.
 	errStreamAckTimeout = errors.New("wecom: stream frame ack timed out")
 
-	// errStreamSuperseded — a frame was overtaken by the closing frame, either
-	// while waiting for its verdict or on the way to the wire.
+	// errStreamSuperseded — a non-final frame reached the writer after the
+	// closing frame had sealed the stream, and was refused there.
 	errStreamSuperseded = errors.New("wecom: stream frame superseded by the closing frame")
 
 	// errNoLiveConnection lives in outbound_outcome.go: classifyDrop matches on
@@ -210,9 +206,19 @@ var (
 // the wire — see streamAcks for why a verdict has to be matched rather than
 // simply handed to whoever is waiting.
 type ackWaiter struct {
-	ch  chan ackResult
-	seq uint64 // 0 until the frame is written
+	ch   chan ackResult
+	seq  uint64        // 0 until the frame is written
+	done chan struct{} // closed once the waiter has left the table, by verdict or by cancel
+	once sync.Once
 }
+
+func newAckWaiter() *ackWaiter {
+	return &ackWaiter{ch: make(chan ackResult, 1), done: make(chan struct{})}
+}
+
+// resolve marks the waiter as gone from the table. A closing frame parked
+// behind it (awaitAck) wakes on this.
+func (w *ackWaiter) resolve() { w.once.Do(func() { close(w.done) }) }
 
 // ackResult is one server verdict.
 type ackResult struct {
@@ -227,21 +233,20 @@ type ackResult struct {
 // The ack frame carries nothing but the req_id — no stream id, no sequence —
 // so a verdict is only identifiable by its position.
 //
-// ASSUMPTION, unmeasured: acks come back over the one TCP connection in the
-// order the frames went out. WeCom documents no ordering guarantee for them,
-// and we have not instrumented a run to check. It is the weakest premise under
-// this file — if the server ever answers out of order, matching by position
-// misattributes verdicts and the counting below makes it worse, not better.
-// What would settle it: tag a sequence onto the frames of one turn in a trace
-// build and record the order the acks arrive in over a few thousand turns,
-// including a reconnect. Until then, cancelAck is deliberately the only way a
-// count moves without a verdict.
+// MEASURED 2026-09-02 against the live bot (STRATEGY §6.4): with several
+// frames of one req_id in flight, acks do NOT come back in write order — 24
+// frames written back-to-back were answered grouped by outcome, and eleven of
+// twelve concurrent refreshes to one stream were refused with errcode 6000
+// ("data version conflict"). So position matching is only sound while AT MOST
+// ONE frame of a req_id is on the wire, and that is the rule awaitAck now
+// enforces for closing frames as well as refreshes.
 //
-// Without the count, an
-// opening frame whose ack is still on the wire when the answer goes out hands
-// ITS verdict to the closing frame, and a closing frame the server actually
-// refused reads as delivered — which loses the answer entirely, since the
-// caller then has no reason to fall back to a plain message.
+// The count still matters under that rule, for the one ordering that remains:
+// a frame whose caller gave up (cancelAck) may still be answered later, and
+// that late verdict must not be handed to the next frame. With one frame in
+// flight the worst a mis-ordered late ack can do is make the NEXT frame time
+// out, which sends the answer as a plain message — a possible duplicate, never
+// a silence.
 //
 // sealed is the other half: a finished stream is immutable, so a frame that
 // lost the race to the answer must never reach the wire behind it.
@@ -332,27 +337,39 @@ func (s *wsSender) deliverAck(reqID string, code int, msg string) {
 	case w.ch <- ackResult{code: code, msg: msg}:
 	default:
 	}
+	w.resolve()
 }
 
 // awaitAck registers interest in the verdict for the stream frame about to be
-// written. force is what makes a closing frame able to jump an in-flight
-// frame: without it the answer would be held hostage by an opening frame whose
-// ack is late.
-func (s *wsSender) awaitAck(reqID string, force bool) (*ackWaiter, bool) {
-	s.ackMu.Lock()
-	defer s.ackMu.Unlock()
-	if prev, taken := s.waiters[reqID]; taken {
-		if !force {
-			return nil, false
+// written, and is where "one frame in flight per req_id" is enforced.
+//
+// A non-final frame that finds one in flight yields with errStreamBusy. A
+// closing frame waits for it to leave the table — by verdict or by its
+// caller's own timeout, so the wait is bounded by ackTimeout — and only then
+// takes its turn. It used to jump the queue instead, and that was the window
+// the live probe showed to be lethal: two frames on the wire are answered in
+// whatever order the server likes and the second is refused with 6000 for
+// colliding with the first, so a refused answer could read as delivered.
+func (s *wsSender) awaitAck(ctx context.Context, reqID string, finish bool) (*ackWaiter, error) {
+	for {
+		s.ackMu.Lock()
+		prev, taken := s.waiters[reqID]
+		if !taken {
+			w := newAckWaiter()
+			s.waiters[reqID] = w
+			s.ackMu.Unlock()
+			return w, nil
+		}
+		s.ackMu.Unlock()
+		if !finish {
+			return nil, errStreamBusy
 		}
 		select {
-		case prev.ch <- ackResult{code: ackSuperseded}:
-		default:
+		case <-prev.done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
-	w := &ackWaiter{ch: make(chan ackResult, 1)}
-	s.waiters[reqID] = w
-	return w, true
 }
 
 // cancelAck retires a waiter whose caller has stopped waiting, for either of
@@ -371,10 +388,11 @@ func (s *wsSender) awaitAck(reqID string, force bool) (*ackWaiter, bool) {
 // is exactly the signal that sends the answer as a plain message.
 func (s *wsSender) cancelAck(reqID string, w *ackWaiter) {
 	s.ackMu.Lock()
-	defer s.ackMu.Unlock()
 	if cur, ok := s.waiters[reqID]; ok && cur == w {
 		delete(s.waiters, reqID)
 	}
+	s.ackMu.Unlock()
+	w.resolve()
 }
 
 // beginStreamFrameLocked reserves the next place in a req_id's write order for
@@ -568,9 +586,9 @@ func (s *wsSender) respondStream(ctx context.Context, reqID, streamID, content s
 		return err
 	}
 
-	w, ok := s.awaitAck(reqID, finish)
-	if !ok {
-		return errStreamBusy
+	w, err := s.awaitAck(ctx, reqID, finish)
+	if err != nil {
+		return err
 	}
 	if err := s.writeStreamFrame(ctx, reqID, w, finish, map[string]any{
 		"cmd":     cmdRespondMsg,
@@ -585,10 +603,7 @@ func (s *wsSender) respondStream(ctx context.Context, reqID, streamID, content s
 	defer timer.Stop()
 	select {
 	case res := <-w.ch:
-		switch {
-		case res.code == ackSuperseded:
-			return errStreamSuperseded
-		case res.code != 0:
+		if res.code != 0 {
 			return &streamError{Code: res.code, Msg: res.msg}
 		}
 		return nil
