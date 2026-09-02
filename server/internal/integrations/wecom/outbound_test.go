@@ -499,7 +499,7 @@ func TestProcessEvent_DoesNotPushAWebUIAnswerIntoTheRoom(t *testing.T) {
 // So the room has a live question of its own here — a bubble open, waiting on
 // an answer — and the installer's browser question finishes first against the
 // session they share. Everything WeCom-side has to come out of it untouched:
-// the round still open, its bubble still unsealed, the ledger holding no
+// the round still open, its bubble still unsealed, the store holding no
 // record of a run this adapter never ingested, and not a word in the chat.
 func TestAWebUIAnswerDoesNotConsumeTheRoomsBubble(t *testing.T) {
 	t.Parallel()
@@ -539,10 +539,10 @@ func TestAWebUIAnswerDoesNotConsumeTheRoomsBubble(t *testing.T) {
 	if got := pushedTexts(t, rig.conn); len(got) != 0 {
 		t.Fatalf("the room was told %q about a question typed in Multica", got)
 	}
-	if rig.streams.knowsRound(bubbleSessionID(t), taskUUID(t, "task-2")) {
-		t.Fatalf("the ledger has a record of a browser run — owed and the open list are what " +
-			"the failure path reads as proof of where a question was asked, so a refused answer " +
-			"that files itself there hands the run permission to speak in the room later")
+	if rig.streams.has(bubbleSessionID(t), taskUUID(t, "task-2")) {
+		t.Fatalf("the store has a record of a browser run — the open list is what the failure " +
+			"path reads as proof of where a question was asked, so a refused answer that files " +
+			"itself there hands the run permission to speak in the room later")
 	}
 }
 

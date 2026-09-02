@@ -11,6 +11,15 @@ package wecom
 // nothing can touch it again
 // (https://developer.work.weixin.qq.com/document/path/101463).
 //
+// THIS STORE IS A CACHE, NOTHING MORE. It maps a chat session to the bubbles
+// that can still be written to. An ending that finds a writable bubble writes
+// into it; one that does not goes out through the plain aibot_send_msg path
+// that outbound.go already has, addressed by the task's own delivery row. A
+// bubble that cannot be written to — never painted, past its window, disowned
+// by the server, lost to a restart — is simply not used. Nothing here records
+// what was said, what is owed, or who was told; nothing owes anyone anything
+// once the bubble is gone.
+//
 // A session holds a LIST of open bubbles, not one. Messages the engine's
 // debouncer collects into one agent run share a bubble; a message it gives a
 // run of its own gets a bubble of its own, queued behind the run in flight —
@@ -31,11 +40,7 @@ package wecom
 //     (TypingNotifier.OnRunStarted), so every later lifecycle event matches a
 //     round by id rather than by position. An auto-retry clone carries a fresh
 //     id and inherits its parent's chat_input_task_id, which is this same
-//     round's task id — see roundTaker, which resolves the clone through it
-//     before any ending is said.
-//
-// What a round's ending is allowed to record, and when, is the ending ledger's
-// contract further down. Read it before adding a caller.
+//     round's task id — see roundTaker, which resolves the clone through it.
 //
 // The rounds are kept sorted by batch id (insertLocked), which for one session
 // reads as the order its runs execute in: the engine serializes chat tasks per
@@ -59,13 +64,6 @@ package wecom
 // than a fix: a stored handle still inside the window would be writable from
 // the new process, at the cost of a row per bubble and a sweep to retire them,
 // to save a fallback message on the restart that lands mid-run.
-//
-// The lease is what makes that safe, and the relay does not extend it to the
-// bubble: an answer produced off-lease is routed to the socket holder and sent
-// there as an ordinary message, past the round this store is holding for it, so
-// the bubble runs to streamGuardAfter and promises a reply the reader already
-// has. See the replica topology in outbound.go, which is where that gap is
-// stated and where closing it would go.
 //
 // A RECONNECT IS NOT A RESTART, and the difference is why this store is built
 // once at boot, outside the connection loop (router.go). A handle outlives the
@@ -109,9 +107,9 @@ import (
 // same probe sealed a first stream with finish=true at two minutes and opened
 // a second on the same req_id with a fresh stream id: the second was still
 // being accepted at eight minutes old, well past the first one's own
-// ten-minute mark, and died at its own. That is what would make rotating onto
-// a fresh stream a real way to outlive the window, and it is not visible on
-// the wire — it is why it is written down here.
+// ten-minute mark, and died at its own. That is what makes rotating onto a
+// fresh stream a real way to outlive the window — see rotate, and fireGuard in
+// typing_indicator.go, which is where it is done.
 //
 // The six minutes this used to say came from a different mechanism, not from a
 // source that disagreed with the ten. Tencent's OpenClaw plugin carries six for
@@ -125,49 +123,18 @@ import (
 // the clock starts at the opening frame, and waiting in line does not stop it.
 const streamMaxAge = 10 * time.Minute
 
-// streamGuardAfter is when we close a bubble ourselves rather than let it run
-// into streamMaxAge. A minute of headroom covers a slow frame and leaves the
-// user with a sentence instead of a spinner the server will no longer let us
-// replace. It stays clear of the measured ceiling's lower bound, not just of
+// streamGuardAfter is when a live bubble is rotated onto a fresh stream rather
+// than let run into streamMaxAge. A minute of headroom covers a slow frame:
+// the old stream still has to take the closing frame that hands over to the
+// new one. It stays clear of the measured ceiling's lower bound, not just of
 // streamMaxAge.
 const streamGuardAfter = 9 * time.Minute
 
-// roundMemory is how long a session keeps the note the last handle left
-// behind. It has to outlast the bubble by a lot: the guard closes at nine
-// minutes and the run it made a promise about carries on for as long as the
-// agent needs, so the window between the promise and the failure it accounts
-// for is the length of a long run, not the length of a stream. An hour covers
-// those and still bounds the map to the sessions answered in the last hour.
-const roundMemory = time.Hour
-
-// roundEnding says whether the words a closer is writing are the last this
-// round will need. Only the guard's are not: "still working, I'll reply
-// separately" is a promise, and whatever the run does next is still owed.
-type roundEnding bool
-
+// streamCloseRetries is how many times a closing frame whose ack never came is
+// written again, and streamCloseRetryDelay the gap between attempts. See seal.
 const (
-	roundOver      roundEnding = true
-	roundContinues roundEnding = false
-)
-
-// roundVerdict is the store's answer to "may I speak for this round, and where".
-type roundVerdict int
-
-const (
-	// roundForgotten — nothing on file. A turn from before a restart, one that
-	// never opened a bubble at all, or one whose only record is that its batch
-	// is finished. The caller has to find the chat some other way.
-	roundForgotten roundVerdict = iota
-	// roundOwesAnEnding — the store found this round and the caller may say its
-	// ending. Which words go where is on the roundTurn: into the bubble the
-	// round still has, or against the promise the guard left where a bubble
-	// used to be.
-	roundOwesAnEnding
-	// roundToldAlready — the answer landed, another publisher's failure got
-	// here first, an earlier delivery went out and nobody could confirm it
-	// (I4), or the words are going out on another goroutine right now. Nothing
-	// to add.
-	roundToldAlready
+	streamCloseRetries    = 3
+	streamCloseRetryDelay = 2 * time.Second
 )
 
 // openVerdict is the store's answer to "a message just arrived — does it get a
@@ -197,12 +164,12 @@ type streamHandle struct {
 	// ReqID is the aibot_msg_callback's req_id. WeCom refuses a stream frame
 	// carrying any other value, including a req_id from an event callback
 	// (errcode 846605). Each round's bubble runs on the req_id of the message
-	// that opened it.
+	// that opened it — including every stream the round is rotated onto.
 	ReqID string
 
 	// StreamID is ours to choose. Reusing it updates the message; a new one
 	// opens another — which is exactly how a session comes to hold several
-	// bubbles at once.
+	// bubbles at once, and how a round outlives one stream's window.
 	StreamID string
 
 	// InstallationID finds the live socket. ChatID and ChatType address the
@@ -242,9 +209,12 @@ type streamHandle struct {
 	// bubble it painted is on the user's screen and no frame will ever touch
 	// it again, so what is left of the handle is the addressing. A caller that
 	// gets one writes its words as a plain message instead of a frame. Set by
-	// the store on the way out of takeAtLocked.
+	// the store on the way out of take.
 	Unusable bool
 
+	// CreatedAt is when the CURRENT stream was opened, which is what the
+	// protocol's window counts from. Rotating a round onto a fresh stream
+	// resets it.
 	CreatedAt time.Time
 }
 
@@ -268,111 +238,23 @@ func (h streamHandle) address() roundAddress {
 	}
 }
 
-// ── THE ENDING LEDGER'S CONTRACT ────────────────────────────────────────────
-//
-// owed / told / speaking below are one piece of bookkeeping answering one
-// question: has this run's ending been said to the user, and if not, who still
-// owes it. Four review rounds have found four different ways to get that wrong,
-// and all four were the same mistake — the ledger recorded an outcome the user
-// never got:
-//
-//	1. a promise spent by POSITION, so one round's words settled another
-//	   round's promise and the round the user cared about was never told;
-//	2. a delivery path that sent the words and settled NOTHING, leaving the
-//	   promise on file for the next repeat of that run's failure to spend
-//	   underneath the answer the user had just read;
-//	3. "already told" read off the SESSION rather than the run, so a second
-//	   asker was silenced by a note an unrelated run had left;
-//	4. a promise recorded as kept BEFORE the send meant to keep it, so a send
-//	   refused during a WebSocket reconnect lost the promise for good.
-//
-// Scenario tests were written for each and did not stop the next one, because
-// each fix was a rule the next caller had to remember. So the ledger states its
-// invariants and the API enforces them instead:
-//
-//	I1. NOTHING IS RECORDED AS SAID UNTIL IT HAS BEEN SAID. A run reaches told,
-//	    and a promise leaves owed, only after a delivery reports that the words
-//	    were accepted for sending — or, under I4, that nobody can say they were
-//	    not.
-//	I2. A RUN'S ENDING IS MATCHED BY THE RUN'S OWN ID — never by position,
-//	    never by session. A promise another round is waiting on is not this
-//	    run's to spend, and a note another round left is not this run's reason
-//	    for silence.
-//	I3. EVERY TERMINAL PATH ENDS IN WORDS OR LEAVES THE RUN OWED AN ENDING. No
-//	    path may both stay silent and clear the record. A delivery that failed
-//	    puts a claimed promise back where it was, and for a round this store
-//	    WAS HOLDING it records that the run is still owed one — so the next
-//	    publisher of the same news says it, rather than finding it filed as
-//	    already said. A run this store held no round for leaves no trace: it
-//	    was owed nothing here, and a debt filed against it would be
-//	    indistinguishable from the inbound path's own record of the round —
-//	    which is what knowsRound reads as proof of where a question was asked.
-//	I4. AN OUTCOME NOBODY COULD CONFIRM IS NOT A FAILURE. A delivery comes back
-//	    with one of THREE things, not two: the words were accepted, they
-//	    provably never left this process, or the transport gave no verdict at
-//	    all — an ack that never came, a write that raised after entering the
-//	    socket, a context cut short while either was pending. Only the middle
-//	    one is the failure I3 speaks of. An unknown is recorded the way an
-//	    accepted delivery is, because the alternative is to say one run's
-//	    ending a second time to somebody who is already reading the first: the
-//	    words may be on their screen, and nothing that arrives later will ever
-//	    settle whether they are. Which errors those are is NOT decided here —
-//	    unconfirmedReason (outbound_outcome.go) is this package's one
-//	    definition of "unknown", and every other send path consults it before
-//	    calling a send lost. The ledger consults the same one, so a reconnect
-//	    (errNoLiveConnection, provably nothing written) stays a retry under I3
-//	    while an ack timeout stops being one.
-//
-// sayEnding is the only way the ledger is written, and it takes the delivery as
-// an argument rather than handing out the right to speak. A caller cannot hold
-// a claim it forgets to resolve because it never holds one: it is given the
-// round, it reports whether the words went out, and the store records that and
-// nothing else. Adding a fifth way to end a round means writing another say
-// function, which cannot be written in the wrong order.
-//
-// The one thing that is NOT conditional is the bubble. A handle is consumed by
-// whichever closer reaches the round first — that is what makes two racing
-// closers produce one closing frame — so it is taken under the same lock that
-// finds the round, whether or not the frame it is taken for lands.
-// ────────────────────────────────────────────────────────────────────────────
-
-// errNothingToSay is how a delivery reports that it declined to speak: a cancel
-// for a round this process has no record of, an empty completion nobody is owed
-// an ending for, a session with no WeCom binding at all. Nothing reached the
-// user, so under I1 nothing is recorded as SAID — and unlike a refused send it
-// is not worth a warning, because no words were ever going out. It is not the
-// same as nothing having happened: a round this store was holding has had its
-// bubble consumed either way, so I3 still leaves that run owed an ending.
+// errNothingToSay is how a delivery reports that it declined to speak: an
+// empty completion with no bubble to close and no file to send, a session with
+// no WeCom route at all. Nothing reached the user and nothing was owed, so it
+// is not worth a warning — processEvent reads it as "skipped", which is not
+// the same as "dropped".
 var errNothingToSay = errors.New("wecom: nothing to say for this round")
 
-// roundTurn is what the ledger hands a delivery for the length of one ending:
-// everything this store knows about where the round can still be reached.
-//
-// Both halves can be absent, and they are separate questions. A round whose
-// opening frame the server refused has no bubble but may still be on file; a
-// round the guard closed has no bubble and a promise instead; a run this
-// process never saw has neither, and its delivery has to find the chat itself.
+// roundTurn is what take hands back: the round's bubble, if it still has one
+// that can be written to.
 type roundTurn struct {
-	// Handle is the round's open bubble, writable now. HasBubble says whether
-	// there is one: a round with no painted frame, or one past the protocol's
-	// window, reports false and its words go out as an ordinary message.
+	// Handle is the round's open bubble. HasBubble says whether there is one:
+	// a round with no painted frame, or one past the protocol's window,
+	// reports false and its words go out as an ordinary message. A handle the
+	// server has disowned is still handed back, with Unusable set, because
+	// its addressing is still the chat that asked.
 	Handle    streamHandle
 	HasBubble bool
-
-	// Addr is where this round was speaking, off the handle or off the note it
-	// left. Unknown for a round this process holds nothing for.
-	Addr roundAddress
-
-	// Promised says the guard closed this round's bubble with "还在处理，完成后
-	// 我再单独回复你" and this turn holds that promise. It is what separates
-	// "nothing to add" from "a promise to keep" when a run finishes silently,
-	// and what lets a cancel speak without chasing an address it should not.
-	Promised bool
-
-	// Verdict is the store's answer to "may I speak for this round". A delivery
-	// only ever runs for roundOwesAnEnding and roundForgotten; roundToldAlready
-	// never reaches one.
-	Verdict roundVerdict
 }
 
 // roundKey picks which round an ending speaks for. Both names are authoritative
@@ -392,218 +274,8 @@ func byBatch(batch engine.RunBatchID) roundKey {
 	return roundKey{batch: batch, byBatch: true}
 }
 
-// pendingEnding is one ending in flight: reserved under the lock, not yet
-// recorded, and holding everything needed to put the ledger back exactly as it
-// was if the words never land. It never leaves this file — sayEnding is the
-// only thing that creates one and the only thing that resolves one.
-type pendingEnding struct {
-	// live is false when there is nothing to record: an ending for a round the
-	// flush had not yet named, or a turn no delivery ran for.
-	live   bool
-	key    string
-	taskID string
-	// alias is the auto-retry clone's own id, when the round was found under
-	// the batch owner's name instead. A repeat carrying the clone's id has to
-	// find the ending on file or it says the same thing a second time.
-	alias  string
-	ending roundEnding
-	// owedAt is where in owed the promise sat when it was claimed, or -1 if
-	// nothing was claimed. It is what I3 restores.
-	owedAt int
-	// held says this ending was reserved from a round this store actually had:
-	// one takeAtLocked lifted off the open list, or one whose promise was still
-	// on the note. Both are written only by this adapter's inbound path — a
-	// bubble opened by a message it ingested, named by the flush that answered
-	// it — so it is the run-level fact "this run was asked in the room".
-	//
-	// It is what separates the two failed deliveries. A round this store held
-	// has lost its bubble to the attempt, so I3 leaves the run owed an ending
-	// and the next publisher says it. A run this store held NOTHING for lost
-	// nothing: forgottenLocked took no handle and consumed no promise, and it
-	// reached here only because some subscriber tried to speak for a run on a
-	// shared bus. Filing a debt for that one would put a run this adapter never
-	// ingested on owed — where knowsRound reads it as proof the question was
-	// asked in the room, and hands the failure gate a permission the database
-	// was supposed to decide.
-	held bool
-}
-
-// endedRound is what a session keeps once a handle is gone: where the round
-// was speaking, whether anything is still owed to it, and which runs are done.
-//
-// owed is the heart of it. A handle is taken by whichever ending gets there
-// first, and the nine-minute guard is allowed to be that one — it writes
-// "still working, I'll reply separately" while the run carries on. The failure
-// that arrives afterwards finds no handle, and without this note it would
-// return without a word: a promise, and then nothing.
-//
-// One note per session, but the promises inside it are counted per ROUND. A
-// single flag could not hold two: with rounds A and B both guard-closed, A's
-// own answer — the separate reply its guard promised — would clear the flag,
-// and when B's run failed the store would say "already told" and B's asker
-// would hear nothing at all. The address is still shared, which is fine
-// because both rounds name the same chat; it is the promises that have to be
-// individual.
-type endedRound struct {
-	addr roundAddress
-	at   time.Time
-	// owed lists the rounds promised a separate reply that have not had one,
-	// oldest first, each holding its run id. A round's own ending settles its
-	// own entry; another round's cannot.
-	owed []string
-	// finished lists the batches whose bubble is over, so a badly delayed
-	// OnIngested cannot paint a second one for a run that has already
-	// answered. Bounded: a batch old enough to have fallen off cannot still
-	// have a message in flight for it.
-	finished []engine.RunBatchID
-	// told lists the RUNS that have been spoken for — a bubble sealed, a
-	// promise kept, a plain message sent, or an attempt at any of those whose
-	// outcome the transport never settled (I4). It is what makes a second
-	// publisher of one run's failure silent, and it has to be per run for the
-	// same reason owed is: the existence of a note says only that SOMETHING in
-	// this session has been spoken for. Keyed by session, a second run's
-	// failure would read another run's note as its own and its asker would be
-	// told nothing at all. Bounded the way finished is.
-	told []string
-	// speaking lists the runs whose ending is going out RIGHT NOW: claimed out
-	// of owed, not yet on told, because under I1 nothing is told until it has
-	// been said. It is what keeps the gap between those two safe. The bus is
-	// synchronous and task:failed has two publishers, so a repeat can arrive
-	// while the first delivery is still on the wire — it finds the run here and
-	// stays silent, and if the words never land the run comes off this list and
-	// back onto owed, where the next publisher can still keep the promise.
-	speaking []string
-}
-
-// isTold reports whether this run has already been spoken for.
-func (e endedRound) isTold(taskID string) bool {
-	if taskID == "" {
-		return false
-	}
-	for _, id := range e.told {
-		if id == taskID {
-			return true
-		}
-	}
-	return false
-}
-
-// tell adds a run to the told list, keeping it bounded. Returns the new list.
-func (e endedRound) tell(taskID string) []string {
-	if taskID == "" || e.isTold(taskID) {
-		return e.told
-	}
-	next := append(e.told, taskID)
-	if len(next) > maxToldRounds {
-		next = next[len(next)-maxToldRounds:]
-	}
-	return next
-}
-
-// owe adds a run to the owed list, keeping it bounded. Returns the new list.
-func (e endedRound) owe(taskID string) []string {
-	if taskID == "" || indexOfRun(e.owed, taskID) >= 0 {
-		return e.owed
-	}
-	next := append(e.owed, taskID)
-	if len(next) > maxOwedRounds {
-		next = next[len(next)-maxOwedRounds:]
-	}
-	return next
-}
-
-// maxOwedRounds bounds the owed list, which I3 lets grow on its own: every
-// ending that could not be delivered leaves its run owed one, so a session
-// whose socket is down for the whole hour the note lives adds an entry per run.
-// The oldest promise is the one worth dropping — the note itself expires at
-// roundMemory, so an entry near the front is already close to worthless — and
-// the same thirty-two is far more outstanding promises than a session
-// serializing its runs can produce in that time.
-const maxOwedRounds = 32
-
-// maxToldRounds bounds the told list. What it has to outlast is a REPEAT of
-// one run's ending — a sweeper tick republishing a failure, an auto-retry's
-// first attempt arriving late — which lands within minutes of the original,
-// while the note itself is discarded after roundMemory. Thirty-two rounds is
-// far more than a session serializing its runs gets through in that gap, and
-// it keeps the note a fixed size for a chat that never stops.
-const maxToldRounds = 32
-
-// isFinished reports whether this run's bubble is already over.
-func (e endedRound) isFinished(batch engine.RunBatchID) bool {
-	if batch == 0 {
-		return false
-	}
-	for _, id := range e.finished {
-		if id == batch {
-			return true
-		}
-	}
-	return false
-}
-
-// finish adds a batch to the list, keeping it bounded: a session that runs for
-// days should not accumulate ids forever.
-func (e endedRound) finish(batch engine.RunBatchID) []engine.RunBatchID {
-	if batch == 0 || e.isFinished(batch) {
-		return e.finished
-	}
-	next := append(e.finished, batch)
-	if len(next) > maxFinishedRounds {
-		next = next[len(next)-maxFinishedRounds:]
-	}
-	return next
-}
-
-// maxFinishedRounds bounds the finished list. Ten rounds back is far more than
-// an ingest goroutine can lag by — it holds the Router's reply budget, a
-// couple of seconds, against rounds that take minutes.
-const maxFinishedRounds = 10
-
-// isOwed reports whether anything is still promised.
-func (e endedRound) isOwed() bool { return len(e.owed) > 0 }
-
-// isSpeaking reports whether this run's ending is on the wire right now.
-func (e endedRound) isSpeaking(taskID string) bool { return indexOfRun(e.speaking, taskID) >= 0 }
-
-// indexOfRun finds a run in one of the note's lists, or -1. Every match in this
-// file goes through it: I2 says a run is matched by its own id and by nothing
-// else, and one lookup is one place for that to stay true.
-func indexOfRun(runs []string, taskID string) int {
-	if taskID == "" {
-		return -1
-	}
-	for i, id := range runs {
-		if id == taskID {
-			return i
-		}
-	}
-	return -1
-}
-
-// withoutRun returns runs with the entry at i removed, leaving the input
-// untouched — the note is copied in and out of the map, so a shared backing
-// array would let one round's edit rewrite another's list.
-func withoutRun(runs []string, i int) []string {
-	return append(runs[:i:i], runs[i+1:]...)
-}
-
-// restoreRun puts a claimed promise back where it was, which is what I3 owes a
-// delivery that failed. Position carries no meaning any more — every match is
-// by id — but a list that comes back in the order it went out is one less thing
-// for a future reader to wonder about.
-func restoreRun(runs []string, at int, taskID string) []string {
-	if at < 0 || at > len(runs) {
-		at = len(runs)
-	}
-	out := make([]string, 0, len(runs)+1)
-	out = append(out, runs[:at]...)
-	out = append(out, taskID)
-	return append(out, runs[at:]...)
-}
-
 // roundEntry is one run's place in a session, from the moment anything is
-// known about it until its ending is said. Whoever takes or drops the round
+// known about it until something takes it. Whoever takes or drops the round
 // disposes of all of it in one lock.
 //
 // The two facts arrive from different directions and in either order, which is
@@ -625,14 +297,15 @@ type roundEntry struct {
 	// OnRunStarted. Empty until the debounce window expires.
 	taskID string
 
-	// guard closes the bubble if nothing else does before the protocol's
-	// stream window runs out.
+	// guard rotates the bubble onto a fresh stream before the protocol's
+	// window runs out on the current one.
 	guard *time.Timer
 
 	// feed is the bubble's scrolling list of steps, created on the first one
 	// that reaches it (progress_render.go). It lives here rather than beside
 	// the store's maps so it dies exactly when the round does — a list of a
-	// finished run's tool calls has nothing left to be painted into.
+	// finished run's tool calls has nothing left to be painted into. A
+	// rotation starts a fresh one: the new stream is a new bubble.
 	feed *progressFeed
 
 	// unusable is the server's verdict that this stream takes no further
@@ -646,23 +319,60 @@ type roundEntry struct {
 	createdAt time.Time
 }
 
-// streamStore maps chat_session_id to that session's rounds, oldest first, and
-// — for a while after the last one is gone — to what the session still owes.
+// maxFinishedRounds bounds the per-session memory of closed batches. Ten
+// rounds back is far more than an ingest goroutine can lag by — it holds the
+// Router's reply budget, a couple of seconds, against rounds that take
+// minutes.
+const maxFinishedRounds = 10
+
+// streamStore maps chat_session_id to that session's rounds, oldest first.
 type streamStore struct {
 	mu       sync.Mutex
 	sessions map[string][]*roundEntry
-	ended    map[string]endedRound
+
+	// finished remembers, per session, the last few batches whose round has
+	// been taken, so a badly delayed OnIngested cannot paint a second bubble
+	// for a run that has already answered. It is the one thing kept about a
+	// round after it is gone, and it says nothing about what was said — only
+	// that nothing more should be painted. Bounded by maxFinishedRounds; a
+	// session whose rounds are all gone keeps its ring until the sweep drops
+	// it along with everything else past the window.
+	finished map[string]finishedRing
 
 	maxAge time.Duration
 	now    func() time.Time
+
+	// closeRetryDelay is the gap between two attempts at a closing frame
+	// (seal). A field so a test can run the retries without the two seconds.
+	closeRetryDelay time.Duration
+}
+
+// finishedRing is one session's recently closed batches, with when the last
+// one was added so the sweep can retire the whole ring.
+type finishedRing struct {
+	batches []engine.RunBatchID
+	at      time.Time
+}
+
+func (r finishedRing) has(batch engine.RunBatchID) bool {
+	if batch == 0 {
+		return false
+	}
+	for _, id := range r.batches {
+		if id == batch {
+			return true
+		}
+	}
+	return false
 }
 
 func newStreamStore() *streamStore {
 	return &streamStore{
-		sessions: make(map[string][]*roundEntry),
-		ended:    make(map[string]endedRound),
-		maxAge:   streamMaxAge,
-		now:      time.Now,
+		sessions:        make(map[string][]*roundEntry),
+		finished:        make(map[string]finishedRing),
+		maxAge:          streamMaxAge,
+		now:             time.Now,
+		closeRetryDelay: streamCloseRetryDelay,
 	}
 }
 
@@ -697,6 +407,29 @@ func (s *streamStore) insertLocked(key string, e *roundEntry) *roundEntry {
 	return e
 }
 
+// finishedLocked reports whether a batch's round has already been taken.
+// Caller holds s.mu.
+func (s *streamStore) finishedLocked(key string, batch engine.RunBatchID) bool {
+	return s.finished[key].has(batch)
+}
+
+// retireLocked records that a batch's round is over, keeping the ring
+// bounded. Caller holds s.mu.
+func (s *streamStore) retireLocked(key string, batch engine.RunBatchID) {
+	if batch == 0 {
+		return
+	}
+	ring := s.finished[key]
+	if !ring.has(batch) {
+		ring.batches = append(ring.batches, batch)
+		if len(ring.batches) > maxFinishedRounds {
+			ring.batches = ring.batches[len(ring.batches)-maxFinishedRounds:]
+		}
+	}
+	ring.at = s.now()
+	s.finished[key] = ring
+}
+
 // open registers a message's bubble against the run the engine collected it
 // into, and says whether this message is the one that paints it. Every message
 // of a run calls this; the first gets roundOpened and the rest roundJoined,
@@ -712,7 +445,7 @@ func (s *streamStore) open(sessionID pgtype.UUID, batch engine.RunBatchID, h str
 	defer s.mu.Unlock()
 	s.sweepLocked()
 
-	if note, ok := s.ended[key]; ok && note.isFinished(batch) {
+	if s.finishedLocked(key, batch) {
 		return roundFinished
 	}
 	if h.CreatedAt.IsZero() {
@@ -761,7 +494,7 @@ func (s *streamStore) bind(sessionID pgtype.UUID, batch engine.RunBatchID, taskI
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if note, ok := s.ended[key]; ok && note.isFinished(batch) {
+	if s.finishedLocked(key, batch) {
 		return
 	}
 	if e := s.entryLocked(key, batch); e != nil {
@@ -771,13 +504,16 @@ func (s *streamStore) bind(sessionID pgtype.UUID, batch engine.RunBatchID, taskI
 	s.insertLocked(key, &roundEntry{batch: batch, taskID: taskID, createdAt: s.now()})
 }
 
-// arm attaches the expiry guard to a round. A round that ended between the
-// open and this call has already left the list, so there is nothing to guard
-// and the timer is stopped instead of leaked.
+// arm attaches the expiry guard to a round, replacing any earlier one. A
+// round that ended between the open and this call has already left the list,
+// so there is nothing to guard and the timer is stopped instead of leaked.
 func (s *streamStore) arm(sessionID pgtype.UUID, batch engine.RunBatchID, t *time.Timer) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if e := s.entryLocked(util.UUIDToString(sessionID), batch); e != nil {
+		if e.guard != nil && e.guard != t {
+			e.guard.Stop()
+		}
 		e.guard = t
 		return
 	}
@@ -806,31 +542,20 @@ func (s *streamStore) indexLocked(key string, k roundKey) int {
 	return -1
 }
 
-// noteLocked returns this session's note, fresh if there is none yet. Caller
+// takeAtLocked removes rounds[i] and hands back what is left of it: the
+// bubble, if it can still be written to.
+//
+// The entry goes unconditionally. Removing it under the lock that found it is
+// the mutual exclusion between two closers racing for one run — whichever
+// gets here first is the only one that ever sees the handle, so one run
+// produces one closing frame. A round with no bubble reports absent, and so
+// does a handle past maxAge: the server would refuse the frame and a caller
+// that believed it had a bubble would leave the user with nothing.
+//
+// The batch goes on the session's finished ring so a badly delayed OnIngested
+// cannot paint a second bubble for a run that has already answered. Caller
 // holds s.mu.
-func (s *streamStore) noteLocked(key string) endedRound {
-	if note, ok := s.ended[key]; ok {
-		return note
-	}
-	return endedRound{}
-}
-
-// takeAtLocked removes rounds[i] and reserves its ending — the ending of a
-// round, whichever ending it is.
-//
-// The handle goes unconditionally, because it is the mutual exclusion that
-// makes two racing closers write one closing frame. A round with no bubble
-// reports absent, and so does a handle past maxAge: the server would refuse the
-// frame and a caller that believed it had a bubble would leave the user with
-// nothing.
-//
-// What the round IS gets filed here too, because none of it depends on words
-// reaching anyone: the batch is over, so a badly delayed OnIngested cannot
-// paint a second bubble for a run that has already answered, and this is the
-// chat the round was speaking in. What the round has been TOLD is the only part
-// that waits for the delivery (I1), and the pendingEnding is what carries it
-// there. Caller holds s.mu.
-func (s *streamStore) takeAtLocked(key string, i int, ending roundEnding) (roundTurn, pendingEnding) {
+func (s *streamStore) takeAtLocked(key string, i int) roundTurn {
 	rounds := s.sessions[key]
 	entry := rounds[i]
 	rounds = append(rounds[:i], rounds[i+1:]...)
@@ -842,38 +567,9 @@ func (s *streamStore) takeAtLocked(key string, i int, ending roundEnding) (round
 	if entry.guard != nil {
 		entry.guard.Stop()
 	}
+	s.retireLocked(key, entry.batch)
 
-	note := s.noteLocked(key)
-	note.finished = note.finish(entry.batch)
-	addr := roundAddress{}
-	if entry.painted {
-		addr = entry.handle.address()
-	}
-	if addr.known() {
-		// A round that never had a bubble must not overwrite a known address
-		// with its blank one.
-		note.addr = addr
-	} else {
-		addr = note.addr
-	}
-
-	pending := pendingEnding{key: key, taskID: entry.taskID, ending: ending, owedAt: -1, held: true}
-	promised := false
-	if entry.taskID != "" {
-		pending.live = true
-		// A round back on the open list while its own promise is outstanding is
-		// not a shape this store produces, but spending that promise twice
-		// would be — so it is claimed here exactly the way a claim claims it.
-		if at := indexOfRun(note.owed, entry.taskID); at >= 0 {
-			note.owed = withoutRun(note.owed, at)
-			pending.owedAt, promised = at, true
-		}
-		note.speaking = append(note.speaking, entry.taskID)
-	}
-	note.at = s.now()
-	s.ended[key] = note
-
-	turn := roundTurn{Addr: addr, Promised: promised, Verdict: roundOwesAnEnding}
+	turn := roundTurn{}
 	if entry.painted && !s.expiredLocked(entry.handle.CreatedAt) {
 		turn.Handle, turn.HasBubble = entry.handle, true
 		// The server's verdict travels with the handle: a stream it has
@@ -882,7 +578,45 @@ func (s *streamStore) takeAtLocked(key string, i int, ending roundEnding) (round
 		// charged against the whole bot's rate limit.
 		turn.Handle.Unusable = entry.unusable
 	}
-	return turn, pending
+	return turn
+}
+
+// take removes the round k names and hands back its bubble. The second result
+// says whether a round was on file at all: false is a run this process holds
+// nothing for — a turn from before a restart, one that never opened a bubble,
+// or one already taken by another closer.
+//
+// resolve is the auto-retry lookup, consulted at most once and only when the
+// id on the event matches nothing in a session that still has rounds open — a
+// clone carries a fresh id and inherits the round's own on chat_input_task_id,
+// so it is filed under its parent's name. It runs OUTSIDE the lock, because it
+// costs a database row.
+func (s *streamStore) take(ctx context.Context, sessionID pgtype.UUID, k roundKey, resolve func(context.Context, string) string) (roundTurn, bool) {
+	key := util.UUIDToString(sessionID)
+
+	s.mu.Lock()
+	s.sweepLocked()
+	if i := s.indexLocked(key, k); i >= 0 {
+		turn := s.takeAtLocked(key, i)
+		s.mu.Unlock()
+		return turn, true
+	}
+	worthResolving := !k.byBatch && k.taskID != "" && len(s.sessions[key]) > 0
+	s.mu.Unlock()
+
+	if !worthResolving || resolve == nil {
+		return roundTurn{}, false
+	}
+	root := resolve(ctx, k.taskID)
+	if root == "" || root == k.taskID {
+		return roundTurn{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if i := s.indexLocked(key, byTask(root)); i >= 0 {
+		return s.takeAtLocked(key, i), true
+	}
+	return roundTurn{}, false
 }
 
 // feedFor hands back the bubble a step belongs in, and the scrolling list that
@@ -946,349 +680,66 @@ func (s *streamStore) markUnusable(sessionID pgtype.UUID, streamID string) bool 
 	return false
 }
 
-// sayEnding is the only way this store's ending ledger is written, and the
-// whole of the contract at the top of this file lives in its shape.
+// rotate moves a live round onto a fresh stream id, and hands back the handle
+// it had (old) and the one it has now (next). false when there is nothing to
+// rotate: the round is gone, was never painted, has been disowned, or is
+// already past the window — in which case the caller has nothing to seal and
+// nothing to reopen.
 //
-// It finds the round k names, hands what it knows to say, and records what say
-// reports — in that order, always. A caller never holds the right to speak as a
-// value it could drop, so "claimed but never settled" is not a state that can
-// be written: there is nothing to forget to resolve.
+// The swap happens BEFORE either frame is written, under the lock, so an
+// answer that takes the round while the hand-over is on the wire gets the new
+// stream id. Its closing frame then queues behind the seal (one frame in
+// flight per req_id, ws_sender.go) and lands as the new bubble's only frame,
+// which WeCom accepts as creating the message — measured 2026-08-09, see
+// senders_registry.go. Had the answer been handed the OLD id it would have
+// written a second closing frame onto a stream the hand-over had just sealed.
 //
-//	say returns nil            — the words were accepted for sending. The
-//	                             promise is settled, the run goes on told, and
-//	                             a guard's ending files the promise it just made.
-//	say returns a DEFINITE     — nothing reached the user, so nothing is told
-//	error                        (I1) and the next publisher of the same news
-//	                             can still say it. A claimed promise returns to
-//	                             where it sat, and a round this store was
-//	                             holding is left owed an ending even if it was
-//	                             owed none before (I3) — its bubble went with
-//	                             the attempt. A run this store held no round for
-//	                             is left exactly as it was found: untouched.
-//	                             errNothingToSay is the deliberate case and is
-//	                             recorded the same way.
-//	say returns an UNCONFIRMED — recorded exactly as nil is (I4). The words may
-//	error                        be on the user's screen and no later event can
-//	                             settle whether they are, so the run is spoken
-//	                             for and a repeat stays quiet rather than
-//	                             telling them the same thing twice.
-//
-// The address say returns is where it actually spoke, which is how a delivery
-// that found its own chat in the binding row teaches the note an address it did
-// not have. A zero address leaves the note's own alone.
-//
-// resolve is the auto-retry lookup, called at most once and only when the id on
-// the event matches nothing this store holds — a clone carries a fresh id and
-// inherits the round's own on chat_input_task_id. It runs BEFORE anything is
-// said, so whichever name finds the round, the words go out exactly once.
-func (s *streamStore) sayEnding(
-	sessionID pgtype.UUID,
-	k roundKey,
-	ending roundEnding,
-	resolve func(string) string,
-	say func(roundTurn) (roundAddress, error),
-) (roundVerdict, error) {
-	key := util.UUIDToString(sessionID)
-
-	s.mu.Lock()
-	s.sweepLocked()
-	turn, pending, worthResolving := s.beginEndingLocked(key, k, ending)
-	s.mu.Unlock()
-
-	if turn.Verdict == roundForgotten && worthResolving && resolve != nil && !k.byBatch && k.taskID != "" {
-		if root := resolve(k.taskID); root != "" && root != k.taskID {
-			s.mu.Lock()
-			rootTurn, rootPending, _ := s.beginEndingLocked(key, byTask(root), ending)
-			s.mu.Unlock()
-			if rootTurn.Verdict != roundForgotten {
-				// The round was found under the batch owner's name, so the
-				// ending is said in the clone's name too — a repeat carrying
-				// the clone's own id has to find it on file or it goes looking
-				// for a chat to repeat it in.
-				turn, pending = rootTurn, rootPending
-				pending.alias = k.taskID
-			}
-		}
-	}
-
-	if turn.Verdict == roundToldAlready {
-		// Said already, or being said on another goroutine right now. Nothing
-		// was reserved, so there is nothing to resolve.
-		return turn.Verdict, nil
-	}
-	addr, err := say(turn)
-	s.endEnding(pending, addr, spokenFor(err))
-	return turn.Verdict, err
-}
-
-// spokenFor reads a delivery's own error the way I4 requires: true when this
-// run has been spoken for as far as anyone can tell, false only for a failure
-// that provably put nothing in front of the user.
-//
-// The set of unknowns is not this file's to define. unconfirmedReason is the
-// package's single definition of it (outbound_outcome.go), consulted by every
-// other send path before it files a drop, and the ledger has to agree with them
-// about one error or the same send is a retry here and a settled outcome there.
-func spokenFor(err error) bool {
-	return err == nil || unconfirmedReason(err) != ""
-}
-
-// beginEndingLocked finds the round and reserves its ending. It is half of
-// sayEnding and has no other caller: on its own it produces exactly the
-// unresolved claim this file exists to make unrepresentable.
-//
-// The third return says whether a second id is worth a database row: true only
-// when this session holds something a clone could still be reached through — an
-// open bubble, or a promise. Caller holds s.mu.
-func (s *streamStore) beginEndingLocked(key string, k roundKey, ending roundEnding) (roundTurn, pendingEnding, bool) {
-	if i := s.indexLocked(key, k); i >= 0 {
-		turn, pending := s.takeAtLocked(key, i, ending)
-		return turn, pending, false
-	}
-	// No bubble. Whether a clone could still find one is what the open list
-	// answers; whether it could find a promise is what the note answers.
-	worthResolving := len(s.sessions[key]) > 0
-
-	note, ok := s.ended[key]
-	if !ok {
-		return s.forgottenLocked(key, k.taskID, ending, worthResolving)
-	}
-	if s.now().Sub(note.at) > roundMemory {
-		delete(s.ended, key)
-		return s.forgottenLocked(key, k.taskID, ending, worthResolving)
-	}
-	// An ending already told is deliberately NOT a reason to go looking for a
-	// second id. told is a dedup of ONE run's ending, matched by that run's own
-	// id (I2), and a retry clone is a different run: reading the owner's note
-	// as the clone's silence is defect 3 in another coat, and it would swallow
-	// the retry's answer whenever the first attempt's own failure had already
-	// been reported. The one honest link between the two names is a delivery
-	// that actually went out under both, which endEnding records as the alias.
-	worthResolving = worthResolving || note.isOwed() || len(note.speaking) > 0
-
-	taskID := k.taskID
-	if note.isTold(taskID) || note.isSpeaking(taskID) {
-		// ASKED BEFORE THE ADDRESS, and that order is the whole of it. The
-		// not-twice rule is about the RUN — an ending already said, or on the
-		// wire right now on another goroutine — and it holds whether or not
-		// this store knows where the words went. A round bound to a run but
-		// never painted (the opening frame refused, or the flush arriving
-		// ahead of the goroutine that paints) leaves the note addressless
-		// while its ending is being said, and asking the address first sends
-		// the second publisher off to find its own chat and say the same thing
-		// there. An empty id matches nothing (indexOfRun), so a batch key
-		// falls through to the branches below untouched.
-		return roundTurn{Addr: note.addr, Verdict: roundToldAlready}, pendingEnding{}, false
-	}
-	if !note.addr.known() {
-		// Nowhere to speak. Not a refusal — the caller finds its own chat.
-		return s.forgottenLocked(key, taskID, ending, worthResolving)
-	}
-	if k.byBatch || taskID == "" {
-		// A batch that matched no open round has nothing left to end, and an
-		// unnamed ending claims nothing for the same reason no unnamed promise
-		// is ever filed: there is no round it could be speaking for. Not
-		// forgotten either — a caller told to go and find a chat would announce
-		// an ending it cannot attribute to any round in it.
-		return roundTurn{Addr: note.addr, Verdict: roundToldAlready}, pendingEnding{}, false
-	}
-	at := indexOfRun(note.owed, taskID)
-	if at < 0 {
-		// The promises on file belong to other rounds and this run has never
-		// been spoken for. Not this caller's to spend (I2), and not a reason
-		// for silence: the caller finds its own address, and whatever it says
-		// there is still recorded — see forgottenLocked.
-		return s.forgottenLocked(key, taskID, ending, worthResolving)
-	}
-	note.owed = withoutRun(note.owed, at)
-	note.speaking = append(note.speaking, taskID)
-	note.at = s.now()
-	s.ended[key] = note
-	return roundTurn{Addr: note.addr, Promised: true, Verdict: roundOwesAnEnding},
-		pendingEnding{live: true, key: key, taskID: taskID, ending: ending, owedAt: at, held: true},
-		false
-}
-
-// forgottenLocked is the verdict for a run this store holds nothing for, and it
-// still reserves an ending.
-//
-// That is the point. "Nothing on file" is not "nothing happened": the caller
-// goes and finds the chat in the binding row and says the run's ending there,
-// and a delivery the ledger never hears about is exactly defect 2 — the words
-// go out, nothing is recorded, and the next publisher of the same news repeats
-// them. So the pending is live, and a successful delivery files the note that
-// keeps the repeat quiet, addressed wherever the caller actually spoke.
-//
-// No note is created or touched HERE, and nothing joins speaking, because at
-// this point there is no evidence the session is even WeCom's — this subscriber
-// sees every failed run on a shared bus. Only words that actually reached a
-// WeCom chat produce a note; a delivery that FAILED writes nothing at all, which
-// is what the pending's held flag carries down to endEnding. Caller holds s.mu.
-func (s *streamStore) forgottenLocked(key, taskID string, ending roundEnding, worthResolving bool) (roundTurn, pendingEnding, bool) {
-	turn := roundTurn{Verdict: roundForgotten}
-	if taskID == "" {
-		return turn, pendingEnding{}, worthResolving
-	}
-	return turn, pendingEnding{live: true, key: key, taskID: taskID, ending: ending, owedAt: -1}, worthResolving
-}
-
-// endEnding is the other half of sayEnding: it records the delivery's account
-// of itself, and it is where all four invariants are actually paid.
-//
-// spoken is the whole of the decision, and it is the answer to "can anybody
-// still say this run has not been told" rather than "did the words arrive"
-// (I4). False reaches told for nothing (I1) and returns a claimed promise to
-// exactly where it sat, which is what makes a send refused during a reconnect
-// window a retry rather than a loss. For a round this store was holding it goes
-// one step further and leaves the run owed an ending it was not owed before
-// (I3): the bubble was consumed whether or not the words landed, so only a
-// later ending can put anything under it.
-//
-// False for a run this store held no round for writes nothing whatsoever — see
-// held on pendingEnding for why that asymmetry is the point rather than an
-// omission.
-func (s *streamStore) endEnding(p pendingEnding, addr roundAddress, spoken bool) {
-	if !p.live {
-		return
+// The window restarts: CreatedAt is stamped now, so expiry and the next guard
+// count from the new stream's opening frame, which is what the server counts
+// from. The feed starts over too — the new stream is a new bubble and carries
+// none of the old one's lines.
+func (s *streamStore) rotate(sessionID pgtype.UUID, batch engine.RunBatchID, streamID string) (old, next streamHandle, ok bool) {
+	if streamID == "" {
+		return streamHandle{}, streamHandle{}, false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	note, ok := s.ended[p.key]
-	if !ok {
-		if !spoken {
-			// Nothing was reserved in a note and nothing was said. There is no
-			// reason to start remembering this session now.
-			return
-		}
-		// Words reached a WeCom chat for a round this store had no note for —
-		// a run that outlived a restart, or one whose bubble was never
-		// painted. This is that note.
-		note = endedRound{}
+	e := s.entryLocked(util.UUIDToString(sessionID), batch)
+	if e == nil || !e.painted || e.unusable || s.expiredLocked(e.handle.CreatedAt) {
+		return streamHandle{}, streamHandle{}, false
 	}
-	if at := indexOfRun(note.speaking, p.taskID); at >= 0 {
-		note.speaking = withoutRun(note.speaking, at)
-	}
-	note.at = s.now()
-	if !spoken {
-		switch {
-		case p.owedAt >= 0:
-			note.owed = restoreRun(note.owed, p.owedAt, p.taskID)
-		case p.held && note.addr.known():
-			// A round this store was holding, nothing claimed, nothing landed.
-			// Its bubble has just been consumed, so what the user is looking at
-			// is a spinner nothing will ever seal — and this store knows the
-			// chat it is in. Recording the run as owed is what makes the next
-			// publisher of its ending say the words there instead of finding
-			// the round gone and going quiet.
-			//
-			// held is what keeps this off a run that was never this adapter's.
-			// The address is a SESSION-level fact — one earlier WeCom round
-			// leaves it on the note and it outlives every round after — so
-			// without held, an answer the installer asked for in their browser,
-			// whose delivery this replica could not make, would file itself as
-			// owed on a session it merely shares. knowsRound would then read
-			// that debt as proof the question came from the room and wave the
-			// run's failure notice into the chat with no database check at all.
-			note.owed = note.owe(p.taskID)
-		}
-		s.ended[p.key] = note
-		return
-	}
-	if addr.known() {
-		note.addr = addr
-	}
-	switch p.ending {
-	case roundContinues:
-		// "还在处理，完成后我再单独回复你" is on the user's screen, so the
-		// promise now exists. It is the one ending that files a promise instead
-		// of settling one, and the one that tells nothing: the round goes on.
-		note.owed = note.owe(p.taskID)
-	case roundOver:
-		// The promise was claimed at begin and the words have landed — or have
-		// gone somewhere nobody can account for, which under I4 ends the same
-		// way — so it stays settled. This run has now been spoken for; a repeat
-		// of its own ending stays silent, another run's ending is not covered
-		// by it.
-		note.told = note.tell(p.taskID)
-		if p.alias != "" {
-			note.told = note.tell(p.alias)
-		}
-	}
-	s.ended[p.key] = note
+	old = e.handle
+	next = old
+	next.StreamID = streamID
+	next.CreatedAt = s.now()
+	e.handle = next
+	e.createdAt = next.CreatedAt
+	e.feed = nil
+	return old, next, true
 }
 
-// owesEnding reports whether a run's promise is still outstanding — nothing has
-// been said for it and nothing is being said right now. Read-only; for the
-// wiring guards and the tests that assert what a path left behind.
-func (s *streamStore) owesEnding(sessionID pgtype.UUID, taskID string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	note, ok := s.ended[util.UUIDToString(sessionID)]
-	if !ok || s.now().Sub(note.at) > roundMemory {
-		return false
-	}
-	return indexOfRun(note.owed, taskID) >= 0
-}
-
-// wasTold reports whether a run's ending has been recorded as spoken for — said
-// outright, or attempted with no verdict to say otherwise (I4). Read-only; the
-// other half of what owesEnding inspects.
-func (s *streamStore) wasTold(sessionID pgtype.UUID, taskID string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	note, ok := s.ended[util.UUIDToString(sessionID)]
-	if !ok {
-		return false
-	}
-	return note.isTold(taskID)
-}
-
-// knowsRound reports whether this process holds local evidence that a run
-// belongs to a WeCom round of this session: a round bound to it, or an ending
-// owed to it. Both trace back to the inbound path — a round is opened by a
-// message this adapter ingested and named by the flush that answered it, and
-// every entry on owed comes from a round that was on that list — so either one
-// is positive proof of where the question was asked, needing no database.
-//
-// That second half only holds because owed is written for a round this store
-// was HOLDING and for nothing else (endEnding, the held flag). A ledger that
-// filed a debt for any run whose delivery failed would put runs asked in the
-// installer's browser on this list, and this function would then answer yes for
-// them — an authorization question settled by a bus event the caller does not
-// control. Read owed as "a round of ours is owed words", never as "the store
-// once tried to speak for this id".
-//
-// It is deliberately not the whole of the origin question: a run with nothing
-// on file here may still have come from WeCom, and that case is the row's to
-// answer (failureBelongsOnWecom).
-func (s *streamStore) knowsRound(sessionID pgtype.UUID, taskID string) bool {
+// has reports whether a session holds a round bound to this run. A round is
+// opened by a message this adapter ingested and named by the flush that
+// answered it, so an entry here is local proof the question was asked in the
+// room — the one case the failure notice's origin gate can decide without a
+// database (failureBelongsOnWecom).
+func (s *streamStore) has(sessionID pgtype.UUID, taskID string) bool {
 	if taskID == "" {
 		return false
 	}
-	key := util.UUIDToString(sessionID)
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, r := range s.sessions[key] {
+	for _, r := range s.sessions[util.UUIDToString(sessionID)] {
 		if r.taskID == taskID {
-			return true
-		}
-	}
-	note, ok := s.ended[key]
-	if !ok || s.now().Sub(note.at) > roundMemory {
-		return false
-	}
-	for _, id := range note.owed {
-		if id == taskID {
 			return true
 		}
 	}
 	return false
 }
 
-// holding reports whether this store has anything on file anywhere: a round on
-// some session's open list, painted or not, or a session's ended note. It is
-// the "nothing here to close" test at the head of the two ending subscribers.
+// holding reports whether this store has any round on file anywhere, painted
+// or not. It is the "nothing here to close" test at the head of the two
+// ending subscribers.
 //
 // Unpainted rounds count, and that is the point. depth() screens on painted
 // because it answers "how many bubbles are on screen"; a round bound to a run
@@ -1299,46 +750,12 @@ func (s *streamStore) knowsRound(sessionID pgtype.UUID, taskID string) bool {
 func (s *streamStore) holding() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.ended) > 0 {
-		return true
-	}
 	for _, rounds := range s.sessions {
 		if len(rounds) > 0 {
 			return true
 		}
 	}
 	return false
-}
-
-// knowsSession reports whether this process holds anything at all for a
-// session: a round on the open list, or a note left by one that has ended.
-// Both are written only by this adapter's inbound path, so either settles that
-// the session is WeCom's without asking the database.
-//
-// Weaker than knowsRound, and for a different job. knowsRound answers "did
-// THIS run come from the room", which is an authorization question and has to
-// name the run. This one answers "is this session ours at all", which is what
-// keeps another channel's failed run off the database entirely.
-func (s *streamStore) knowsSession(sessionID pgtype.UUID) bool {
-	key := util.UUIDToString(sessionID)
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.sessions[key]) > 0 {
-		return true
-	}
-	note, ok := s.ended[key]
-	return ok && s.now().Sub(note.at) <= roundMemory
-}
-
-// remembered reports how many SESSIONS hold a note — one per session, however
-// many of its rounds are on it. Diagnostics, and the "this process knows
-// nothing at all" check at the head of the two ending subscribers; neither
-// wants a round count, so none is kept.
-func (s *streamStore) remembered() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.ended)
 }
 
 // drop forgets a round without sending anything — used when the opening frame
@@ -1367,7 +784,7 @@ func (s *streamStore) drop(sessionID pgtype.UUID, batch engine.RunBatchID) {
 }
 
 // depth reports how many bubbles are open across all sessions. Diagnostics,
-// tests, and the cheap rejection at the head of the failure subscriber.
+// tests, and the cheap rejection at the head of the progress subscribers.
 func (s *streamStore) depth() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1382,25 +799,15 @@ func (s *streamStore) depth() int {
 	return n
 }
 
-// hasRounds reports whether a session has any round on file. It gates the one
-// database read the retry-clone lookup costs, so a session with nothing open
-// never pays for it.
-func (s *streamStore) hasRounds(sessionID pgtype.UUID) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.sessions[util.UUIDToString(sessionID)]) > 0
-}
-
 func (s *streamStore) expiredLocked(createdAt time.Time) bool {
 	return s.now().Sub(createdAt) > s.maxAge
 }
 
-// sweepLocked evicts rounds the server would no longer accept, and the notes
-// left by rounds too old to still be running. The guard timer normally retires
-// a round long before this fires; the sweep is what keeps a process whose
-// timers were beaten by a clock jump from accumulating entries forever, and it
-// is the only thing that bounds the notes, which no timer touches. Caller
-// holds s.mu.
+// sweepLocked evicts rounds the server would no longer accept, and the
+// finished rings of sessions that have been quiet for a whole window. The
+// guard timer normally rotates a round long before this fires; the sweep is
+// what keeps a process whose timers were beaten by a clock jump from
+// accumulating entries forever. Caller holds s.mu.
 func (s *streamStore) sweepLocked() {
 	for key, rounds := range s.sessions {
 		live := rounds[:0]
@@ -1419,12 +826,67 @@ func (s *streamStore) sweepLocked() {
 			s.sessions[key] = live
 		}
 	}
-	now := s.now()
-	for key, round := range s.ended {
-		if now.Sub(round.at) > roundMemory {
-			delete(s.ended, key)
+	for key, ring := range s.finished {
+		if s.expiredLocked(ring.at) {
+			delete(s.finished, key)
 		}
 	}
+}
+
+// seal writes a bubble's closing frame and is the one place the retry policy
+// for closing frames lives. Every closer goes through it: the answer, the
+// failure and cancellation notices, the settled flush, and the hand-over a
+// rotation writes on the stream it is leaving.
+//
+// The policy, measured against the live bot (STRATEGY §6.5):
+//
+//   - An ack that never comes (errStreamAckTimeout) says nothing about whether
+//     the frame landed, and a frame written right before a disconnect does
+//     NOT land. Re-sending the identical closing frame is accepted with errcode
+//     0 whether or not the first one did, so the frame is written again, up to
+//     streamCloseRetries more times, streamCloseRetryDelay apart. The registry
+//     resolves the sender per frame, so a reconnect between two attempts is
+//     covered. THE CHOSEN SIDE: a retry after an ack that was merely lost may
+//     put in front of the user a closing frame they have already seen — the
+//     same content on the same stream, which the client renders in place. That
+//     is preferred over the alternative, an answer written before a drop that
+//     never arrived and was never sent again.
+//   - A verdict from the server (streamUnusable: 846605 / 846608) ends it: this
+//     stream will never take a frame, and the caller falls back to a plain
+//     message.
+//   - errStreamBusy and errStreamSuperseded are not retried. Busy cannot
+//     happen to a closing frame (they queue, ws_sender.go); superseded means
+//     another closer sealed this stream first, and the answer is theirs.
+//   - The retries stop when ctx ends or the stream's own window is gone: a
+//     frame the server is about to refuse on age is not worth the wait.
+//
+// The ending is counted once, whatever the number of attempts: a bubble that
+// took the frame on the second try ended in words all the same.
+func (s *streamStore) seal(ctx context.Context, senders *sendersRegistry, h streamHandle, text string) error {
+	var err error
+	for attempt := 0; ; attempt++ {
+		err = senders.stream(ctx, h, text, true)
+		if !errors.Is(err, errStreamAckTimeout) || attempt >= streamCloseRetries {
+			break
+		}
+		if s.expiredLocked(h.CreatedAt) {
+			break
+		}
+		if s.closeRetryDelay > 0 {
+			timer := time.NewTimer(s.closeRetryDelay)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				err = ctx.Err()
+			}
+			if ctx.Err() != nil {
+				break
+			}
+		}
+	}
+	senders.recordEnding(err)
+	return err
 }
 
 // roundTaker matches a task lifecycle event to the round it belongs to. Both
@@ -1436,10 +898,8 @@ type roundTaker struct {
 	log     *slog.Logger
 }
 
-// sayEnding is roundTaker's one job: sayEnding on the store, with the auto-retry
-// lookup supplied. Everything the contract at the top of this file promises
-// holds here unchanged — the delivery goes in, the record comes out of what it
-// reports, and no caller ever holds an unresolved claim.
+// take is roundTaker's one job: take on the store, with the auto-retry lookup
+// supplied.
 //
 // The id on the event is tried first, because that is the id the flush bound.
 // An auto-retry clone is the one case it does not match: FailTask creates the
@@ -1450,32 +910,20 @@ type roundTaker struct {
 // belongs to is on file, it is just filed under the batch's owner.
 //
 // The lookup costs one read, and the store only asks for it on a miss in a
-// session that holds something a second id could match. Without a task lookup
-// configured the miss is simply a miss: the delivery falls back to whatever it
-// can find on its own.
+// session that still holds a round. Without a task lookup configured the miss
+// is simply a miss.
 //
-// With no store at all the in-place reply is disabled, so the delivery still
-// runs — an answer has to reach the user either way — and nothing is recorded.
-func (r roundTaker) sayEnding(
-	ctx context.Context,
-	sessionID pgtype.UUID,
-	k roundKey,
-	ending roundEnding,
-	say func(roundTurn) (roundAddress, error),
-) (roundVerdict, error) {
+// With no store at all the in-place reply is disabled: nothing is ever found.
+func (r roundTaker) take(ctx context.Context, sessionID pgtype.UUID, k roundKey) (roundTurn, bool) {
 	if r.streams == nil {
-		_, err := say(roundTurn{Verdict: roundForgotten})
-		return roundForgotten, err
+		return roundTurn{}, false
 	}
-	return r.streams.sayEnding(sessionID, k, ending,
-		func(taskID string) string { return r.rootTaskID(ctx, taskID) }, say)
+	return r.streams.take(ctx, sessionID, k, r.rootTaskID)
 }
 
 // rootTaskID reads the input batch a task belongs to — its own id for a first
 // attempt, the parent's for an auto-retry clone. Empty when there is nothing
-// to gain from asking. Whether asking is worth a row is the caller's call:
-// take asks only while a bubble is open, claim and settle only while a promise
-// is outstanding.
+// to gain from asking.
 func (r roundTaker) rootTaskID(ctx context.Context, taskID string) string {
 	if r.tasks == nil {
 		return ""

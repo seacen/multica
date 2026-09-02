@@ -9,7 +9,7 @@ package wecom
 // browser and ask the agent something. Both runs die the same way — one
 // task:failed on the shared bus, carrying the same chat_session_id — and
 // nothing in the event says which surface asked. Without the question,
-// sayTheRunFailed resolves the room off the binding row and announces, in
+// handleTaskFailed resolves the room off the delivery row and announces, in
 // front of everyone in it, that something they never saw has gone wrong.
 //
 // The first two tests are the pair that matters: the same event, the same
@@ -79,20 +79,20 @@ func (r *logRecorder) refusals() []string {
 	return out
 }
 
-// newBoundRoomRig is a bubbleRig whose manager also holds the binding row —
-// the address of last resort for a failure notice, and the one the leak
-// travels down. newBubbleRig leaves it nil because its own tests are about the
-// rounds this process holds; here it is the whole point.
+// newBoundRoomRig is a bubbleRig whose manager also reads the delivery row —
+// the address a failure notice takes when no bubble is left, and the one the
+// leak travels down. newBubbleRig leaves it nil because its own tests are
+// about the rounds this process holds; here it is the whole point.
 func newBoundRoomRig(t *testing.T) *bubbleRig {
 	t.Helper()
 	rig := newBubbleRig(t)
 	rig.logs = &logRecorder{}
 	rig.typing = NewTypingIndicator(TypingIndicatorConfig{
-		Senders:  rig.senders,
-		Streams:  rig.streams,
-		Tasks:    rig.q,
-		Bindings: rig.q,
-		Logger:   slog.New(rig.logs),
+		Senders:    rig.senders,
+		Streams:    rig.streams,
+		Tasks:      rig.q,
+		Deliveries: rig.q,
+		Logger:     slog.New(rig.logs),
 		// No guard: these tests drive the endings themselves.
 		GuardAfter: -1,
 	})
@@ -180,27 +180,24 @@ func TestAWebUIRunsFailureIsNotAnnouncedInTheRoom(t *testing.T) {
 }
 
 // The control, and the direction that costs more to get wrong. The round was
-// asked in WeCom, ran past the stream window, and its bubble was closed on the
-// guard's promise of a separate reply. This notice IS that reply — the only
-// "that run did not go through" WeCom ever produces.
-func TestAWecomRunsFailureStillReachesTheAskerAfterThePromise(t *testing.T) {
+// asked in WeCom and this process holds no bubble for it — a restart mid-run
+// — so the notice is addressed by the task's delivery row, the way the answer
+// would be. It is the only "that run did not go through" WeCom ever produces.
+func TestAWecomRunsFailureStillReachesTheAskerWithoutABubble(t *testing.T) {
 	t.Parallel()
 	rig := newBoundRoomRig(t)
 	rig.askedInTheRoom(t, "task-1")
-	rig.ran(t, "REQ-1", 1, "task-1")
-	rig.guardClosed(t, 1) // "还在处理，完成后我再单独回复你"
 
 	rig.failed(t, "task-1", false)
 
 	got := pushedTexts(t, rig.conn)
 	if len(got) != 1 || got[0] != streamCopyFailed {
-		t.Fatalf("the asker read %q, want exactly [%q] — they were promised a separate reply "+
-			"and the failure of their own question never arrived", got, streamCopyFailed)
+		t.Fatalf("the asker read %q, want exactly [%q] — the failure of their own question never arrived", got, streamCopyFailed)
 	}
 }
 
-// The same control one step earlier: the bubble is still open, so the notice
-// goes into it rather than under it. A gate that refuses a WeCom round leaves
+// The same control with the bubble still open, so the notice goes into it
+// rather than under it. A gate that refuses a WeCom round leaves
 // this bubble spinning with no ending at all.
 func TestAWecomRunsFailureStillClosesTheBubbleItOpened(t *testing.T) {
 	t.Parallel()
@@ -251,8 +248,8 @@ func TestAWebUIRunsFailureLeavesTheRoomsOwnBubbleAlone(t *testing.T) {
 // still tells a room that activity nobody there can see has gone wrong, and
 // the existence of the activity is the disclosure.
 //
-// The promise these used to be protecting is not paid for here. It is covered
-// two tests further down, out of the round state this process already holds.
+// The case that made fail-open tempting is covered further down, out of the
+// round state this process already holds.
 
 // A task:failed with no task id on it cannot be attributed at all. Both
 // publishers go through service.taskEvent, which sets TaskID on the envelope
@@ -302,43 +299,13 @@ func TestAnUnreadableOriginRefusesTheFailure(t *testing.T) {
 // ---- and where it can be established without a database ----
 //
 // The case the refusals above look like they cost is the case with local
-// evidence, which is why the trade-off is not one. A round sitting on the
-// guard's promise, and a round still open, are both written only by the
-// inbound path — a message this adapter ingested, named by the flush that
-// answered it — so either one is proof of origin that no outage can take away.
+// evidence, which is why the trade-off is not one. A round still open was
+// written only by the inbound path — a message this adapter ingested, named by
+// the flush that answered it — so it is proof of origin that no outage can
+// take away.
 
-// TestAnUnreadableOriginStillKeepsTheGuardsPromise is the pair to
-// TestAnUnreadableOriginRefusesTheFailure: same broken database, same event,
-// and the opposite outcome, because this round is owed words.
-//
-// The gate runs before anything is consumed, so the promise is still on the
-// list when it is asked. Refusing here would be the one failure that cannot be
-// recovered from — the asker was told "还在处理，完成后我再单独回复你" and would
-// wait for a reply that was never going to come.
-func TestAnUnreadableOriginStillKeepsTheGuardsPromise(t *testing.T) {
-	t.Parallel()
-	rig := newBoundRoomRig(t)
-	rig.askedInTheRoom(t, "task-1")
-	rig.ran(t, "REQ-1", 1, "task-1")
-	rig.guardClosed(t, 1) // "还在处理，完成后我再单独回复你"
-	// Every database read the gate could make now fails.
-	rig.q.taskErr = errors.New("connection refused")
-	rig.q.originErr = errors.New("connection refused")
-
-	rig.failed(t, "task-1", false)
-
-	got := pushedTexts(t, rig.conn)
-	if len(got) != 1 || got[0] != streamCopyFailed {
-		t.Fatalf("the asker read %q, want exactly [%q] — they are sitting on the guard's promise of a "+
-			"separate reply, and this process knew the round was theirs without asking anybody", got, streamCopyFailed)
-	}
-	if reasons := rig.logs.refusals(); len(reasons) != 0 {
-		t.Errorf("the gate refused (%v) a round whose own promise names this run", reasons)
-	}
-}
-
-// A round still open is the same evidence one step earlier, and it costs no
-// read at all: the bubble on screen was opened by a message from the room.
+// A round still open is evidence that costs no read at all: the bubble on
+// screen was opened by a message from the room.
 func TestAnOpenRoundIsProofEnoughOfOrigin(t *testing.T) {
 	t.Parallel()
 	rig := newBoundRoomRig(t)
@@ -430,40 +397,34 @@ func TestAnotherChannelsFailureNeverReachesTheTaskRow(t *testing.T) {
 // ---- and where the local evidence must not be manufactured ----
 //
 // The gate answers "yes, this run is ours" from memory before it asks the
-// database, and the memory it reads is the owed list. That shortcut is only
-// sound while owed holds runs of rounds this adapter actually ingested. The
-// note's ADDRESS is a session-level fact — one WeCom round leaves it and every
-// later round of that session sees it — so a ledger that filed a debt whenever
-// a delivery failed would let any run sharing the session write itself onto the
-// list the gate trusts.
+// database, and the memory it reads is the open list. That shortcut is only
+// sound while the list holds rounds this adapter actually ingested: a delivery
+// attempt for a run of somebody else's must leave nothing behind that the gate
+// would later read as proof.
 
 // TestAWebRunsUndeliveredAnswerDoesNotBuyItTheRoomsVoice is the fix.
 //
 // The installer asks in their browser, against a session the room also uses.
 // The origin gate turns that answer away before anything WeCom-side is
-// touched: nothing owed, nothing consumed, nothing said. If a delivery attempt
-// could put the run on owed instead, its later task:failed would walk straight
-// through the gate on "local evidence" and tell everyone in the room that a
-// question they never saw has gone wrong — with no database read, so no fix on
-// the row side could reach it.
+// touched: nothing taken, nothing filed, nothing said. Its later task:failed
+// then has to be decided by the row, and the row says no.
 //
 // The answer is still driven through processEvent rather than skipped, and the
 // socket is still taken down under it, because that is what makes this test
 // fail if the origin gate is ever moved back behind the take: the answer would
-// reach deliverAnswer, the dead socket would fail it, and the ledger would be
-// asked to record an ending for a run this adapter never ingested.
+// reach deliverAnswer and the dead socket would fail it, and the store would
+// have been asked to take a round for a run this adapter never ingested.
 func TestAWebRunsUndeliveredAnswerDoesNotBuyItTheRoomsVoice(t *testing.T) {
 	t.Parallel()
 	rig := newBoundRoomRig(t)
 
-	// The room asked something earlier and read its answer. That is what puts
-	// the room's address on the session's note, where it outlives the round.
+	// The room asked something earlier and read its answer.
 	rig.askedInTheRoom(t, "task-1")
 	rig.ran(t, "REQ-1", 1, "task-1")
 	rig.answer(t, "42", "task-1")
 
 	// Now the installer asks the same session something in a browser. No
-	// bubble, no promise — and the socket is down when the answer goes out.
+	// bubble — and the socket is down when the answer goes out.
 	rig.askedInTheBrowser(t, "task-2")
 	rig.senders.clear(rig.instID, rig.conn.sender)
 	if err := rig.out.processEvent(context.Background(), events.Event{
@@ -475,15 +436,6 @@ func TestAWebRunsUndeliveredAnswerDoesNotBuyItTheRoomsVoice(t *testing.T) {
 			"and there is nothing to report: %v", err)
 	}
 	rig.senders.set(rig.instID, rig.conn.sender) // the socket comes back
-
-	// Errorf, not Fatalf: this is the mechanism, and the next three assertions
-	// are what it costs the room. A run that stops here has been told half of
-	// what went wrong.
-	if rig.streams.owesEnding(bubbleSessionID(t), taskUUID(t, "task-2")) {
-		t.Errorf("the ledger owes an ending to a run this adapter never ingested — owed is what " +
-			"knowsRound reads as proof of where a question was asked, so a browser run that " +
-			"failed to deliver has just written itself its own permission to speak in the room")
-	}
 
 	// Everything read up to here belongs to the answer path. What the failure
 	// path asks on its own is the tail after this mark.
@@ -497,73 +449,12 @@ func TestAWebRunsUndeliveredAnswerDoesNotBuyItTheRoomsVoice(t *testing.T) {
 	}
 	if asked := rig.q.originAsked()[beforeFailure:]; len(asked) != 1 || asked[0] != taskUUID(t, "task-2") {
 		t.Fatalf("the failure path read the channel_ingested stamp for %v, want exactly [%s] — "+
-			"a run with no round and no promise of this adapter's has to be decided by the row, "+
+			"a run with no round of this adapter's has to be decided by the row, "+
 			"and this one skipped the check on evidence it manufactured for itself",
 			asked, taskUUID(t, "task-2"))
 	}
 	// Two frames: the room's own bubble, opened and sealed by its own answer.
 	if frames := rig.conn.streamFrames(t); len(frames) != 2 {
 		t.Fatalf("the room's stream frames are %v, want the 2 its own round wrote", frames)
-	}
-}
-
-// TestARoomRunsUndeliveredAnswerStillTellsItsAskerSomething is the control,
-// and the direction that costs more to get wrong.
-//
-// Same dropped socket, same session — except this round IS the room's, and the
-// attempt cost it the bubble the asker was watching. The answer is gone: there
-// is no durable fall-back on this path, so a socket that is down when the words
-// go out loses them. What is left is the ledger — the run is still owed an
-// ending — and that is the only thing standing between the asker and a bubble
-// that spins forever.
-//
-// So the failure that follows has to speak, and it has to speak with the
-// database dark: the open round is this process's own proof that the question
-// was asked in the room. The previous test is the same shape with the opposite
-// verdict, and the two only mean anything read together.
-func TestARoomRunsUndeliveredAnswerStillTellsItsAskerSomething(t *testing.T) {
-	t.Parallel()
-	rig := newBoundRoomRig(t)
-	rig.askedInTheRoom(t, "task-1")
-	rig.ran(t, "REQ-1", 1, "task-1")
-
-	// The socket drops between the answer being computed and it going out. The
-	// bubble is consumed by the attempt either way.
-	rig.senders.clear(rig.instID, rig.conn.sender)
-	err := rig.out.processEvent(context.Background(), events.Event{
-		ChatSessionID: bubbleSession,
-		TaskID:        taskUUID(t, "task-1"),
-		Payload:       protocol.ChatDonePayload{Content: "42"},
-	})
-	if !errors.Is(err, errNoLiveConnection) {
-		t.Fatalf("the answer went out over a dead socket and reported %v, want errNoLiveConnection — "+
-			"an answer nobody read has to be reported as undelivered, because the ending that "+
-			"follows is the only thing left to tell the asker anything", err)
-	}
-	rig.senders.set(rig.instID, rig.conn.sender)
-
-	if !rig.streams.owesEnding(bubbleSessionID(t), taskUUID(t, "task-1")) {
-		t.Fatalf("the round is spoken for after an answer that never reached anybody — the asker " +
-			"is left watching a bubble that no ending will ever seal")
-	}
-
-	// And the database has stopped answering, so the gate has nothing but this.
-	rig.q.taskErr = errors.New("connection refused")
-	rig.q.originErr = errors.New("connection refused")
-
-	rig.failed(t, "task-1", false)
-
-	// A plain push, not a stream frame: the failed in-place attempt consumed
-	// the bubble's handle, so the ending has nowhere to be written but an
-	// ordinary message. What matters is that the asker is told at all, and
-	// that it took no database read to decide they could be.
-	got := pushedTexts(t, rig.conn)
-	if len(got) != 1 || got[0] != streamCopyFailed {
-		t.Fatalf("the asker read %q, want exactly [%q] — the answer was lost with the socket, so "+
-			"this notice is the only thing left, and the room's own open round is proof enough of "+
-			"where the question came from", got, streamCopyFailed)
-	}
-	if reasons := rig.logs.refusals(); len(reasons) != 0 {
-		t.Errorf("the gate refused (%v) a run whose own round is still open in this process", reasons)
 	}
 }

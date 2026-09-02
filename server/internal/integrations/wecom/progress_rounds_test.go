@@ -19,7 +19,7 @@ package wecom
 //
 // The other half of the file is which round a step belongs to. A chat session
 // outlives its turns, the daemon flushes a transcript in arrears, and the
-// five-minute guard closes a bubble while its run carries on — so a step for a
+// nine-minute guard rotates a bubble while its run carries on — so a step for a
 // round that is over really does arrive after the next question has opened a
 // bubble of its own.
 
@@ -567,14 +567,17 @@ func TestTheAudienceIsDecidedAgainForEveryRound(t *testing.T) {
 	}
 }
 
-// ---- decisions 1 and 2: a round that is over gets no more frames ----
+// ---- decisions 1 and 2: a stream that is over gets no more frames ----
 
-// The five-minute guard closes the bubble and tells the user the reply is
-// coming separately; the run carries on and keeps publishing steps. Those
-// steps have nowhere to go, and nowhere is the answer: a second bubble would
-// put a second spinner in the conversation for a run the user already has an
-// account of, and buy a frame every 1.5s to keep it turning.
-func TestTheGuardsPromiseIsNotFollowedBySecondThoughts(t *testing.T) {
+// The nine-minute guard seals the bubble that is about to expire and opens a
+// fresh one for the run to carry on in. The steps that follow belong to the
+// new bubble and only there: a refresh on the sealed stream would be refused
+// by the server, or worse, repaint a status over the hand-over line.
+//
+// REVERSE VERIFICATION: make streamStore.rotate leave e.handle as it was (drop
+// the `e.handle = next` line) and this fails with every refresh addressed to
+// the sealed stream.
+func TestASealedBubbleIsNotRefreshed(t *testing.T) {
 	t.Parallel()
 	rig := newProgressRig(t)
 	rig.running(t, "REQ-A", 1, "task-1")
@@ -582,8 +585,8 @@ func TestTheGuardsPromiseIsNotFollowedBySecondThoughts(t *testing.T) {
 	// the cheap "nothing open" rejection cannot be what makes this pass.
 	rig.running(t, "REQ-B", 2, "task-2")
 
-	rig.guardClosed(t, 1)
-	before := len(rig.refreshes(t))
+	old, next := rig.rotated(t, 1)
+	before := len(rig.conn.streamFrames(t))
 	beforePushes := len(rig.conn.pushes(t))
 
 	for i := 0; i < 5; i++ {
@@ -591,12 +594,20 @@ func TestTheGuardsPromiseIsNotFollowedBySecondThoughts(t *testing.T) {
 		rig.tick()
 	}
 
-	if got := len(rig.refreshes(t)) - before; got != 0 {
-		t.Errorf("a guard-closed round's run wrote %d more refresh frame(s). The user was told "+
-			"\"I'll reply separately\" and is now watching a second spinner for the same run.", got)
+	after := rig.conn.streamFrames(t)[before:]
+	if len(after) == 0 {
+		t.Fatal("a rotated round's run wrote no refresh frame at all; the new bubble spins with nothing in it")
+	}
+	for _, f := range after {
+		if f["id"] == old {
+			t.Errorf("a refresh was written to the sealed stream %s: %v", old, f)
+		}
+		if f["id"] != next {
+			t.Errorf("a refresh was written to stream %v, want the rotated bubble %s", f["id"], next)
+		}
 	}
 	if got := len(rig.conn.pushes(t)) - beforePushes; got != 0 {
-		t.Errorf("a guard-closed round's steps went out as %d plain message(s). A step is not an "+
+		t.Errorf("a rotated round's steps went out as %d plain message(s). A step is not an "+
 			"ending: chasing an address for one turns a status line into a chat message, once per "+
 			"1.5s, for the rest of the run.", got)
 	}
@@ -608,18 +619,22 @@ func TestTheGuardsPromiseIsNotFollowedBySecondThoughts(t *testing.T) {
 // message arrives, so there is a real window in which the new bubble has no
 // run of its own yet and the old run is still talking.
 //
-// Both ways a round can be over are checked here, because the answer is the
-// same one and for the same reason — a finished run may not have a bubble
-// opened later, and a step is a write into a bubble.
+// Every way a round's first bubble can be over is checked here, because the
+// answer is the same one and for the same reason — a step is a write into a
+// bubble, and the next question's bubble is not this run's. A finished run
+// gets no frame at all; a rotated run's frame goes to its own new bubble.
 func TestAFinishedRunsStepsNeverLandInTheNextQuestionsBubble(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		end  func(t *testing.T, rig *progressRig)
+		// stillOpen says the round carries on in a bubble of its own after
+		// end, so a refresh is expected — just not in the next question's.
+		stillOpen bool
 	}{
-		{"answered", func(t *testing.T, rig *progressRig) { rig.answer(t, "all done", "task-1") }},
-		{"guard-closed", func(t *testing.T, rig *progressRig) { rig.guardClosed(t, 1) }},
-		{"cancelled", func(t *testing.T, rig *progressRig) { rig.cancelled(t, "task-1") }},
+		{"answered", func(t *testing.T, rig *progressRig) { rig.answer(t, "all done", "task-1") }, false},
+		{"rotated", func(t *testing.T, rig *progressRig) { rig.rotated(t, 1) }, true},
+		{"cancelled", func(t *testing.T, rig *progressRig) { rig.cancelled(t, "task-1") }, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -630,15 +645,25 @@ func TestAFinishedRunsStepsNeverLandInTheNextQuestionsBubble(t *testing.T) {
 			// The next question. Its bubble is painted immediately; the flush
 			// that names its run has not happened yet.
 			rig.ask(t, "REQ-B", 2)
-			before := len(rig.refreshes(t))
+			nextQuestion := rig.streamIDOf(t, 2)
+			before := len(rig.conn.streamFrames(t))
 
 			rig.toolCall(t, "task-1", "Read", map[string]any{"file_path": "/srv/app/last-round.go"})
 
-			if after := rig.refreshes(t); len(after) != before {
-				t.Errorf("the finished round's tool call was painted into the new question's bubble: %q\n"+
-					"The user asked something else and is watching the previous run's work reported as "+
-					"the answer to it — and the new round's own run is then locked out of its own bubble.",
-					after[len(after)-1])
+			after := rig.conn.streamFrames(t)[before:]
+			for _, f := range after {
+				if f["id"] == nextQuestion {
+					t.Errorf("the previous round's tool call was painted into the new question's bubble: %q\n"+
+						"The user asked something else and is watching the previous run's work reported as "+
+						"the answer to it — and the new round's own run is then locked out of its own bubble.",
+						f["content"])
+				}
+			}
+			if !tc.stillOpen && len(after) != 0 {
+				t.Errorf("a finished round's tool call wrote %d frame(s): %v", len(after), after)
+			}
+			if tc.stillOpen && len(after) == 0 {
+				t.Errorf("a rotated round's tool call wrote nothing; its own new bubble spins empty")
 			}
 		})
 	}

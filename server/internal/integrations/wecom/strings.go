@@ -219,8 +219,11 @@ type copyPack struct {
 	//   Separate copy from StreamFailed on purpose: inviting a retry of
 	//   something somebody just stopped on purpose reads as the bot not having
 	//   noticed.
-	// StreamStillWorking — the run outlived the protocol's stream window, so
-	//   we close the bubble ourselves and answer separately later.
+	// StreamContinued — the run outlived one stream's window, so the bubble
+	//   is sealed with this and the run carries on in a fresh bubble right
+	//   underneath it (the rotation in typing_indicator.go's fireGuard). A
+	//   statement of fact, not a promise: nothing is owed on the strength of
+	//   it, the next bubble is already on screen.
 	// StreamNoReplyWithFiles — the agent finished with no words but produced
 	// files, which arrive as separate messages right after this one. Distinct
 	// from StreamNoReply because that copy says nothing is coming, and then
@@ -243,7 +246,7 @@ type copyPack struct {
 	StreamNotStarted       string
 	StreamFailed           string
 	StreamCancelled        string
-	StreamStillWorking     string
+	StreamContinued        string
 
 	// StreamStuck is the odd one out among the Stream* lines: it does not close
 	// a bubble, it explains one that can no longer be closed. The server has
@@ -411,7 +414,7 @@ var copyPacks = map[Locale]copyPack{
 		StreamNotStarted:       "已收到，但这条暂时没能开始处理。",
 		StreamFailed:           "⚠️ 这次没跑通，请稍后再试一次。",
 		StreamCancelled:        "⏹️ 这次处理已取消。",
-		StreamStillWorking:     "还在处理，完成后我再单独回复你。",
+		StreamContinued:        "处理时间较长，接下一条",
 		StreamStuck:            "⚠️ 上面那条进度不会再更新了，这轮的结果我用新消息发你。",
 
 		StreamProgressPrefix: "正在处理：",
@@ -488,7 +491,7 @@ var copyPacks = map[Locale]copyPack{
 		StreamNotStarted:       "Got it, but this one couldn't start processing.",
 		StreamFailed:           "⚠️ That run didn't go through. Please try again.",
 		StreamCancelled:        "⏹️ That run was cancelled.",
-		StreamStillWorking:     "Still working on it — I'll reply separately when it's done.",
+		StreamContinued:        "Still working, continued below",
 		StreamStuck:            "⚠️ The status above won't update any further. I'll send this round's result as a new message.",
 
 		StreamProgressPrefix: "Working on it: ",

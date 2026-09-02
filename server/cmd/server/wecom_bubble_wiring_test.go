@@ -16,8 +16,7 @@ import (
 // What closes the WeCom streaming bubble is a bus subscription holding four
 // dependencies, and every one of those five things is invisible when it is
 // missing: the events keep being published, nothing panics, nothing logs, and
-// the user watches a spinner until the nine-minute guard replaces it with a
-// promise about a run that is already over. Nothing in the wecom package fails
+// the user watches a spinner until the server's window runs out on it. Nothing in the wecom package fails
 // either, because every unit test builds its own manager and hands it its own
 // dependencies.
 //
@@ -28,7 +27,7 @@ import (
 // without having to know which other subsystems listen to the same events.
 //
 // Subscriptions alone are not enough, and that is the point of the second
-// half. Register subscribes unconditionally: drop Tasks or Bindings from the
+// half. Register subscribes unconditionally: drop Tasks or Deliveries from the
 // boot block and both subscriptions still appear, the counts still rise, and
 // every bubble the manager is supposed to close silently stays open. So the
 // dependencies are read back off the manager the boot path actually
@@ -115,11 +114,10 @@ func TestWecomBubbleClosersAreWiredOnTheRealBootPath(t *testing.T) {
 				"no round for is refused as unattributable and the user is told nothing",
 		},
 		{
-			field: "Bindings",
-			wired: wiring.Bindings,
-			consequence: "a run that fails after its bubble is gone — the guard closed it at nine minutes, " +
-				"or the process restarted mid-run — has no chat to speak in, so the user is told nothing and " +
-				"the guard's \"I'll reply separately\" is never answered",
+			field: "Deliveries",
+			wired: wiring.Deliveries,
+			consequence: "a run that fails after its bubble is gone — the process restarted mid-run, or " +
+				"the opening frame was refused — has no chat to speak in, so the user is told nothing",
 		},
 		{
 			field: "Identities",

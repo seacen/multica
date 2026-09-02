@@ -1031,11 +1031,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					// fallback read of the session off the task row for a
 					// task:failed that carries none.
 					Tasks: queries,
-					// A run that fails after its bubble is gone — the guard
-					// closed it at nine minutes, or the process restarted
-					// mid-run — still owes the user the news, and the binding
-					// row is where the chat is found when no handle is left.
-					Bindings: queries,
+					// A run that fails after its bubble is gone — the process
+					// restarted mid-run, or the opening frame was refused —
+					// still gets its notice, addressed by the task's own
+					// delivery row the way the answer is.
+					Deliveries: queries,
 					// The bubble's own words are written in the reader's
 					// language, resolved when the round is opened and carried
 					// on the handle to whichever closer gets there.

@@ -11,18 +11,27 @@ package wecom
 //
 //   - The bubble MUST be closed. A reaction that never clears is untidy; a
 //     stream that never finishes is a spinner sitting in the user's chat for
-//     good. So every way a turn can end — answered, failed, never started,
-//     outlived its window — writes a closing frame carrying visible text.
+//     good. So every way a turn can end — answered, failed, cancelled, never
+//     started — writes a closing frame carrying visible text into the bubble
+//     while there is one, and a run that outlives one stream's window is
+//     rotated onto a fresh stream before the server stops taking frames
+//     (fireGuard).
 //   - OnSettled is not the normal ending. As on the other platforms the Router
 //     only calls it when the flush produced no task run; the answer closes the
 //     bubble from the chat-done subscriber in outbound.go, which is the only
 //     place that has the answer to close it with.
 //
-// Between those two the bubble is not left blank. The run's own transcript —
-// task:message, one event per tool call — is played into it as a scrolling list
-// of steps, refreshed in place at most every 1.5s. What may be shown, and to
-// whom, is progress_render.go's subject; this file is the wiring and the two
-// bus subscriptions that carry it.
+// The bubble is a CACHE and nothing more (stream_store.go). A closer that
+// finds one writes into it; one that does not says its words as an ordinary
+// message where the words are worth saying — a failed run's notice — and stays
+// silent where they are not. Nothing is owed on the strength of a bubble that
+// is gone.
+//
+// Between opening and closing the bubble is not left blank. The run's own
+// transcript — task:message, one event per tool call — is played into it as a
+// scrolling list of steps, refreshed in place at most every 1.5s. What may be
+// shown, and to whom, is progress_render.go's subject; this file is the wiring
+// and the two bus subscriptions that carry it.
 
 import (
 	"context"
@@ -48,17 +57,17 @@ import (
 // the reader, and by the time a closer runs the only thing that still knows
 // who that is, is the handle the round was opened with.
 
-// The same endings spelled in the compile-time default, for the ledger tests
-// that assert what a bubble was sealed with. A closer never reads these — it
-// reads its round's own pack — but a deployment that configures no second
-// language produces exactly these words, so they are what those tests pin.
+// The same endings spelled in the compile-time default, for the tests that
+// assert what a bubble was sealed with. A closer never reads these — it reads
+// its round's own pack — but a deployment that configures no second language
+// produces exactly these words, so they are what those tests pin.
 var (
-	streamCopyNoReply      = copyFor(DefaultLocale).StreamNoReply
-	streamCopyMerged       = copyFor(DefaultLocale).StreamMerged
-	streamCopyNotStarted   = copyFor(DefaultLocale).StreamNotStarted
-	streamCopyFailed       = copyFor(DefaultLocale).StreamFailed
-	streamCopyCancelled    = copyFor(DefaultLocale).StreamCancelled
-	streamCopyStillWorking = copyFor(DefaultLocale).StreamStillWorking
+	streamCopyNoReply    = copyFor(DefaultLocale).StreamNoReply
+	streamCopyMerged     = copyFor(DefaultLocale).StreamMerged
+	streamCopyNotStarted = copyFor(DefaultLocale).StreamNotStarted
+	streamCopyFailed     = copyFor(DefaultLocale).StreamFailed
+	streamCopyCancelled  = copyFor(DefaultLocale).StreamCancelled
+	streamCopyContinued  = copyFor(DefaultLocale).StreamContinued
 )
 
 // streamCloseTimeout bounds a closing frame written from a timer or a bus
@@ -93,23 +102,16 @@ type identityLookup interface {
 	GetChannelUserBindingByUserID(ctx context.Context, arg db.GetChannelUserBindingByUserIDParams) (db.ChannelUserBinding, error)
 }
 
-// chatBindingLookup finds which WeCom chat a session belongs to. It is the
-// address of last resort for a failure notice: the handle is gone and this
-// process has no note of the round, which is what a restart mid-run looks like.
-// The two queries are the ones outbound.go already makes on the same path for
-// the answer, so *db.Queries satisfies both interfaces without a new query.
-type chatBindingLookup interface {
-	GetChannelChatSessionBindingBySession(ctx context.Context, arg db.GetChannelChatSessionBindingBySessionParams) (db.ChannelChatSessionBinding, error)
-	GetChannelInstallation(ctx context.Context, arg db.GetChannelInstallationParams) (db.ChannelInstallation, error)
-}
-
 // TypingIndicatorManager opens a streaming bubble per round when messages are
 // ingested and owns each one until something closes it.
 type TypingIndicatorManager struct {
-	senders  *sendersRegistry
-	streams  *streamStore
-	tasks    taskOrigin
-	bindings chatBindingLookup
+	senders *sendersRegistry
+	streams *streamStore
+	tasks   taskOrigin
+	// deliveries finds the chat a failed run's notice goes to when the round
+	// has no bubble left: the same delivery row the answer is addressed by
+	// (outbound.go, taskAddress).
+	deliveries deliveryLookup
 	// languages resolves a destination to the language its bubble is closed
 	// in (language.go). nil closes every bubble in the deployment's.
 	languages languageLookup
@@ -144,11 +146,14 @@ type TypingIndicatorConfig struct {
 	// for what this manager does when it cannot ask.
 	Tasks taskOrigin
 
-	// Bindings finds the chat behind a session when nothing else can — a run
-	// that failed after this process was restarted, or after a bubble that was
-	// never painted. Nil keeps the failure notice to the rounds this process
-	// has a handle or a note for.
-	Bindings chatBindingLookup
+	// Deliveries finds the chat a failed run was asked in when its round has
+	// no bubble left — a run that failed after this process was restarted, or
+	// after a bubble that was never painted — off the task's own delivery
+	// row, the same one the answer is addressed by. It is also the ownership
+	// test: a task:failed for a run with no WeCom delivery row is another
+	// channel's and costs nothing more. Nil keeps the failure notice to the
+	// rounds this process holds a bubble for.
+	Deliveries deliveryLookup
 
 	// Languages resolves the chat a bubble was opened in to the language it is
 	// closed in: a 1:1 reads the asker's own Multica profile, a room the
@@ -181,7 +186,7 @@ func NewTypingIndicator(cfg TypingIndicatorConfig) *TypingIndicatorManager {
 		senders:      cfg.Senders,
 		streams:      cfg.Streams,
 		tasks:        cfg.Tasks,
-		bindings:     cfg.Bindings,
+		deliveries:   cfg.Deliveries,
 		languages:    cfg.Languages,
 		identities:   cfg.Identities,
 		taskSessions: newTaskSessionCache(),
@@ -195,10 +200,10 @@ func NewTypingIndicator(cfg TypingIndicatorConfig) *TypingIndicatorManager {
 // Every one of them is optional and every one of them narrows the manager
 // silently when it is missing: nothing panics, nothing logs, Register still
 // subscribes, and the events still arrive — the closing frame just never gets
-// written, which the user sees as a bubble that spins until the guard replaces
-// it with a promise nobody keeps. That makes "is it wired" unfalsifiable from
-// the outside, and a boot path that drops one looks exactly like a healthy
-// one. This is the inspection point that makes it falsifiable.
+// written, which the user sees as a bubble that spins until the server's
+// window runs out on it. That makes "is it wired" unfalsifiable from the
+// outside, and a boot path that drops one looks exactly like a healthy one.
+// This is the inspection point that makes it falsifiable.
 //
 // Languages is deliberately not among them: a manager without it still closes
 // every bubble, in the deployment's language rather than the reader's.
@@ -217,11 +222,11 @@ type TypingIndicatorWiring struct {
 	// the user nothing. It also resolves an auto-retry clone to the round its
 	// parent opened, and recovers the session for a task:failed carrying none.
 	Tasks bool
-	// Bindings finds the chat behind a session when no round is on file.
-	// Without it a run that fails after its bubble is gone (guard closed it at
-	// nine minutes, or the process restarted mid-run) tells the user nothing,
-	// and the guard's "I'll reply separately" is never answered.
-	Bindings bool
+	// Deliveries finds the chat a failed run was asked in when no bubble is
+	// on file. Without it a run that fails after its bubble is gone (the
+	// process restarted mid-run, or the opening frame was refused) tells the
+	// user nothing.
+	Deliveries bool
 
 	// Identities recognises the bot's principal, which is what decides how much
 	// of a run a bubble may show. Without it every bubble falls to the tier
@@ -237,7 +242,7 @@ func (m *TypingIndicatorManager) Wiring() TypingIndicatorWiring {
 		Senders:    m.senders != nil,
 		Streams:    m.streams != nil,
 		Tasks:      m.tasks != nil,
-		Bindings:   m.bindings != nil,
+		Deliveries: m.deliveries != nil,
 		Identities: m.identities != nil,
 	}
 }
@@ -433,17 +438,18 @@ func (m *TypingIndicatorManager) OnRunStarted(_ context.Context, sessionID pgtyp
 // batch names which bubble: the flush that settled reports the run it was
 // answering, so a session with several rounds open closes the right one
 // instead of whichever happens to be newest.
+//
+// No bubble, nothing to say: the replier's notice is the whole of what the
+// user is told, and there is no round left to address a second line to.
 func (m *TypingIndicatorManager) OnSettled(ctx context.Context, sessionID pgtype.UUID, batch engine.RunBatchID) {
 	if m.senders == nil || m.streams == nil || !sessionID.Valid {
 		return
 	}
-	m.streams.sayEnding(sessionID, byBatch(batch), roundOver, nil,
-		func(t roundTurn) (roundAddress, error) {
-			if !t.HasBubble {
-				return roundAddress{}, errNothingToSay
-			}
-			return t.Handle.address(), m.writeClosing(ctx, sessionID, t.Handle, copyFor(t.Handle.Locale).StreamNotStarted, "settled")
-		})
+	t, ok := m.streams.take(ctx, sessionID, byBatch(batch), nil)
+	if !ok || !t.HasBubble {
+		return
+	}
+	m.writeClosing(ctx, sessionID, t.Handle, copyFor(t.Handle.Locale).StreamNotStarted, "settled")
 }
 
 // Register subscribes the manager to the two ways a run ends without an
@@ -582,7 +588,7 @@ func (m *TypingIndicatorManager) progressTarget(e events.Event) (pgtype.UUID, st
 // is worth less than the answer behind it, and it yields again to the feed's
 // own minimum interval, which folds a burst of tool calls into one frame. And
 // a refresh that merely fails leaves the spinner exactly as it was, for the
-// answer or the guard to finish properly.
+// answer to finish properly.
 //
 // The one thing a refresh does end is a bubble the server has disowned; see
 // markUnusable for why that stop condition is not optional.
@@ -669,17 +675,18 @@ func progressSummary(payload any) string {
 // timeout come down that path). So the session is normally on the event, and
 // sessionFor's read of it off the task row is a fallback for a payload neither
 // publisher produces today. It is kept because a bubble left spinning is a
-// failure nobody reports: nine minutes on, the guard replaces it with "still
-// working, I'll reply separately" — a promise about a run that has been dead
-// the whole time.
+// failure nobody reports.
 //
-// The bubble is not the whole of it. A handle is consumed by whichever ending
-// gets there first, and the guard is allowed to be that one at the nine-minute
-// mark while the run carries on — so every run longer than nine minutes that
-// then failed finds no handle here. This notice is the only "that run did not
+// The bubble is not the whole of it. A round that lost its bubble — a restart
+// mid-run, an opening frame the server refused, a stream that ran out its
+// window — still has an asker, and this notice is the only "that run did not
 // go through" WeCom ever produces: the replier speaks for needs_binding,
-// offline, archived and issue_created and for nothing else. So the handle is
-// one address among three, and sayTheRunFailed works down the rest.
+// offline, archived and issue_created and for nothing else. So a round with no
+// bubble is addressed by the task's own delivery row, the way the answer is.
+//
+// A repeat of one run's failure — the sweeper republishing it, the second
+// publisher — is a second notice. Nothing here remembers having said it: the
+// bubble is a cache, and a cache holds no account of what went out.
 func (m *TypingIndicatorManager) handleTaskFailed(e events.Event) {
 	if m.streams == nil {
 		return
@@ -696,7 +703,7 @@ func (m *TypingIndicatorManager) handleTaskFailed(e events.Event) {
 	if retryPending(e) {
 		return
 	}
-	if m.bindings == nil && !m.streams.holding() {
+	if m.deliveries == nil && !m.streams.holding() {
 		// Nothing on file, and no way to find a chat: no reason to read a row
 		// for someone else's run.
 		return
@@ -714,45 +721,53 @@ func (m *TypingIndicatorManager) handleTaskFailed(e events.Event) {
 	dbCtx, cancelDB := context.WithTimeout(context.Background(), taskLookupTimeout)
 	defer cancelDB()
 
-	// Is this session WeCom's at all? Asked first, and cheapest first, because
-	// task:failed fires for every run in the deployment — Slack's, Lark's,
-	// DingTalk's, the web UI's — and none of them are worth a query here.
+	// Where was this question asked? Asked BEFORE the bubble is taken, because
+	// a gate placed after the take has already sealed a WeCom round's bubble
+	// with a web run's ending. The answer path orders its own gate the same
+	// way — see the block above the gate in outbound.go's processEvent.
 	//
-	// A session this process holds a round or a note for is ours on local
-	// evidence, at no cost. Everything else has to ask the binding row, and
-	// that one lookup is the answer: engine.TaskInputIsChannelIngested cannot
-	// give it, because it reports whether the input came from A channel, not
-	// from this one — a failed Slack run passes it. The address is carried
-	// down to sayTheRunFailed so the same row is not read twice.
+	// A round on this session's open list is local proof and costs nothing:
+	// it was opened by a message this adapter ingested and named by the flush
+	// that answered it. Everything else is decided by the database, cheapest
+	// first. task:failed fires for every run in the deployment — Slack's,
+	// Lark's, DingTalk's, the web UI's — so the delivery row is read before
+	// the task row: a run with no WeCom route is another channel's and never
+	// reaches the second read (TestAnotherChannelsFailureNeverReachesTheTaskRow).
 	var bound roundAddress
-	if !m.streams.knowsSession(sessionID) {
-		found, ours := m.addressFromBinding(dbCtx, sessionID)
+	if !m.streams.has(sessionID, taskID) {
+		if taskID != "" {
+			addr, ours := m.addressForTask(dbCtx, taskID)
+			if !ours {
+				return
+			}
+			bound = addr
+		}
+		if !m.failureBelongsOnWecom(dbCtx, sessionID, taskID) {
+			return
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), streamCloseTimeout)
+	defer cancel()
+	t, _ := m.rounds().take(ctx, sessionID, byTask(taskID))
+	if t.HasBubble {
+		if m.senders == nil {
+			return
+		}
+		m.writeClosing(ctx, sessionID, t.Handle, copyFor(t.Handle.Locale).StreamFailed, "task failed")
+		return
+	}
+	// No bubble to write into: the round was never painted, or its stream has
+	// run out. The words still go to the chat that asked.
+	if !bound.known() {
+		found, ours := m.addressForTask(ctx, taskID)
 		if !ours {
 			return
 		}
 		bound = found
 	}
-
-	// A run started in the browser against this same session gets its notice
-	// there. Announcing it here would tell everyone in the room that something
-	// they never saw has gone wrong. Asked BEFORE the bubble is taken, because
-	// a gate placed after the take has already sealed a WeCom round's bubble
-	// with a web run's ending. The answer path orders its own gate the same
-	// way, ahead of sayEnding — see the block above the gate in
-	// outbound.go's processEvent.
-	if !m.failureBelongsOnWecom(dbCtx, sessionID, taskID) {
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), streamCloseTimeout)
-	defer cancel()
-	m.rounds().sayEnding(ctx, sessionID, byTask(taskID), roundOver,
-		func(t roundTurn) (roundAddress, error) {
-			if !t.HasBubble && !t.Addr.known() && bound.known() {
-				t.Addr = bound
-			}
-			return m.sayTheRunFailed(ctx, sessionID, t)
-		})
+	m.sayAsPlainMessage(ctx, sessionID, bound,
+		copyFor(localeFor(ctx, m.languages, bound.InstallationID, bound.ChatType, bound.ChatID)).StreamFailed)
 }
 
 // failureBelongsOnWecom asks where this run's input came from: the channel, or
@@ -763,7 +778,7 @@ func (m *TypingIndicatorManager) handleTaskFailed(e events.Event) {
 // asked.
 //
 // The answer has the same exposure, and outbound.go makes the same
-// engine.TaskInputIsChannelIngested call before it consumes the round. The two
+// engine.TaskInputIsChannelIngested call before it takes the round. The two
 // endings of a run are decided by one stamp.
 //
 // This is an authorization check on writing into somebody else's group chat,
@@ -774,18 +789,11 @@ func (m *TypingIndicatorManager) handleTaskFailed(e events.Event) {
 // cannot be established refuses, and says so at WARN.
 //
 // That costs nothing on the case worth protecting, because that case has local
-// evidence. A round sitting on the guard's "还在处理，完成后我再单独回复你" has
-// this run on its owed list, and a round still open has it bound; both are
-// written only by the inbound path, and both are read here before anything is
-// consumed. So a WeCom round whose promise is outstanding is delivered while
-// the database is down, and it is only the runs this process has never seen
-// that have to produce a row to be spoken for.
+// evidence: a round still open has this run bound, and the caller reads that
+// off the store before it gets here. So a WeCom round whose bubble is open is
+// closed while the database is down, and it is only the runs this process
+// holds no round for that have to produce a row to be spoken for.
 func (m *TypingIndicatorManager) failureBelongsOnWecom(ctx context.Context, sessionID pgtype.UUID, taskID string) bool {
-	// Positive proof of origin, held in memory. Asked first, so the paths
-	// below never decide the one case where silence breaks a promise.
-	if m.streams.knowsRound(sessionID, taskID) {
-		return true
-	}
 	if taskID == "" {
 		// Both task:failed publishers carry one in production — see the block
 		// comment above handleTaskFailed — so this is a payload shape nothing
@@ -827,11 +835,10 @@ func (m *TypingIndicatorManager) refuseUnknownOrigin(ctx context.Context, sessio
 // handleTaskCancelled seals the bubble of a run the user stopped.
 //
 // Cancellation is a terminal state that publishes no chat:done and no
-// task:failed, so without this the bubble spins for the full nine minutes and
-// the guard then promises a separate reply — about a run the user cancelled
-// themselves, that will never come. A session with several rounds open gets one
-// closing frame per cancelled run, each on its own bubble, because the round is
-// matched by the task id the flush bound to it.
+// task:failed, so without this the bubble spins until the server's window
+// runs out on it. A session with several rounds open gets one closing frame
+// per cancelled run, each on its own bubble, because the round is matched by
+// the task id the flush bound to it.
 //
 // This handler is only ever as complete as its publishers. It sees a cancelled
 // run when service.TaskService broadcasts task:cancelled for the row —
@@ -844,9 +851,9 @@ func (m *TypingIndicatorManager) refuseUnknownOrigin(ctx context.Context, sessio
 // and the answer is discarded without a chat:done. Archiving an agent used to
 // be exactly that path (handler.ArchiveAgent).
 //
-// Unlike a failure this does NOT go looking in the binding row when no round
-// is on file. StreamFailed is the only "that run did not go through" WeCom
-// ever produces, which is why a failure is worth chasing an address for; a
+// Unlike a failure this does NOT go looking for an address when no bubble is
+// on file. StreamFailed is the only "that run did not go through" WeCom ever
+// produces, which is why a failure is worth chasing an address for; a
 // cancellation was performed by the user, and chasing it would turn one
 // "cancel all tasks" click into a message in every chat that agent serves —
 // including sessions where WeCom never showed a bubble at all.
@@ -869,25 +876,11 @@ func (m *TypingIndicatorManager) handleTaskCancelled(e events.Event) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), streamCloseTimeout)
 	defer cancel()
-	m.rounds().sayEnding(ctx, sessionID, byTask(taskIDFromEvent(e)), roundOver,
-		func(t roundTurn) (roundAddress, error) {
-			if m.senders == nil {
-				return roundAddress{}, errNothingToSay
-			}
-			if t.HasBubble {
-				return t.Handle.address(), m.writeClosing(ctx, sessionID, t.Handle, copyFor(t.Handle.Locale).StreamCancelled, "task cancelled")
-			}
-			// No bubble left. If the guard already closed one for this run it
-			// promised a separate reply, and that promise is now void — say so,
-			// in the chat the promise was made in. Only for THIS round's own
-			// promise: a session can hold several, the copy differs per
-			// outcome, and announcing a cancel against another round's promise
-			// would tell its asker "已取消" about a run nobody stopped.
-			if !t.Promised || !t.Addr.known() {
-				return roundAddress{}, errNothingToSay
-			}
-			return t.Addr, m.sayAsPlainMessage(ctx, sessionID, t.Addr, m.copyForAddress(ctx, t.Addr).StreamCancelled)
-		})
+	t, _ := m.rounds().take(ctx, sessionID, byTask(taskIDFromEvent(e)))
+	if !t.HasBubble || m.senders == nil {
+		return
+	}
+	m.writeClosing(ctx, sessionID, t.Handle, copyFor(t.Handle.Locale).StreamCancelled, "task cancelled")
 }
 
 // rounds builds the matcher that turns a task id on an event into the round it
@@ -907,47 +900,10 @@ func retryPending(e events.Event) bool {
 	return pending
 }
 
-// sayTheRunFailed delivers a failed run's ending wherever the round can still
-// be reached, in the order of how much each address is trusted.
-//
-// The bubble first, while the round still has one. Then the note the handle
-// left behind, which is the chat the question came from and what the guard's
-// promise was made in — the binding row may no longer point at it. Failing both
-// — a restart mid-run, a turn whose opening frame the server refused — the
-// binding row is the only address there is.
-//
-// A round the store says is accounted for never reaches here at all: the ledger
-// answers roundToldAlready and runs no delivery. That is the whole of the
-// not-twice rule, and it is per run, so a task:failed arriving behind this run's
-// own delivered answer stays quiet while a second run's failure is still told.
-func (m *TypingIndicatorManager) sayTheRunFailed(ctx context.Context, sessionID pgtype.UUID, t roundTurn) (roundAddress, error) {
-	if m.senders == nil {
-		return roundAddress{}, errNothingToSay
-	}
-	if t.HasBubble {
-		return t.Handle.address(),
-			m.writeClosing(ctx, sessionID, t.Handle, copyFor(t.Handle.Locale).StreamFailed, "task failed")
-	}
-	addr := t.Addr
-	if !addr.known() {
-		found, ok := m.addressFromBinding(ctx, sessionID)
-		if !ok {
-			return roundAddress{}, errNothingToSay
-		}
-		addr = found
-	}
-	return addr, m.sayAsPlainMessage(ctx, sessionID, addr, m.copyForAddress(ctx, addr).StreamFailed)
-}
-
-// copyForAddress picks the pack for a round whose handle is gone: the words
-// are going to a chat rather than to a reader anybody still holds, and in a
-// 1:1 that chatid IS the reader's userid, which is what localeFor wants. A
-// room ignores it and reads the deployment's language (language.go).
-func (m *TypingIndicatorManager) copyForAddress(ctx context.Context, addr roundAddress) copyPack {
-	return copyFor(localeFor(ctx, m.languages, addr.InstallationID, addr.ChatType, addr.ChatID))
-}
-
 func (m *TypingIndicatorManager) sayAsPlainMessage(ctx context.Context, sessionID pgtype.UUID, addr roundAddress, text string) error {
+	if m.senders == nil {
+		return errNoLiveConnection
+	}
 	err := m.senders.sendTextCtx(ctx, addr.InstallationID, addr.ChatID, addr.ChatType, text)
 	if err != nil {
 		m.log.WarnContext(ctx, "wecom typing: could not deliver a run's ending",
@@ -957,47 +913,30 @@ func (m *TypingIndicatorManager) sayAsPlainMessage(ctx context.Context, sessionI
 	return err
 }
 
-// addressFromBinding reads the chat a session belongs to off the binding row —
-// the same two queries outbound.go makes when an answer has no bubble to land
-// in. A session with no wecom binding is not ours to speak in: this subscriber
-// sees every failed run on a shared bus, including Slack's and the web UI's.
-// That makes it the ownership test as much as the address, which is why
+// addressForTask reads the chat a run was asked in off its delivery row — the
+// same read outbound.go makes when an answer has no bubble to land in. A run
+// with no WeCom delivery row is not ours to speak for: this subscriber sees
+// every failed run on a shared bus, including Slack's and the web UI's. That
+// makes it the ownership test as much as the address, which is why
 // handleTaskFailed asks it before spending anything on the task row.
-func (m *TypingIndicatorManager) addressFromBinding(ctx context.Context, sessionID pgtype.UUID) (roundAddress, bool) {
-	if m.bindings == nil {
+func (m *TypingIndicatorManager) addressForTask(ctx context.Context, taskID string) (roundAddress, bool) {
+	if m.deliveries == nil {
 		return roundAddress{}, false
 	}
-	binding, err := m.bindings.GetChannelChatSessionBindingBySession(ctx, db.GetChannelChatSessionBindingBySessionParams{
-		ChatSessionID: sessionID,
-		ChannelType:   channelTypeWecom,
-	})
+	id, err := util.ParseUUID(taskID)
+	if err != nil || !id.Valid {
+		return roundAddress{}, false
+	}
+	addr, skip, err := taskAddress(ctx, m.deliveries, id)
 	if err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
-			m.log.WarnContext(ctx, "wecom typing: cannot find the chat a failed run belongs to",
-				"chat_session_id", util.UUIDToString(sessionID), "error", err)
-		}
+		m.log.WarnContext(ctx, "wecom typing: cannot find the chat a failed run belongs to",
+			"task_id", taskID, "error", err)
 		return roundAddress{}, false
 	}
-	// The installation row answers whether the bot is still installed. The
-	// binding row outlives a revoke, so a session keeps looking reachable
-	// after the bot has been removed.
-	inst, err := m.bindings.GetChannelInstallation(ctx, db.GetChannelInstallationParams{
-		ID:          binding.InstallationID,
-		ChannelType: channelTypeWecom,
-	})
-	if err != nil {
-		m.log.WarnContext(ctx, "wecom typing: cannot load the installation a failed run belongs to",
-			"installation_id", util.UUIDToString(binding.InstallationID), "error", err)
+	if skip != "" {
 		return roundAddress{}, false
 	}
-	if inst.Status != string(InstallationActive) {
-		return roundAddress{}, false
-	}
-	return roundAddress{
-		InstallationID: binding.InstallationID,
-		ChatID:         binding.ChannelChatID,
-		ChatType:       aibotChatTypeFromChannel(channel.ChatType(binding.ChatType)),
-	}, true
+	return addr, true
 }
 
 // sessionFor finds the chat session behind a task lifecycle event.
@@ -1044,15 +983,14 @@ func (m *TypingIndicatorManager) sessionFor(e events.Event) (pgtype.UUID, bool) 
 //
 // A pool too slow to answer inside it costs a failure notice for a run this
 // process holds no record of. The case worth protecting does not depend on it:
-// a round with an open bubble or an outstanding promise is proved ours from
-// memory and never reaches these queries — see failureBelongsOnWecom.
+// a round with an open bubble is proved ours from memory and never reaches
+// these queries — see handleTaskFailed.
 const taskLookupTimeout = 800 * time.Millisecond
 
 // taskIDFromEvent prefers the envelope's routing hint and falls back to the
 // payload. ChatDonePayload matters most: broadcastChatDone sets no TaskID on
 // the envelope, and on the in-process bus the payload stays typed — miss it
-// and every answer takes the HEAD round unconditionally, which is the wrong
-// bubble whenever a guard has already closed the running round's.
+// and no answer ever finds its round.
 func taskIDFromEvent(e events.Event) string {
 	if e.TaskID != "" {
 		return e.TaskID
@@ -1071,17 +1009,13 @@ func taskIDFromEvent(e events.Event) string {
 	return ""
 }
 
-// armGuard schedules the close that happens when nothing else does. WeCom
+// armGuard schedules the rotation that keeps a long run's bubble alive. WeCom
 // stops accepting frames for a stream past streamMaxAge, so a bubble that
-// outlives the window — a long run, or a round stuck in the queue behind one —
-// would otherwise become a spinner we can no longer touch. The guard closes
+// outlives the window — a long run, or a round stuck in the queue behind one
+// — would otherwise become a spinner we can no longer touch. The guard acts on
 // exactly the round it was armed for, by batch: with several bubbles open in
 // one session, a timer that took the head could seal a newer round's bubble
-// with an older round's promise.
-//
-// This is the one closer that does not end the round. Its copy says the reply
-// is coming separately, and the run is still going — so the handle it consumes
-// leaves a note behind, and whatever the run does next is said against that.
+// with an older round's words.
 func (m *TypingIndicatorManager) armGuard(sessionID pgtype.UUID, batch engine.RunBatchID) {
 	if m.guardAfter <= 0 {
 		return
@@ -1098,70 +1032,108 @@ func (m *TypingIndicatorManager) armGuard(sessionID pgtype.UUID, batch engine.Ru
 // behaviour has one definition and a test can run it without waiting out the
 // nine minutes.
 //
-// The promise is filed by the ledger, not here, and either way the run comes
-// out of this owed an ending. Words that landed put "还在处理，完成后我再单独
-// 回复你" on the screen and the promise is that sentence. Words that did not —
-// frame refused, fallback unsendable — still cost the round its bubble, which
-// the ledger consumed under the lock that found it, so the user is left
-// watching a spinner nothing can seal; I3 records that as owed too. The
-// difference is only in what the user has already been told, and the run's real
-// ending is said in the chat this round was speaking in either way, off the
-// note rather than the binding row.
+// It ROTATES the round rather than ending it. The stream's ten-minute window
+// belongs to the stream, not to the req_id that carried it (streamMaxAge):
+// sealing this stream and opening a fresh one on the same req_id puts a second,
+// live bubble right under the first, and the run carries on into that one — a
+// run of any length keeps a bubble on screen, with nothing promised and
+// nothing owed. Sequential on purpose: the seal is written and acked before
+// the opener goes out, because two frames of one req_id in flight are answered
+// in whatever order the server likes (ws_sender.go).
+//
+// The store swaps the handle before either frame is written, so an answer that
+// arrives mid-rotation is addressed to the new stream — see streamStore.rotate
+// for why that order is the safe one.
+//
+// A verdict from the server on either frame ends the rotating: the round is
+// marked unusable and its answer goes out as a plain message. A round that was
+// never painted has nothing to seal and is left alone; the window bounds it.
 func (m *TypingIndicatorManager) fireGuard(ctx context.Context, sessionID pgtype.UUID, batch engine.RunBatchID) {
-	m.streams.sayEnding(sessionID, byBatch(batch), roundContinues, nil,
-		func(t roundTurn) (roundAddress, error) {
-			if !t.HasBubble {
-				return roundAddress{}, errNothingToSay
-			}
-			return t.Handle.address(), m.writeClosing(ctx, sessionID, t.Handle, copyFor(t.Handle.Locale).StreamStillWorking, "window expiring")
-		})
+	if m.senders == nil || m.streams == nil {
+		return
+	}
+	old, next, ok := m.streams.rotate(sessionID, batch, newStreamID())
+	if !ok {
+		return
+	}
+	if err := m.streams.seal(ctx, m.senders, old, copyFor(old.Locale).StreamContinued); err != nil {
+		switch {
+		case streamUnusable(err):
+			m.streams.markUnusable(sessionID, next.StreamID)
+			m.log.WarnContext(ctx, "wecom typing: the server refused the hand-over frame, answering as a new message",
+				"chat_session_id", util.UUIDToString(sessionID), "error", err)
+			return
+		case errors.Is(err, errNoLiveConnection), errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			// Nothing can be written right now. The round keeps the new
+			// stream id it was just given: a closing frame on a stream the
+			// server never saw opened still creates the message, so the
+			// answer lands either way, and the old bubble runs out on its
+			// own window.
+			m.log.DebugContext(ctx, "wecom typing: hand-over frame not written, leaving the round",
+				"chat_session_id", util.UUIDToString(sessionID), "error", err)
+			return
+		default:
+			// An ack that never came after every retry, or a transport error
+			// past the write: the old bubble may or may not be sealed, and
+			// either way the run goes on in the new one.
+			m.log.WarnContext(ctx, "wecom typing: hand-over frame unconfirmed, opening the next bubble anyway",
+				"chat_session_id", util.UUIDToString(sessionID), "error", err)
+		}
+	}
+	if err := m.senders.stream(ctx, next, streamThinkingPlaceholder, false); err != nil {
+		switch {
+		case errors.Is(err, errStreamAckTimeout):
+			// Same reading as OnIngested: the frame may have landed, and the
+			// closing frame creates the message if it did not.
+			m.log.DebugContext(ctx, "wecom typing: next bubble's opening frame did not land, keeping the handle",
+				"chat_session_id", util.UUIDToString(sessionID), "error", err)
+		case errors.Is(err, errStreamBusy), errors.Is(err, errStreamSuperseded):
+			// The answer got there first and sealed the new stream itself.
+			// Nothing left to open.
+			return
+		case errors.Is(err, errNoLiveConnection):
+			m.log.DebugContext(ctx, "wecom typing: no connection for the next bubble's opening frame",
+				"chat_session_id", util.UUIDToString(sessionID), "error", err)
+		default:
+			m.streams.markUnusable(sessionID, next.StreamID)
+			m.log.WarnContext(ctx, "wecom typing: the server refused the next bubble, answering as a new message",
+				"chat_session_id", util.UUIDToString(sessionID), "error", err)
+			return
+		}
+	}
+	m.armGuard(sessionID, batch)
 }
 
-// writeClosing seals one bubble with text and reports whether the words reached
-// a sender. Which bubble was decided by the ledger, which consumed the handle
-// under its own lock — that is what makes two closers racing produce one
-// closing frame.
+// writeClosing seals one bubble with text. Which bubble was decided by the
+// store, which removed the round under its own lock — that is what makes two
+// closers racing produce one closing frame.
 //
 // A closing frame that cannot go out falls back to a plain message, the same
 // way the answer does in outbound.go. The words matter more here than there:
-// StreamFailed is the only "that run did not go through" WeCom ever
-// produces, so a frame lost to a reconnect window would otherwise leave the
-// user with a spinner and no explanation that would ever arrive. The addressing
-// comes off the handle, captured at ingest, because by now the binding row may
-// point at a different chat.
+// StreamFailed is the only "that run did not go through" WeCom ever produces,
+// so a frame refused for good would otherwise leave the user with a spinner
+// and no explanation that would ever arrive. The addressing comes off the
+// handle, captured at ingest, because by now the binding row may point at a
+// different chat.
 //
-// Both routes failing is what the returned error is for, and WHICH of the two
-// failures it carries is what the ledger reads. A pair that provably put
-// nothing on the wire leaves this run's ending owed, so the next publisher of
-// it — a sweeper tick, WeCom's own redelivery — says it instead of finding it
-// filed as already said. A pair in which either attempt's outcome is unknown
-// reports that unknown instead, and the run is spoken for (I4, stream_store.go).
-func (m *TypingIndicatorManager) writeClosing(ctx context.Context, sessionID pgtype.UUID, h streamHandle, text, why string) error {
-	err := m.senders.stream(ctx, h, text, true)
-	if err == nil {
-		return nil
+// A handle the server has already disowned is not written to again: the frame
+// would be one more refusal charged against the whole bot's rate limit, and
+// the reader has already been told the rest of this round arrives as new
+// messages (recordStep). The plain message is the whole of it.
+func (m *TypingIndicatorManager) writeClosing(ctx context.Context, sessionID pgtype.UUID, h streamHandle, text, why string) {
+	if !h.Unusable {
+		err := m.streams.seal(ctx, m.senders, h, text)
+		if err == nil {
+			return
+		}
+		m.log.WarnContext(ctx, "wecom typing: closing frame failed, saying it as a new message",
+			"chat_session_id", util.UUIDToString(sessionID),
+			"reason", why, "unusable", streamUnusable(err), "error", err)
 	}
-	m.log.WarnContext(ctx, "wecom typing: closing frame failed, saying it as a new message",
-		"chat_session_id", util.UUIDToString(sessionID),
-		"reason", why, "unusable", streamUnusable(err), "error", err)
-	sendErr := m.senders.sendTextCtx(ctx, h.InstallationID, h.ChatID, h.ChatType, text)
-	if sendErr == nil {
-		return nil
+	if err := m.senders.sendTextCtx(ctx, h.InstallationID, h.ChatID, h.ChatType, text); err != nil {
+		m.log.WarnContext(ctx, "wecom typing: the fallback message was unsendable too",
+			"chat_session_id", util.UUIDToString(sessionID), "reason", why, "error", err)
 	}
-	m.log.WarnContext(ctx, "wecom typing: the fallback message was unsendable too",
-		"chat_session_id", util.UUIDToString(sessionID), "reason", why, "error", sendErr)
-	if unconfirmedReason(sendErr) == "" && unconfirmedReason(err) != "" {
-		// Both routes failed and only the SECOND failure is definite — the
-		// registry lost its sender between the two, say, so the plain message
-		// never reached a socket. The closing frame did: it was written and
-		// nothing came back, so it may have sealed the bubble with these very
-		// words. Returning the definite error would tell the ledger nothing was
-		// said and put the run back on owed (I4, stream_store.go), and the next
-		// publisher would say the same thing underneath a bubble that already
-		// says it. The unknown is the honest account of the pair.
-		return err
-	}
-	return sendErr
 }
 
 // sessionIDFromEvent recovers the chat session from a task lifecycle event.

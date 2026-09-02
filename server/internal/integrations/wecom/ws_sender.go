@@ -249,7 +249,12 @@ type ackResult struct {
 // a silence.
 //
 // sealed is the other half: a finished stream is immutable, so a frame that
-// lost the race to the answer must never reach the wire behind it.
+// lost the race to the answer must never reach the wire behind it. It is kept
+// PER STREAM ID, not per req_id, because one req_id carries more than one
+// stream over a long run: the guard seals the stream that is about to expire
+// and opens a fresh one on the same req_id (streamStore.rotate), and the
+// refreshes that follow are addressed to the new stream. A seal keyed by
+// req_id would refuse every one of them as a straggler of the old one.
 //
 // acked counts verdicts that arrived and only those. Nothing ever advances it
 // on a caller's behalf — see cancelAck for why a write-off is worse than a
@@ -257,8 +262,22 @@ type ackResult struct {
 type streamAcks struct {
 	sent   uint64
 	acked  uint64
-	sealed bool
+	sealed map[string]struct{}
 	at     time.Time
+}
+
+// isSealed reports whether a closing frame has gone out on this stream.
+func (st *streamAcks) isSealed(streamID string) bool {
+	_, ok := st.sealed[streamID]
+	return ok
+}
+
+// seal records that a closing frame has gone out on this stream.
+func (st *streamAcks) seal(streamID string) {
+	if st.sealed == nil {
+		st.sealed = make(map[string]struct{})
+	}
+	st.sealed[streamID] = struct{}{}
 }
 
 // streamAcksMax bounds the per-turn bookkeeping on a long-lived connection,
@@ -401,7 +420,7 @@ func (s *wsSender) cancelAck(reqID string, w *ackWaiter) {
 // the refusal airtight: the seal and the write it fences are decided inside the
 // same critical section, so a later frame can never slip between the two and
 // land on top of the answer.
-func (s *wsSender) beginStreamFrameLocked(reqID string, w *ackWaiter, finish bool) bool {
+func (s *wsSender) beginStreamFrameLocked(reqID, streamID string, w *ackWaiter, finish bool) bool {
 	s.ackMu.Lock()
 	defer s.ackMu.Unlock()
 	st, ok := s.streams[reqID]
@@ -410,12 +429,12 @@ func (s *wsSender) beginStreamFrameLocked(reqID string, w *ackWaiter, finish boo
 		st = &streamAcks{at: time.Now()}
 		s.streams[reqID] = st
 	}
-	if st.sealed && !finish {
+	if st.isSealed(streamID) && !finish {
 		return false
 	}
 	st.sent++
 	if finish {
-		st.sealed = true
+		st.seal(streamID)
 	}
 	if w != nil {
 		w.seq = st.sent
@@ -446,7 +465,7 @@ func (s *wsSender) pruneStreamsLocked() {
 	}
 	now := time.Now()
 	for k, st := range s.streams {
-		if st.sealed && now.Sub(st.at) > streamMaxAge {
+		if len(st.sealed) > 0 && now.Sub(st.at) > streamMaxAge {
 			delete(s.streams, k)
 		}
 	}
@@ -590,7 +609,7 @@ func (s *wsSender) respondStream(ctx context.Context, reqID, streamID, content s
 	if err != nil {
 		return err
 	}
-	if err := s.writeStreamFrame(ctx, reqID, w, finish, map[string]any{
+	if err := s.writeStreamFrame(ctx, reqID, streamID, w, finish, map[string]any{
 		"cmd":     cmdRespondMsg,
 		"headers": frameHeaders{ReqID: reqID},
 		"body":    body,
@@ -649,7 +668,7 @@ func (s *wsSender) write(frame map[string]any) error {
 //
 // Unlike write() this one honours a deadline, at both places a write can stall:
 // waiting for the writer and waiting for the socket.
-func (s *wsSender) writeStreamFrame(ctx context.Context, reqID string, w *ackWaiter, finish bool, frame map[string]any) error {
+func (s *wsSender) writeStreamFrame(ctx context.Context, reqID, streamID string, w *ackWaiter, finish bool, frame map[string]any) error {
 	payload, err := json.Marshal(frame)
 	if err != nil {
 		return fmt.Errorf("wecom: marshal frame: %w", err)
@@ -659,7 +678,7 @@ func (s *wsSender) writeStreamFrame(ctx context.Context, reqID string, w *ackWai
 		return err
 	}
 	defer s.unlockWriter()
-	if !s.beginStreamFrameLocked(reqID, w, finish) {
+	if !s.beginStreamFrameLocked(reqID, streamID, w, finish) {
 		return errStreamSuperseded
 	}
 	if err := s.writeLocked(ctx, payload, t); err != nil {

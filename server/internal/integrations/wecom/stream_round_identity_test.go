@@ -29,8 +29,7 @@ import (
 // (they arrive a full window apart) — the opposite of what the batcher
 // decided, and both mistakes are user-visible: a merged pair loses the second
 // question's receipt entirely, and a split pair leaves a bubble no run will
-// ever close, which the guard later turns into a promise of a reply that has
-// already been sent.
+// ever close.
 func TestTheBubbleCountFollowsTheBatcherNotTheClock(t *testing.T) {
 	t.Parallel()
 	rig := newBubbleRig(t)
@@ -50,7 +49,7 @@ func TestTheBubbleCountFollowsTheBatcherNotTheClock(t *testing.T) {
 	rig.ask(t, "REQ-4", 3)
 	if got := rig.streams.depth(); got != 3 {
 		t.Fatalf("two messages the batcher folded into one run opened %d bubbles in total, want 3 — "+
-			"one run cannot close two bubbles, and the spare spins until the guard promises a reply that has already been sent", got)
+			"one run cannot close two bubbles, and the spare spins until its window runs out", got)
 	}
 }
 
@@ -220,10 +219,8 @@ func TestTheRetryLookupIsNotPaidForOnEveryAnswer(t *testing.T) {
 // TestACancelledRunClosesItsBubble.
 //
 // Cancellation publishes task:cancelled and nothing else: no chat:done, no
-// task:failed. Subscribing only to failure leaves the bubble spinning for the
-// full nine minutes, after which the guard tells the user "还在处理，完成后我再
-// 单独回复你" — a promise of a separate reply, about a run they cancelled
-// themselves, that will never come.
+// task:failed. Subscribing only to failure leaves the bubble spinning until
+// the server's window runs out on it — for a run the user stopped themselves.
 func TestACancelledRunClosesItsBubble(t *testing.T) {
 	t.Parallel()
 	rig := newBubbleRig(t)
@@ -233,7 +230,7 @@ func TestACancelledRunClosesItsBubble(t *testing.T) {
 
 	frames := rig.conn.streamFrames(t)
 	if len(frames) != 2 {
-		t.Fatalf("a cancelled run wrote %d stream frames, want 2 — the bubble spins until the guard promises a reply that will never come", len(frames))
+		t.Fatalf("a cancelled run wrote %d stream frames, want 2 — the bubble spins until its window runs out", len(frames))
 	}
 	if frames[1]["finish"] != true {
 		t.Fatal("the cancellation did not seal the bubble")
@@ -297,30 +294,6 @@ func TestCancellingEveryQueuedTurnClosesEachOwnBubble(t *testing.T) {
 	}
 }
 
-// TestCancellingAfterTheGuardKeepsThePromise. Once the guard has closed a
-// bubble it has promised a separate reply, and that promise outlives the
-// bubble. Cancelling the run makes the promise void, and the only way to say
-// so is a plain message to the chat the promise was made in.
-func TestCancellingAfterTheGuardKeepsThePromise(t *testing.T) {
-	t.Parallel()
-	rig := newBubbleRig(t)
-	rig.ran(t, "REQ-G1", 1, "task-1")
-
-	// The guard closes the bubble at nine minutes; the run carries on.
-	rig.guardClosed(t, 1)
-
-	rig.cancelled(t, "task-1")
-
-	pushes := rig.conn.pushes(t)
-	if len(pushes) != 1 {
-		t.Fatalf("a cancel after the guard sent %d plain messages, want 1 — the guard promised a separate reply and nothing ever came", len(pushes))
-	}
-	md, _ := pushes[0]["markdown"].(map[string]any)
-	if md == nil || md["content"] != copyFor(DefaultLocale).StreamCancelled {
-		t.Fatalf("the promised reply did not say it was cancelled: %v", pushes[0])
-	}
-}
-
 // TestACancelledRunThisProcessNeverSawStaysSilent is the deliberate limit on
 // the above. A bulk "cancel all tasks" sweeps every session an agent serves;
 // chasing an address through the binding row for rounds this process holds
@@ -342,193 +315,14 @@ func TestACancelledRunThisProcessNeverSawStaysSilent(t *testing.T) {
 	}
 }
 
-// ---- the guard, now that a round always knows its run ----
+// ---- an empty answer with no bubble ----
 
-// TestAGuardClosedRoundsFailureIsStillReported. The guard consumes the handle
-// at nine minutes, so a run that fails after that finds no bubble. The note it
-// left is what turns the promise into a delivered message, and it is matched
-// by the run's own id — a promise left by a DIFFERENT round must not be spent
-// on this one.
-func TestAGuardClosedRoundsFailureIsStillReported(t *testing.T) {
-	t.Parallel()
-	rig := newBubbleRig(t)
-	rig.ran(t, "REQ-P1", 1, "task-1")
-	rig.ran(t, "REQ-P2", 2, "task-2")
-
-	// Both bubbles run into the window and are guard-closed mid-run.
-	rig.guardClosed(t, 1)
-	rig.guardClosed(t, 2)
-
-	// The first round's run answers — the separate reply its guard promised.
-	rig.answer(t, "the first answer", "task-1")
-	// The second round's run then fails. Its own promise is still outstanding.
-	rig.failed(t, "task-2", false)
-
-	pushes := rig.conn.pushes(t)
-	if len(pushes) != 2 {
-		t.Fatalf("got %d plain messages, want 2 (the first round's answer, then the second round's failure) — "+
-			"the second asker was promised a reply and heard nothing", len(pushes))
-	}
-	md, _ := pushes[1]["markdown"].(map[string]any)
-	if md == nil || md["content"] != copyFor(DefaultLocale).StreamFailed {
-		t.Fatalf("the second round's failure did not reach its asker: %v", pushes[1])
-	}
-	// The same failure once more — the sweeper repeat the block comment above
-	// sayTheRunFailed anticipates. The promise it spent was its own, so there
-	// is nothing left in this session for it to take a second time.
-	rig.failed(t, "task-2", false)
-	if got := len(rig.conn.pushes(t)); got != 2 {
-		t.Fatalf("a republished failure brought the total to %d plain messages, want 2 — "+
-			"the second notice took a promise this run had already settled and told the user twice about one failed run", got)
-	}
-}
-
-// TestARepeatedFailureDoesNotSpendAnotherRoundsPromise isolates the claim.
-//
-// Every guard-closed round in a session leaves a promise of its own, so a
-// claim that takes the head of the list finds something to take every time —
-// which means the second publisher of one run's failure speaks too. The user
-// reads "⚠️ 这次没跑通" twice, and the promise the second notice consumed
-// belonged to a round that is still running and can no longer be told anything.
-func TestARepeatedFailureDoesNotSpendAnotherRoundsPromise(t *testing.T) {
-	t.Parallel()
-	rig := newBubbleRig(t)
-	rig.ran(t, "REQ-F1", 1, "task-1")
-	rig.ran(t, "REQ-F2", 2, "task-2")
-	// Both runs outlive the stream window, so both bubbles close on a promise.
-	rig.guardClosed(t, 1)
-	rig.guardClosed(t, 2)
-
-	// The second round's run fails, and a sweeper tick republishes it.
-	rig.failed(t, "task-2", false)
-	rig.failed(t, "task-2", false)
-
-	pushes := rig.conn.pushes(t)
-	if len(pushes) != 1 {
-		t.Fatalf("one run's failure was announced %d times, want 1 — the repeat spent the promise made to the OTHER "+
-			"question, whose run is still going", len(pushes))
-	}
-	if md, _ := pushes[0]["markdown"].(map[string]any); md == nil || md["content"] != copyFor(DefaultLocale).StreamFailed {
-		t.Fatalf("the failure notice did not carry the failure copy: %v", pushes[0])
-	}
-
-	// And the round that was never told anything still gets its own reply.
-	rig.answer(t, "the first answer", "task-1")
-	pushes = rig.conn.pushes(t)
-	if len(pushes) != 2 {
-		t.Fatalf("got %d plain messages in total, want 2 (one failure, then the first round's answer)", len(pushes))
-	}
-	if md, _ := pushes[1]["markdown"].(map[string]any); md == nil || md["content"] != "the first answer" {
-		t.Fatalf("the first round's own answer never reached its asker: %v", pushes[1])
-	}
-}
-
-// TestACancelSpendsTheCancelledRoundsPromiseNotTheRunningOnes is the same
-// mismatch on the cancel path, where it costs more than a duplicate: the copy
-// differs per outcome. Two rounds are past the window and each is owed a
-// reply. The user stops the second one. Taking the head tells the FIRST
-// round's asker "⏹️ 这次处理已取消" about a run nobody stopped, and leaves the
-// promise of the round they did stop on the list — for the first round's own
-// late failure to spend, underneath the answer that round has already given.
-func TestACancelSpendsTheCancelledRoundsPromiseNotTheRunningOnes(t *testing.T) {
-	t.Parallel()
-	rig := newBubbleRig(t)
-	rig.ran(t, "REQ-C1", 1, "task-1")
-	rig.ran(t, "REQ-C2", 2, "task-2")
-	rig.guardClosed(t, 1)
-	rig.guardClosed(t, 2)
-
-	rig.cancelled(t, "task-2")
-	// The first round was never cancelled. Its run finishes and answers, which
-	// is the separate reply its own guard promised.
-	rig.answer(t, "the first answer", "task-1")
-	// A sweeper republishing the first run's earlier failure, late.
-	rig.failed(t, "task-1", false)
-
-	pushes := rig.conn.pushes(t)
-	if len(pushes) != 2 {
-		t.Fatalf("got %d plain messages, want 2 (the cancellation, then the first round's answer) — "+
-			"a promise was left unspent for the late failure to claim, so the user read a failure notice under a delivered answer", len(pushes))
-	}
-	first, _ := pushes[0]["markdown"].(map[string]any)
-	if first == nil || first["content"] != copyFor(DefaultLocale).StreamCancelled {
-		t.Fatalf("the first message was not the cancellation: %v", pushes[0])
-	}
-	second, _ := pushes[1]["markdown"].(map[string]any)
-	if second == nil || second["content"] != "the first answer" {
-		t.Fatalf("the still-running round's answer did not reach its asker: %v", pushes[1])
-	}
-}
-
-// TestAnAnsweredGuardClosedRoundIsNoLongerOwedAReply is the other half: the
-// answer path has to settle its own round's promise.
-//
-// Once the guard has taken the bubble the answer cannot land in it, so it goes
-// out as an ordinary message — and that message IS the separate reply the
-// guard promised. Nothing on that path said so, so the promise stayed on file
-// for good, and the next repeat of this run's own failure claimed it: "⚠️ 这次
-// 没跑通" printed underneath the answer the user has just read.
-func TestAnAnsweredGuardClosedRoundIsNoLongerOwedAReply(t *testing.T) {
-	t.Parallel()
-	rig := newBubbleRig(t)
-	rig.ran(t, "REQ-A1", 1, "task-1")
-	rig.guardClosed(t, 1)
-
-	rig.answer(t, "the answer that took nine minutes", "task-1")
-	// The sweeper repeat sayTheRunFailed's own comment anticipates.
-	rig.failed(t, "task-1", false)
-
-	pushes := rig.conn.pushes(t)
-	if len(pushes) != 1 {
-		t.Fatalf("a guard-closed round that answered produced %d plain messages, want 1 — "+
-			"its promise was never settled, so the run's failure notice contradicted the answer above it", len(pushes))
-	}
-	if md, _ := pushes[0]["markdown"].(map[string]any); md == nil || md["content"] != "the answer that took nine minutes" {
-		t.Fatalf("the promised separate reply did not carry the answer: %v", pushes[0])
-	}
-}
-
-// TestAnEmptyAnswerAfterTheGuardStillKeepsThePromise. An empty completion is a
-// legitimate outcome — the agent had nothing to add — and inside a bubble it
-// already ends in words, because a blank closing frame is discarded and the
-// spinner stays. After the guard there is no bubble but there is a promise,
-// and returning without a word breaks it in a way the user cannot recover
-// from: they were told a reply was coming separately, and nothing ever
-// arrives. The promise also stays on the list, for the next repeat of this
-// run's failure to spend under the silence.
-func TestAnEmptyAnswerAfterTheGuardStillKeepsThePromise(t *testing.T) {
-	t.Parallel()
-	rig := newBoundRoomRig(t)
-	rig.askedInTheRoom(t, "task-1")
-	rig.ran(t, "REQ-E1", 1, "task-1")
-	rig.guardClosed(t, 1) // "还在处理，完成后我再单独回复你"
-
-	rig.answer(t, "   \n ", "task-1")
-
-	pushes := rig.conn.pushes(t)
-	if len(pushes) != 1 {
-		t.Fatalf("a run that finished with nothing to say sent %d plain messages, want 1 — "+
-			"the asker was promised a separate reply and received nothing at all", len(pushes))
-	}
-	md, _ := pushes[0]["markdown"].(map[string]any)
-	if md == nil || md["content"] != streamCopyNoReply {
-		t.Fatalf("the promised reply said %v, want %q", pushes[0], streamCopyNoReply)
-	}
-	// And the promise is spent by it, so the sweeper repeat of this run's own
-	// failure does not claim it and print "这次没跑通" underneath.
-	rig.failed(t, "task-1", false)
-	if got := len(rig.conn.pushes(t)); got != 1 {
-		t.Fatalf("a republished failure brought the total to %d plain messages, want 1 — "+
-			"the promise the empty answer kept was left on the list for it to spend again", got)
-	}
-}
-
-// The limit on the above. streamCopyNoReply goes out because a promise names
-// this round; a run that ended properly is owed nothing, and an empty
-// completion for it is what it looks like — nothing to send. Without the
-// claim, every empty chat:done on a bound session would put a line in the room,
-// including the ones a browser produced.
-func TestAnEmptyAnswerWithNothingOwedSaysNothing(t *testing.T) {
+// An empty completion for a round with no bubble is what it looks like —
+// nothing to send. Inside a bubble the copy stands in for the silence, because
+// a spinner has to end in words; with no bubble there is nothing waiting on
+// them, and a line in the room would be noise for every empty chat:done on a
+// bound session, including the ones a browser produced.
+func TestAnEmptyAnswerWithNoBubbleSaysNothing(t *testing.T) {
 	t.Parallel()
 	rig := newBoundRoomRig(t)
 	rig.askedInTheRoom(t, "task-1")
@@ -536,53 +330,10 @@ func TestAnEmptyAnswerWithNothingOwedSaysNothing(t *testing.T) {
 	rig.answer(t, "", "task-1")
 
 	if pushes := rig.conn.pushes(t); len(pushes) != 0 {
-		t.Fatalf("an empty answer for a round owed nothing sent %d plain message(s) into the room", len(pushes))
+		t.Fatalf("an empty answer for a round with no bubble sent %d plain message(s) into the room", len(pushes))
 	}
 	if frames := rig.conn.streamFrames(t); len(frames) != 0 {
 		t.Fatalf("an empty answer for a round with no bubble wrote %d stream frames", len(frames))
-	}
-}
-
-// TestASecondRunsFailureIsNotSilencedByTheFirstsNote.
-//
-// The not-twice rule is per RUN, and the note a session keeps is one note. A
-// dedup that reads "this session has a note" as "this run has been told"
-// answers correctly for the run that filed it and wrongly for every other run
-// in the session: the second asker is dropped by bookkeeping left behind by a
-// run they have nothing to do with.
-//
-// Both halves are asserted in one sequence, because either one alone is
-// satisfiable by deleting the other: A twice is the dedup that has to stay,
-// and B after it is the notice that has to still arrive.
-func TestASecondRunsFailureIsNotSilencedByTheFirstsNote(t *testing.T) {
-	t.Parallel()
-	rig := newBoundRoomRig(t)
-	rig.askedInTheRoom(t, "task-1")
-	rig.askedInTheRoom(t, "task-2")
-
-	// No bubbles anywhere — this process restarted mid-run, so both notices
-	// have to find their chat in the binding row.
-	rig.failed(t, "task-1", false)
-	if got := pushedTexts(t, rig.conn); len(got) != 1 || got[0] != streamCopyFailed {
-		t.Fatalf("the first run's asker read %q, want [%q]", got, streamCopyFailed)
-	}
-
-	// The sweeper repeat of the FIRST run's own failure — the dedup this is
-	// all for. One run's failure is news once.
-	rig.failed(t, "task-1", false)
-	if got := pushedTexts(t, rig.conn); len(got) != 1 {
-		t.Fatalf("a republished failure of one run was announced %d times, want 1: %q", len(got), got)
-	}
-
-	// A different run, in the same session, whose asker has been told nothing.
-	rig.failed(t, "task-2", false)
-	got := pushedTexts(t, rig.conn)
-	if len(got) != 2 {
-		t.Fatalf("two runs failed and the room read %d notice(s) (%q), want 2 — the second run's asker was "+
-			"silenced by the note the FIRST run left, and nobody ever told them their question died", len(got), got)
-	}
-	if got[1] != streamCopyFailed {
-		t.Fatalf("the second run's notice said %q, want %q", got[1], streamCopyFailed)
 	}
 }
 
@@ -653,7 +404,7 @@ func TestAStaleRoundIsSweptRatherThanKept(t *testing.T) {
 	if got := rig.streams.depth(); got != 1 {
 		t.Fatalf("store holds %d open bubbles, want 1 (only the new question's)", got)
 	}
-	if rig.streams.knowsRound(sessionID, taskUUID(t, "task-1")) {
+	if rig.streams.has(sessionID, taskUUID(t, "task-1")) {
 		t.Fatal("a round from beyond the stream window was still on file")
 	}
 }
@@ -682,9 +433,7 @@ func TestOpenIsIgnoredWithoutABatch(t *testing.T) {
 // window is the run's LAST event: cancellation publishes no chat:done and no
 // task:failed, so if the round is not retired here nothing will ever retire
 // it, and the opening frame landing a moment later paints a spinner with no
-// closer. The guard replaces it nine minutes on with "还在处理，完成后我再单独
-// 回复你" — a promise of a separate reply, about a run the user themselves
-// stopped.
+// closer — for a run the user themselves stopped.
 //
 // The subscriber used to return before looking, because its cheap rejection
 // counted PAINTED rounds and there were none anywhere in the process. This is
@@ -699,15 +448,14 @@ func TestACancelRetiresARoundWhoseBubbleIsStillInFlight(t *testing.T) {
 	rig.cancelled(t, "task-1")
 
 	// The ingest goroutine finally gets to the socket. Retiring the round is
-	// what it reads: open sees the batch on the note's finished list and
+	// what it reads: open sees the batch on the session's finished ring and
 	// paints nothing.
 	rig.ask(t, "REQ-1", 1)
 
 	if frames := rig.conn.streamFrames(t); len(frames) != 0 {
 		t.Fatalf("the opening frame painted %d bubble(s) for a run that was cancelled before it "+
 			"landed; a cancel publishes no chat:done and no task:failed, so there is no ending "+
-			"left to close them and the guard can only replace them with a promise of a reply "+
-			"that will never come", len(frames))
+			"left to close them", len(frames))
 	}
 	if got := rig.streams.depth(); got != 0 {
 		t.Fatalf("%d bubble(s) on screen for a cancelled run, want 0", got)

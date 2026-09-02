@@ -508,7 +508,7 @@ func TestZhHansPackIsTheCopyThatAlreadyShipped(t *testing.T) {
 		"StreamNotStarted":     "已收到，但这条暂时没能开始处理。",
 		"StreamFailed":         "⚠️ 这次没跑通，请稍后再试一次。",
 		"StreamCancelled":      "⏹️ 这次处理已取消。",
-		"StreamStillWorking":   "还在处理，完成后我再单独回复你。",
+		"StreamContinued":      "处理时间较长，接下一条",
 		"StreamStuck":          "⚠️ 上面那条进度不会再更新了，这轮的结果我用新消息发你。",
 		"StreamProgressPrefix": "正在处理：",
 		"InboxDetailLink":      "查看详情",

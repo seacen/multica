@@ -38,11 +38,10 @@ package wecom
 // holding the socket, which is the one with the bubble — and deliverRelayed
 // pushes the words as an ordinary message without ever looking for it
 // (relay_outbound.go). So on a multi-replica deployment the answer arrives, the
-// bubble it belonged in stays open, and streamGuardAfter later seals it with
-// "还在处理，完成后我再单独回复你": a promise of a separate reply the reader
-// already has, sitting above it. Replies are delivered either way; the in-place
-// bubble is a single-replica experience until a relayed reply is routed through
-// the ending ledger on the replica that takes it (stream_store.go).
+// bubble it belonged in stays open, and the guard keeps rotating it until the
+// run's last stream runs out its window. Replies are delivered either way; the
+// in-place bubble is a single-replica experience until a relayed reply is
+// routed through the round store on the replica that takes it.
 //
 // Sessions with no wecom binding are ignored so this coexists with the Slack /
 // Lark subscribers on the shared bus.
@@ -91,12 +90,24 @@ type outboundQueries interface {
 	languageLookup
 }
 
+// deliveryLookup is the pair of reads that turn a task id into the WeCom chat
+// its words go to: the delivery row the engine wrote when the question was
+// ingested, and the installation whose socket carries them. Shared with the
+// typing indicator's failure notice, which addresses a bubble-less round the
+// same way the answer does (taskAddress). *db.Queries satisfies it.
+type deliveryLookup interface {
+	GetChannelTaskDelivery(ctx context.Context, taskID pgtype.UUID) (db.ChannelTaskDelivery, error)
+	GetChannelInstallation(ctx context.Context, arg db.GetChannelInstallationParams) (db.ChannelInstallation, error)
+}
+
 // Outbound delivers an agent's chat reply back to WeCom over the same aibot
 // WebSocket the inbound loop owns, sealing the round's bubble with it where
 // there still is one. Registered against the shared event bus; sessions with no
 // wecom binding are silently ignored.
 type Outbound struct {
-	q       outboundQueries
+	q outboundQueries
+	// tasks is the retry-clone lookup behind rounds(): the same *db.Queries
+	// as q, narrowed to the one row the round matcher reads.
 	tasks   taskLookup
 	senders *sendersRegistry
 	streams *streamStore
@@ -238,9 +249,9 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 	//
 	// Fails closed: an origin we cannot establish is not delivered.
 	//
-	// Asked BEFORE sayEnding, which is the line that consumes the round. Every
-	// way a web run could touch this room is on the far side of it: sayEnding
-	// takes the bubble the room's own question opened, and deliverAnswer seals
+	// Asked BEFORE the take, which is the line that consumes the round. Every
+	// way a web run could touch this room is on the far side of it: the take
+	// removes the bubble the room's own question opened, and deliverAnswer seals
 	// it — with the answer, or with the copy pack's StreamNoReply when the
 	// completion is empty. Sealing is not sending, so a gate placed inside
 	// deliverAnswer would still cost the asker in the room the bubble they were
@@ -284,17 +295,12 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 	// already in hand, so a deployment with no storage costs no query.
 	carriesFiles := o.mayCarryAttachments(e)
 
-	// Every way this answer can reach the user runs inside deliverAnswer, and
-	// the ledger records the ending only from what deliverAnswer reports. There
-	// is no path here that sends without recording, and none that records
-	// without sending — see the ending ledger's contract in stream_store.go.
-	var said answerOutcome
-	_, err = o.rounds().sayEnding(ctx, sessionID, byTask(taskIDFromEvent(e)), roundOver,
-		func(t roundTurn) (roundAddress, error) {
-			var err error
-			said, err = o.deliverAnswer(ctx, e, taskID, t, content, carriesFiles)
-			return said.addr, err
-		})
+	// The take removes the round under the store's lock, which is what makes
+	// two closers racing for one run produce one closing frame. Whether it
+	// found a bubble is all deliverAnswer needs to know: the bubble is a cache,
+	// and a round with none goes down the plain path.
+	t, _ := o.rounds().take(ctx, sessionID, byTask(taskIDFromEvent(e)))
+	said, err := o.deliverAnswer(ctx, e, taskID, t, content, carriesFiles)
 	if errors.Is(err, errNothingToSay) {
 		// Counted by whichever branch declined to speak — each one names its
 		// own reason, and a blanket count here would file a revoked
@@ -307,14 +313,9 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 	if said.routed {
 		// The replica holding the socket owns the rest of this turn, files
 		// included — relayFrame.CarriesFiles is how it knows. Sending them from
-		// here as well would put every attachment in the chat twice.
-		//
-		// The ending is recorded as said even though nothing left this process:
-		// a published frame is owed an outcome by the relay, which records the
-		// drop itself if nobody takes it (RelayOutbound.watchOutcomes). Leaving
-		// the round owed instead would let the next repeat of this run's failure
-		// claim the promise and tell the user "这次没跑通" under an answer that
-		// did arrive.
+		// here as well would put every attachment in the chat twice. A
+		// published frame is owed an outcome by the relay, which records the
+		// drop itself if nobody takes it (RelayOutbound.watchOutcomes).
 		return nil
 	}
 	// Then whatever the agent produced alongside the words, as its own message —
@@ -346,10 +347,9 @@ func (o *Outbound) processEvent(ctx context.Context, e events.Event) error {
 // reached, in the order the user would rather have it.
 //
 // The bubble comes first: the round opened one when the question arrived and
-// the whole point of the feature is that the answer replaces it in place. The
-// round's own address is next, for the one case where an empty completion still
-// owes the user words. Everything else is an ordinary message to the chat the
-// task's delivery row names.
+// the whole point of the feature is that the answer replaces it in place.
+// Everything else is an ordinary message to the chat the task's delivery row
+// names.
 //
 // Nothing here re-asks where the question came from. processEvent has already
 // refused every run that is not this room's, which is what makes it safe for
@@ -417,12 +417,11 @@ func (o *Outbound) deliverAnswer(ctx context.Context, e events.Event, taskID pgt
 				return answerOutcome{addr: t.Handle.address(), spoke: true}, nil
 			}
 		}
-		// The frame was refused, or was never worth attempting. Say it as a
-		// new message instead, and do not re-send the stream frame: 846608 and
-		// 846605 both mean this stream
-		// will never take another one, and a transport error leaves it unknown
-		// whether the first frame landed — a second could print the answer
-		// twice in the same bubble. The plain message is the one route whose
+		// The frame was refused for good, or every attempt at it went
+		// unanswered, or it was never worth attempting. Say it as a new
+		// message instead: 846608 and 846605 both mean this stream will never
+		// take another frame, and the retries inside seal have already spent
+		// what a lost ack is worth. The plain message is the one route whose
 		// outcome this process can actually observe, and the whole answer goes
 		// down it — that path splits it again on its own. finishStream counted
 		// the refusal.
@@ -434,26 +433,9 @@ func (o *Outbound) deliverAnswer(ctx context.Context, e events.Event, taskID pgt
 		content = text
 	}
 	if !hasVisibleChar(content) {
-		// No bubble to close and nothing to say. Ordinarily that is the end of
-		// it — but if the guard closed this round's bubble it said "还在处理，
-		// 完成后我再单独回复你", and returning here is that promise broken in
-		// silence: the user is left waiting for a reply that has already
-		// happened. The bubble path above ends an empty completion in words for
-		// the same reason; after the guard the words go out as the separate
-		// reply instead.
-		//
-		// The promise is what makes this safe to send at all. One exists only
-		// where the guard closed a bubble this adapter opened, so it is itself
-		// the proof that a WeCom round is waiting on these words — no delivery
-		// row is consulted and no session that never asked anything here is
-		// written to.
-		if t.Promised && t.Addr.known() && o.senders != nil {
-			err := o.senders.sendTextCtx(ctx, t.Addr.InstallationID, t.Addr.ChatID, t.Addr.ChatType, o.copyForAddress(ctx, t.Addr).StreamNoReply)
-			if err == nil {
-				o.delivered()
-			}
-			return answerOutcome{addr: t.Addr, spoke: err == nil}, err
-		}
+		// No bubble to close and nothing to say. That is the end of it: a
+		// completion with no words and no file was never a message, and no
+		// bubble is waiting on one.
 		if !carriesFiles {
 			o.skipped(ctx, e, skipNothingToSay)
 			return answerOutcome{}, errNothingToSay
@@ -466,31 +448,19 @@ func (o *Outbound) deliverAnswer(ctx context.Context, e events.Event, taskID pgt
 	return o.sendAsMessage(ctx, e, taskID, content, carriesFiles)
 }
 
-// copyForAddress picks the pack for a round whose handle is gone: the words are
-// going to a chat rather than to a reader anybody still holds, and in a 1:1 that
-// chatid IS the reader's userid, which is what localeFor wants. A room ignores
-// it and reads the deployment's language (language.go).
-func (o *Outbound) copyForAddress(ctx context.Context, addr roundAddress) copyPack {
-	return copyFor(localeFor(ctx, o.q, addr.InstallationID, addr.ChatType, addr.ChatID))
-}
-
-// sendAsMessage pushes an answer to the chat this turn was admitted on, for a
-// round with no bubble left to put it in — a restart mid-run, a stream past its
-// window, a frame the server refused. It returns where it spoke, so a round
-// whose note never held an address learns one.
+// taskAddress resolves the chat a turn's words go to, off the task's own
+// delivery row. The skip reason names a turn that is not this adapter's to
+// answer — no row, another platform's row, an installation revoked since —
+// so the two callers can count it their own way; the error is a database that
+// did not answer.
 //
 // The address comes off channel_task_delivery rather than off the session's
 // current binding: /new and /clear re-point a session, and an answer produced
 // across one of those belongs to the room that asked. The bubble path is
 // already routed that way — its handle carries the address the question came in
 // on — so both paths of this adapter answer where they were asked.
-//
-// For a round the guard closed at nine minutes this message IS the separate
-// reply it promised, which is why the ledger settles on the strength of it:
-// left owed, the promise would be claimed by the next repeat of this run's
-// failure and tell the user "这次没跑通" underneath the answer they just read.
-func (o *Outbound) sendAsMessage(ctx context.Context, e events.Event, taskID pgtype.UUID, content string, carriesFiles bool) (answerOutcome, error) {
-	delivery, err := o.q.GetChannelTaskDelivery(ctx, taskID)
+func taskAddress(ctx context.Context, q deliveryLookup, taskID pgtype.UUID) (roundAddress, skipReason, error) {
+	delivery, err := q.GetChannelTaskDelivery(ctx, taskID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// No route was recorded for a turn whose input DID come in over a
@@ -500,42 +470,55 @@ func (o *Outbound) sendAsMessage(ctx context.Context, e events.Event, taskID pgt
 			// channel task. What produces one is an upgrade, and the answer it
 			// belongs to is going nowhere, so the branch is counted and warned
 			// about rather than left as a quiet return. See skipNoDeliveryRow.
-			o.skippedFor(ctx, e.ChatSessionID, skipNoDeliveryRow)
-			return answerOutcome{}, errNothingToSay
+			return roundAddress{}, skipNoDeliveryRow, nil
 		}
-		return answerOutcome{}, fmt.Errorf("wecom: lookup task delivery: %w", err)
+		return roundAddress{}, "", fmt.Errorf("wecom: lookup task delivery: %w", err)
 	}
 	if delivery.ChannelType != channelTypeWecom {
 		// Not a wecom turn (Slack / Lark). Named rather than silent so it does
 		// not share an exit with the branch above it: the two are one
 		// errNothingToSay from outside, and one of them means somebody is
 		// waiting.
-		o.skippedFor(ctx, e.ChatSessionID, skipNotWecomTurn)
-		return answerOutcome{}, errNothingToSay
+		return roundAddress{}, skipNotWecomTurn, nil
 	}
 	binding := wecomBindingFromTaskDelivery(delivery)
-	inst, err := o.q.GetChannelInstallation(ctx, db.GetChannelInstallationParams{
+	inst, err := q.GetChannelInstallation(ctx, db.GetChannelInstallationParams{
 		ID:          binding.InstallationID,
 		ChannelType: channelTypeWecom,
 	})
 	if err != nil {
-		return answerOutcome{}, fmt.Errorf("wecom: load installation: %w", err)
+		return roundAddress{}, "", fmt.Errorf("wecom: load installation: %w", err)
 	}
 	if inst.Status != string(InstallationActive) {
-		// Revoked between trigger and reply. Named here rather than left to the
-		// caller: from outside, this and a silent agent are both errNothingToSay.
-		o.skippedFor(ctx, e.ChatSessionID, skipInstallationInactive)
+		// Revoked between trigger and reply.
+		return roundAddress{}, skipInstallationInactive, nil
+	}
+	return roundAddress{
+		InstallationID: inst.ID,
+		ChatID:         binding.ChannelChatID,
+		ChatType:       aibotChatTypeFromChannel(channel.ChatType(binding.ChatType)),
+	}, "", nil
+}
+
+// sendAsMessage pushes an answer to the chat this turn was admitted on, for a
+// round with no bubble left to put it in — a restart mid-run, a stream past its
+// window, a frame the server refused. It returns where it spoke, which is where
+// the files that follow go.
+func (o *Outbound) sendAsMessage(ctx context.Context, e events.Event, taskID pgtype.UUID, content string, carriesFiles bool) (answerOutcome, error) {
+	addr, skip, err := taskAddress(ctx, o.q, taskID)
+	if err != nil {
+		return answerOutcome{}, err
+	}
+	if skip != "" {
+		// Named here rather than left to the caller: from outside, each of
+		// these and a silent agent are all errNothingToSay.
+		o.skippedFor(ctx, e.ChatSessionID, skip)
 		return answerOutcome{}, errNothingToSay
 	}
 	if o.senders == nil {
 		return answerOutcome{}, errors.New("wecom: sender registry not configured")
 	}
-	addr := roundAddress{
-		InstallationID: inst.ID,
-		ChatID:         binding.ChannelChatID,
-		ChatType:       aibotChatTypeFromChannel(channel.ChatType(binding.ChatType)),
-	}
-	sender := o.senders.get(inst.ID)
+	sender := o.senders.get(addr.InstallationID)
 	if sender == nil {
 		// Before giving up: this reply may simply have been produced on the
 		// wrong replica. Hand it to the one holding the socket.
@@ -547,7 +530,7 @@ func (o *Outbound) sendAsMessage(ctx context.Context, e events.Event, taskID pgt
 		// this deliberately does not solve (relay_outbound.go).
 		if o.relay.publish(relayFrame{
 			Kind:           relayKindReply,
-			InstallationID: util.UUIDToString(inst.ID),
+			InstallationID: util.UUIDToString(addr.InstallationID),
 			ChatID:         addr.ChatID,
 			ChatType:       addr.ChatType,
 			Content:        content,
@@ -558,7 +541,7 @@ func (o *Outbound) sendAsMessage(ctx context.Context, e events.Event, taskID pgt
 			CarriesFiles:   carriesFiles,
 		}, relayEventID(e, taskID)) {
 			o.logger.DebugContext(ctx, "wecom outbound: routed to the replica holding the socket",
-				"installation_id", util.UUIDToString(inst.ID), "chat_session_id", e.ChatSessionID)
+				"installation_id", util.UUIDToString(addr.InstallationID), "chat_session_id", e.ChatSessionID)
 			return answerOutcome{addr: addr, routed: true}, nil
 		}
 		// No live WS for this installation on this replica. Two causes:
@@ -591,9 +574,7 @@ func (o *Outbound) sendAsMessage(ctx context.Context, e events.Event, taskID pgt
 		// So it settles here, the same way the bubble path settles a failed
 		// sendRest — delivered, plus the count that says only part of it
 		// arrived. Reporting spoke means the files that follow are not the
-		// whole answer, which is true: some of the words got there. And a nil
-		// error is what stops the round being left owed an ending, whose next
-		// claimant would repeat the whole answer under the half already read.
+		// whole answer, which is true: some of the words got there.
 		o.truncated(ctx, e.ChatSessionID, err)
 	}
 	o.delivered()
@@ -633,22 +614,24 @@ func chatDoneTaskID(e events.Event) (pgtype.UUID, bool) {
 	return id, err == nil && id.Valid
 }
 
-// finishStream writes the answer into the bubble and seals it. A failure here
-// is not fatal to the reply — it means the caller falls back to a new message —
-// so it is logged with the one detail that explains it: whether the stream is
-// beyond saving (past its window, bad req_id) or the socket simply blinked.
+// finishStream writes the answer into the bubble and seals it, through the
+// store's seal — the one place the closing frame's retry policy lives. A
+// failure here is not fatal to the reply — it means the caller falls back to a
+// new message — so it is logged with the one detail that explains it: whether
+// the stream is beyond saving (past its window, bad req_id) or the socket
+// simply blinked.
 //
-// Both endings are counted inside sendersRegistry.stream, which every bubble
-// closer goes through — this one and the typing indicator's. Counted at all
-// because from outside the two are indistinguishable: the user gets the answer
-// either way, and nobody reports "the bubble I was watching turned into a
-// separate message". A bubble that has stopped working at all — a WeCom-side
+// Both endings are counted inside sendersRegistry.recordEnding, which every
+// bubble closer goes through — this one and the typing indicator's. Counted at
+// all because from outside the two are indistinguishable: the user gets the
+// answer either way, and nobody reports "the bubble I was watching turned into
+// a separate message". A bubble that has stopped working at all — a WeCom-side
 // change to the stream frame, a req_id convention that drifted — shows up as
 // stream_fell_back climbing to meet stream_finished, and nowhere else.
 //
-// senders is non-nil here: takeStream returns false without it.
+// senders and streams are non-nil here: a turn has a bubble only through them.
 func (o *Outbound) finishStream(ctx context.Context, h streamHandle, text string) error {
-	err := o.senders.stream(ctx, h, text, true)
+	err := o.streams.seal(ctx, o.senders, h, text)
 	if err == nil {
 		return nil
 	}
