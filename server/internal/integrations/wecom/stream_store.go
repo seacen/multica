@@ -128,6 +128,11 @@ const streamMaxAge = 10 * time.Minute
 // the old stream still has to take the closing frame that hands over to the
 // new one. It stays clear of the measured ceiling's lower bound, not just of
 // streamMaxAge.
+// maxRotations bounds how many fresh bubbles one run may be handed. Twenty-
+// four is four hours of a run that keeps stepping; past it the guard leaves
+// the bubble to the server's window and the answer goes plain.
+const maxRotations = 24
+
 const streamGuardAfter = 9 * time.Minute
 
 // streamCloseRetries is how many times a closing frame whose ack never came is
@@ -300,6 +305,23 @@ type roundEntry struct {
 	// guard rotates the bubble onto a fresh stream before the protocol's
 	// window runs out on the current one.
 	guard *time.Timer
+
+	// steps counts the run's signs of life — every task:message or
+	// task:progress event for it, whether or not a line was painted — and
+	// stepsAtOpen is the count when the current stream opened. The guard
+	// rotates a bubble only for a run that has stepped since: a run that ended
+	// without an event (an agent archived on main publishes no task:cancelled)
+	// would otherwise be handed a fresh bubble every nine minutes for as long
+	// as the process lives. A quiet run keeps its stream until the server ends
+	// it at the window, and its answer, if one still comes, goes out as a
+	// plain message. Counts rather than clocks, so a step and an open in the
+	// same instant still tell apart.
+	steps       int
+	stepsAtOpen int
+
+	// rotations counts hand-overs, bounded by maxRotations as a backstop for a
+	// run that keeps stepping and never ends.
+	rotations int
 
 	// feed is the bubble's scrolling list of steps, created on the first one
 	// that reaches it (progress_render.go). It lives here rather than beside
@@ -645,6 +667,7 @@ func (s *streamStore) feedFor(sessionID pgtype.UUID, taskID string) (streamHandl
 		// message. Disowned: another connection owns this conversation now,
 		// and every frame from here is a refusal counted against the whole
 		// bot's rate limit.
+		r.steps++
 		if !r.painted || r.unusable || s.expiredLocked(r.handle.CreatedAt) {
 			return streamHandle{}, nil, false
 		}
@@ -708,6 +731,11 @@ func (s *streamStore) rotate(sessionID pgtype.UUID, batch engine.RunBatchID, str
 	if e == nil || !e.painted || e.unusable || s.expiredLocked(e.handle.CreatedAt) {
 		return streamHandle{}, streamHandle{}, false
 	}
+	// Only a run that has stepped since this stream opened is alive enough
+	// to deserve the next one; see steps. The cap is the backstop.
+	if e.steps <= e.stepsAtOpen || e.rotations >= maxRotations {
+		return streamHandle{}, streamHandle{}, false
+	}
 	old = e.handle
 	next = old
 	next.StreamID = streamID
@@ -715,6 +743,8 @@ func (s *streamStore) rotate(sessionID pgtype.UUID, batch engine.RunBatchID, str
 	e.handle = next
 	e.createdAt = next.CreatedAt
 	e.feed = nil
+	e.rotations++
+	e.stepsAtOpen = e.steps
 	return old, next, true
 }
 

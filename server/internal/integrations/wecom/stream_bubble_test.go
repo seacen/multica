@@ -467,12 +467,23 @@ func (r *bubbleRig) streamIDOf(t *testing.T, batch engine.RunBatchID) string {
 func (r *bubbleRig) rotated(t *testing.T, batch engine.RunBatchID) (old, next string) {
 	t.Helper()
 	old = r.streamIDOf(t, batch)
+	// A rotation is for a run that is alive: one step since the stream opened.
+	r.stepped(t, batch)
 	r.typing.fireGuard(context.Background(), bubbleSessionID(t), batch)
 	next = r.streamIDOf(t, batch)
 	if next == old {
 		t.Fatalf("could not rotate round %d: its bubble is still on stream %s", batch, old)
 	}
 	return old, next
+}
+
+// stepped records one sign of life for the run bound to batch, the way a
+// task:message reaching recordStep does.
+func (r *bubbleRig) stepped(t *testing.T, batch engine.RunBatchID) {
+	t.Helper()
+	if _, _, ok := r.streams.feedFor(bubbleSessionID(t), r.taskOfBatch(t, batch)); !ok {
+		t.Fatalf("round %d has no bubble to step into", batch)
+	}
 }
 
 // taskOfBatch is the run the flush bound to a batch, read back out of the rig's
@@ -774,8 +785,11 @@ func TestTheGuardRotatesABubbleTheWindowIsAboutToStrand(t *testing.T) {
 	rig.runStarted(t, 1, "task-1")
 	opened := rig.conn.streamFrames(t)[0]["id"]
 
+	// The run keeps stepping the whole time: a rotation is only for a run
+	// that is alive (TestTheGuardLeavesAQuietRoundAlone).
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) && len(rig.conn.streamFrames(t)) < 5 {
+		rig.stepped(t, 1)
 		time.Sleep(time.Millisecond)
 	}
 	frames := rig.conn.streamFrames(t)

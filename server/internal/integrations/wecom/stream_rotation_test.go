@@ -129,6 +129,7 @@ func TestARefusedHandOverStopsRotatingAndTheAnswerGoesPlain(t *testing.T) {
 	rig.ran(t, "REQ-ROT3", 1, "task-1")
 	sessionID := bubbleSessionID(t)
 
+	rig.stepped(t, 1)
 	rig.typing.fireGuard(context.Background(), sessionID, 1)
 	frames := rig.conn.streamFrames(t)
 	if len(frames) != 2 || frames[1]["finish"] != true {
@@ -171,5 +172,57 @@ func TestTheGuardLeavesAnUnpaintedRoundAlone(t *testing.T) {
 	}
 	if !rig.streams.has(bubbleSessionID(t), taskUUID(t, "task-1")) {
 		t.Fatal("the guard retired a round that still has an answer coming")
+	}
+}
+
+// A run that has shown no sign of life since its stream opened is not handed a
+// fresh bubble. The case that makes this matter: an agent archived on main
+// cancels its runs without publishing task:cancelled, so nothing ever ends the
+// round from outside — and a guard that rotated on the clock alone would open
+// a new bubble in the chat every nine minutes for as long as the process
+// lived. The quiet round keeps its stream until the server ends it.
+//
+// REVERSE VERIFICATION: drop the lastStep check in rotate and this fails with
+// the round on a new stream and two frames on the wire.
+func TestTheGuardLeavesAQuietRoundAlone(t *testing.T) {
+	t.Parallel()
+	rig := newBubbleRig(t)
+	rig.ran(t, "REQ-QUIET", 1, "task-1")
+	before := rig.streamIDOf(t, 1)
+	frames := len(rig.conn.streamFrames(t))
+
+	rig.typing.fireGuard(context.Background(), bubbleSessionID(t), 1)
+
+	if after := rig.streamIDOf(t, 1); after != before {
+		t.Fatalf("a quiet round was rotated from %s to %s", before, after)
+	}
+	if n := len(rig.conn.streamFrames(t)); n != frames {
+		t.Fatalf("%d stream frames after the guard, want %d: nothing is written for a quiet round", n, frames)
+	}
+	// A step brings it back to life for the next guard.
+	rig.stepped(t, 1)
+	rig.typing.fireGuard(context.Background(), bubbleSessionID(t), 1)
+	if after := rig.streamIDOf(t, 1); after == before {
+		t.Fatalf("the round stepped and was still not rotated")
+	}
+}
+
+// The backstop: a run that keeps stepping is handed at most maxRotations fresh
+// bubbles, then left to the window.
+//
+// REVERSE VERIFICATION: drop the rotations check in rotate and this fails with
+// a rotation past the cap.
+func TestRotationStopsAtItsCap(t *testing.T) {
+	t.Parallel()
+	rig := newBubbleRig(t)
+	rig.ran(t, "REQ-CAP", 1, "task-1")
+	for i := 0; i < maxRotations; i++ {
+		rig.rotated(t, 1)
+	}
+	before := rig.streamIDOf(t, 1)
+	rig.stepped(t, 1)
+	rig.typing.fireGuard(context.Background(), bubbleSessionID(t), 1)
+	if after := rig.streamIDOf(t, 1); after != before {
+		t.Fatalf("rotated past the cap of %d: %s -> %s", maxRotations, before, after)
 	}
 }
