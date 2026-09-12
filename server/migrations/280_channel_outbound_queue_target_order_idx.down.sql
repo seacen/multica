@@ -1,1 +1,0 @@
-DROP INDEX CONCURRENTLY IF EXISTS idx_channel_outbound_queue_target_order;
