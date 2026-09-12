@@ -178,16 +178,29 @@ func (c *Client) setIdentityHeaders(req *http.Request) {
 	if c.os != "" {
 		req.Header.Set("X-Client-OS", c.os)
 	}
-	req.Header.Set("X-Client-Capabilities", daemonClientCapabilities())
+	req.Header.Set("X-Client-Capabilities", daemonHTTPClientCapabilities())
 }
 
 // daemonClientCapabilities is the X-Client-Capabilities value the daemon
-// advertises on BOTH the HTTP control-plane requests and the WS handshake, so a
-// claim built over WS gets the same capability gating (skill refs,
-// coalesced-comments) as the HTTP path. rpc-v1 advertises WS request/response
-// support (MUL-4257).
+// advertises on the WS handshake. A claim built over WS gets the common
+// capability gating plus WS-only scheduling metadata. rpc-v1 advertises WS
+// request/response support (MUL-4257).
 func daemonClientCapabilities() string {
-	return strings.Join([]string{
+	return strings.Join(append(daemonCommonCapabilities(),
+		protocol.DaemonCapabilityClaimPollHintsV1,
+	), ",")
+}
+
+// daemonHTTPClientCapabilities omits claim-poll-hints-v1 because HTTP fallback
+// responses cannot drive the healthy-WS scheduler. Advertising it there would
+// make the server run the deferred-task hint query only for the daemon to ignore
+// the result.
+func daemonHTTPClientCapabilities() string {
+	return strings.Join(daemonCommonCapabilities(), ",")
+}
+
+func daemonCommonCapabilities() []string {
+	return []string{
 		protocol.DaemonCapabilitySkillBundlesV1,
 		protocol.DaemonCapabilityCoalescedCommentsV1,
 		protocol.DaemonCapabilityExecutionManifestV1,
@@ -196,7 +209,9 @@ func daemonClientCapabilities() string {
 		protocol.DaemonCapabilityLocalWorktreeV1,
 		protocol.DaemonCapabilitySourceContextQuickCreateV1,
 		protocol.DaemonCapabilityRPCV1,
-	}, ",")
+		protocol.DaemonCapabilityPlatformSkillV1,
+		protocol.DaemonCapabilityCheckoutKeepsWorkV1,
+	}
 }
 
 // SetToken sets the auth token for authenticated requests.
@@ -255,6 +270,17 @@ func (c *Client) ResolveRemoteMCPCredential(ctx context.Context, daemonToken, ta
 // comfortably above p99 claim latency so recovery stays the exception.
 const batchClaimRequestTimeout = 5 * time.Second
 
+// claimTasksResult carries optional scheduling metadata understood only by
+// daemons advertising claim-poll-hints-v1. A zero-value result is deliberately
+// conservative: it makes the poller retain PollInterval, which protects new
+// daemons talking to old servers and claims whose WS outcome was uncertain.
+type claimTasksResult struct {
+	Tasks                       []*Task `json:"tasks"`
+	ClaimPollHintSupported      bool    `json:"claim_poll_hint_supported,omitempty"`
+	NextDeferredTaskAfterMillis int64   `json:"next_deferred_task_after_ms,omitempty"`
+	ClaimedOverWS               bool    `json:"-"`
+}
+
 // ClaimTasks is the machine-level (MUL-4257) batch counterpart of ClaimTask:
 // it asks the server, in a single request, to claim up to maxTasks tasks across
 // every runtime the daemon hosts. daemonID scopes the request to this machine —
@@ -266,19 +292,22 @@ const batchClaimRequestTimeout = 5 * time.Second
 // one slow claim cannot stall the whole batch; the deadline propagates to the
 // server and cancels the in-flight query there too.
 func (c *Client) ClaimTasks(ctx context.Context, daemonID string, runtimeIDs []string, maxTasks int) ([]*Task, error) {
+	result, err := c.claimTasksWithHints(ctx, daemonID, runtimeIDs, maxTasks)
+	return result.Tasks, err
+}
+
+func (c *Client) claimTasksWithHints(ctx context.Context, daemonID string, runtimeIDs []string, maxTasks int) (claimTasksResult, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, batchClaimRequestTimeout)
 	defer cancel()
-	var resp struct {
-		Tasks []*Task `json:"tasks"`
-	}
+	var resp claimTasksResult
 	if err := c.postJSON(reqCtx, "/api/daemon/tasks/claim", map[string]any{
 		"daemon_id":   daemonID,
 		"runtime_ids": runtimeIDs,
 		"max_tasks":   maxTasks,
 	}, &resp); err != nil {
-		return nil, err
+		return claimTasksResult{}, err
 	}
-	return resp.Tasks, nil
+	return resp, nil
 }
 
 // isBatchClaimUnsupported reports whether err is a 404 from the batch claim
@@ -486,6 +515,14 @@ type TaskMessageData struct {
 	Content string         `json:"content,omitempty"`
 	Input   map[string]any `json:"input,omitempty"`
 	Output  string         `json:"output,omitempty"`
+	// CreatedAt is when the daemon observed the event, before the 500ms report
+	// batch. Without it, every row in one batch gets the same database time.
+	CreatedAt time.Time `json:"created_at"`
+	// OutputTruncated reports whether Output dropped bytes to fit the preview
+	// budget. Tri-state on purpose: nil means this daemon did not measure it,
+	// which an older installed daemon talking to a newer server cannot say any
+	// other way, and which the server must not record as "complete".
+	OutputTruncated *bool `json:"output_truncated,omitempty"`
 }
 
 func (c *Client) ReportTaskMessages(ctx context.Context, taskID string, messages []TaskMessageData) error {
@@ -892,6 +929,19 @@ func (c *Client) GetTaskGCCheck(ctx context.Context, taskID string) (*TaskGCStat
 // must be refused with an explanation (MUL-6164).
 const RuntimeOfflineCodeNotExecutable = "not_executable"
 
+// RuntimeOfflineCodeDshProfile marks a runtime taken offline because the DSH
+// runtime profile it depends on is not installed. Like not_executable it is not
+// something waiting fixes on its own — a human installs a bundle, or configures
+// the daemon to — so work for it is refused with an explanation rather than
+// queued forever. The exception is an install the daemon is running right now,
+// which Installing states explicitly.
+//
+// Only an ABSENT profile reaches this code. A profile that is present but
+// answers with a protocol this daemon does not drive never takes a live runtime
+// offline at all: the daemon can be the stale side of that skew, so it reports
+// the incompatibility and leaves the runtime alone.
+const RuntimeOfflineCodeDshProfile = "dsh_profile"
+
 // RuntimeOfflineReason is why a runtime went offline, in the form clients can
 // act on: a stable code they switch on and localize, and the command that
 // repairs the install. Prose stays in Detail for logs — never as the thing a
@@ -900,6 +950,12 @@ type RuntimeOfflineReason struct {
 	Code   string                  `json:"code"`
 	Detail string                  `json:"detail,omitempty"`
 	Repair *agent.ExecFormatRepair `json:"repair,omitempty"`
+	// Installing reports that the daemon has an automatic install in flight for
+	// this runtime. It is the difference between "a human has to act" and "this
+	// comes back by itself", which the server cannot infer from the code alone:
+	// without it, a successful install that is still running would look exactly
+	// like a machine waiting on an operator who was never going to be told.
+	Installing bool `json:"installing,omitempty"`
 }
 
 // Deregister takes runtimes offline. reasons is optional and keyed by runtime

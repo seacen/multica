@@ -30,6 +30,37 @@ const (
 	// Gated so only daemons+servers that both support it route claim over WS;
 	// everyone else keeps using the HTTP claim endpoint.
 	DaemonCapabilityRPCV1 = "rpc-v1"
+	// DaemonCapabilityClaimPollHintsV1 advertises that the daemon understands
+	// the batch-claim response's safety-poll metadata. The server only performs
+	// the extra deferred-task lookup for clients that opt in, and an older
+	// server's missing fields make a newer daemon retain its short fallback.
+	DaemonCapabilityClaimPollHintsV1 = "claim-poll-hints-v1"
+
+	// DaemonCapabilityPlatformSkillV1 advertises that the daemon's runtime
+	// brief names the merged `multica-platform` skill instead of the
+	// per-domain built-ins it replaced (MUL-6986).
+	//
+	// The brief is assembled by the daemon, so a backend upgrade does not
+	// rewrite it: a daemon released before that merge still tells the agent to
+	// "read the `multica-working-on-issues` skill", a name this server no
+	// longer ships. Without this gate the pointer dangles and the agent is left
+	// hunting for a skill that is not installed. When it is absent the server
+	// ships a redirect stub under the old name; when it is present it ships
+	// nothing extra, so the stub retires itself as daemons update.
+	DaemonCapabilityPlatformSkillV1 = "platform-skill-v1"
+
+	// DaemonCapabilityCheckoutKeepsWorkV1 advertises that the daemon's
+	// `multica repo checkout` keeps an existing checkout that holds work
+	// (uncommitted changes, untracked files, unpushed commits) instead of
+	// resetting it (MUL-7284).
+	//
+	// The server hands an automatic retry that must start a fresh session its
+	// parent's workdir only when this is present (MUL-7034). That session has no
+	// memory of the work in the directory and will fetch its repositories again.
+	// An older daemon's checkout resets an existing checkout and deletes that
+	// work, so such a daemon keeps getting a fresh directory and the parent's
+	// stays untouched on disk.
+	DaemonCapabilityCheckoutKeepsWorkV1 = "checkout-keeps-work-v1"
 
 	// AppCapabilityChatDraftRestoreV1 is advertised (X-Client-Capabilities) by
 	// app clients that understand the durable draft-restore recovery path:
@@ -168,15 +199,20 @@ type ChatQuickActionsPayload struct {
 
 // TaskMessagePayload represents a single agent execution message (tool call, text, etc.)
 type TaskMessagePayload struct {
-	TaskID    string         `json:"task_id"`
-	IssueID   string         `json:"issue_id,omitempty"`
-	Seq       int            `json:"seq"`
-	Type      string         `json:"type"`              // "text", "tool_use", "tool_result", "error"
-	Tool      string         `json:"tool,omitempty"`    // tool name for tool_use/tool_result
-	Content   string         `json:"content,omitempty"` // text content
-	Input     map[string]any `json:"input,omitempty"`   // tool input (tool_use only)
-	Output    string         `json:"output,omitempty"`  // tool output (tool_result only)
-	CreatedAt string         `json:"created_at,omitempty"`
+	TaskID  string         `json:"task_id"`
+	IssueID string         `json:"issue_id,omitempty"`
+	Seq     int            `json:"seq"`
+	Type    string         `json:"type"`              // "text", "tool_use", "tool_result", "error"
+	Tool    string         `json:"tool,omitempty"`    // tool name for tool_use/tool_result
+	Content string         `json:"content,omitempty"` // text content
+	Input   map[string]any `json:"input,omitempty"`   // tool input (tool_use only)
+	Output  string         `json:"output,omitempty"`  // tool output (tool_result only)
+	// OutputTruncated reports whether Output is the whole tool output that ran
+	// (tool_result only). Tri-state: omitted means no daemon ever measured this
+	// record — historical rows and older installed daemons — which clients must
+	// present as unknown rather than as complete.
+	OutputTruncated *bool  `json:"output_truncated,omitempty"`
+	CreatedAt       string `json:"created_at,omitempty"`
 }
 
 // DaemonRegisterPayload is sent from daemon to server on connection.

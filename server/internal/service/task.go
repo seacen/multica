@@ -541,9 +541,10 @@ func (s *TaskService) attributionForIssueTask(ctx context.Context, issue db.Issu
 		}
 	}
 	// Autopilot-origin issues (origin_id is the autopilot id) from a schedule /
-	// webhook trigger attribute to the firing trigger's CREATOR — trigger_owner
-	// (MUL-4302; MUL-6951) — degrading to the audit-only rule publisher when no
-	// creator is recoverable. That human is the originator as well as the
+	// webhook trigger attribute to the firing trigger's persisted created_by
+	// principal — trigger_owner (MUL-4302; MUL-6951; legacy semantics in
+	// ResolveAutopilotTriggerPrincipal) — degrading to the audit-only rule publisher
+	// when the trigger has none. That human is the originator as well as the
 	// accountable, so a create_issue-mode run carries the same authorization a
 	// manual "run now" by that member would; an edit of the trigger does not move
 	// it. Resolved the same way
@@ -587,8 +588,9 @@ func (s *TaskService) attributionForIssueTask(ctx context.Context, issue db.Issu
 // from its active (latest) rule version snapshot (MUL-4302 §3.4). Shared by both
 // autopilot execution modes — run_only dispatch and the create_issue enqueue path —
 // so they attribute identically. originator stays NULL: an autopilot DOES carry a
-// human's authority since MUL-6951, but it comes from the trigger's creator, and
-// this is the fallback for when that creator cannot be proven. Only the
+// human's authority since MUL-6951, but it comes from the trigger's created_by
+// principal (see ResolveAutopilotTriggerPrincipal), and this is the fallback for a
+// trigger that has none. Only the
 // audit-accountable side is set, to the version's member publisher. A missing version (autopilot published before this feature, or
 // none yet) or a non-member/absent publisher degrades to unattributed rather than
 // fabricating a human. Never returns an error: attribution must not fail an
@@ -612,23 +614,24 @@ func ruleOwnerAttribution(ctx context.Context, q *db.Queries, workspaceID, autop
 }
 
 // triggerOwnerAttribution resolves an autopilot schedule/webhook run to the firing
-// trigger's CREATOR (MUL-4302; MUL-6951). triggerID is the autopilot_run's
-// trigger_id.
+// trigger's dispatch principal, created_by (MUL-4302; MUL-6951) — see
+// ResolveAutopilotTriggerPrincipal for what that column does and does not prove.
+// triggerID is the autopilot_run's trigger_id.
 //
-// The creator is immutable — a substantive edit re-stamps published_by, not
-// created_by, so it cannot re-authorize the automation as the editor (MUL-6951,
-// Bohan's ruling). Because the DB invariant forces accountable == originator once
-// the originator is set, BOTH columns on the task name the creator; the editor's
-// responsibility for the config lives on autopilot_trigger.published_by.
+// No edit rewrites created_by — a substantive edit re-stamps published_by — so it
+// cannot re-authorize the automation as the editor (MUL-6951, Bohan's ruling).
+// Because the DB invariant forces accountable == originator once the originator is
+// set, BOTH columns on the task name that principal; the editor's responsibility
+// for the config lives on autopilot_trigger.published_by.
 //
-// A trigger with no recoverable creator degrades to ruleOwnerAttribution, which is
+// A trigger with no principal degrades to ruleOwnerAttribution, which is
 // audit-only — the run then carries no originator and the invoke gate fails closed.
 // Never errors: attribution must not fail an enqueue.
 func triggerOwnerAttribution(ctx context.Context, q *db.Queries, triggerID, workspaceID, autopilotID pgtype.UUID, evidenceKind attribution.EvidenceKind, evidenceRefID pgtype.UUID) attribution.Result {
 	if principal := ResolveAutopilotTriggerPrincipal(ctx, q, triggerID, autopilotID, workspaceID); principal.Valid {
 		return attribution.TriggerOwner(principal, evidenceKind, evidenceRefID)
 	}
-	// No provable principal: degrade to the rule publisher, which is AUDIT-ONLY.
+	// No principal: degrade to the rule publisher, which is AUDIT-ONLY.
 	// rule_owner must never become an authorization identity — it is a guess at
 	// "who probably owns this rule", and promoting it would hand a legacy trigger
 	// somebody's invoke rights without that person ever arming anything. The run
@@ -637,8 +640,9 @@ func triggerOwnerAttribution(ctx context.Context, q *db.Queries, triggerID, work
 }
 
 // ResolveAutopilotTriggerPrincipal returns the human a schedule/webhook dispatch
-// ACTS AS, or an invalid UUID when none can be proven — in which case every
-// caller must fail closed rather than substitute a different human.
+// ACTS AS — the trigger's created_by — or an invalid UUID when there is none, in
+// which case every caller must fail closed rather than substitute a different
+// human.
 //
 // This is the single source of that answer (MUL-6951). Admission
 // (autopilotAdmitInvoke), the originator stamped on the task, and every run
@@ -646,11 +650,19 @@ func triggerOwnerAttribution(ctx context.Context, q *db.Queries, triggerID, work
 // person A and then run with person B's rights — a combination neither of them
 // could produce by hand, and the exact fork Elon's review found.
 //
-// The principal is the trigger's IMMUTABLE created_by, not published_by:
-// published_by transfers to whoever last substantively edits the trigger, so
-// using it would let a collaborator adjusting a cron expression silently hand the
-// automation their own rights (MUL-6951, Bohan's ruling: the run always acts as
-// the trigger's creator).
+// The principal is the trigger's created_by, not published_by: published_by
+// transfers to whoever last substantively edits the trigger, so using it would let
+// a collaborator adjusting a cron expression silently hand the automation their
+// own rights (MUL-6951, Bohan's ruling: the run always acts as the trigger's
+// creator).
+//
+// What created_by records depends on the trigger's age. For a trigger created
+// since MUL-6951 it is the member who created it, written at creation. For a legacy
+// trigger it is a principal inferred once by backfill and frozen — the last
+// publisher (migration 449), else the autopilot's creator (migration 467) — so it
+// is NOT proof of who created that trigger; treat it only as the dispatch
+// principal. Nothing here infers a principal at dispatch time, and no edit
+// rewrites it.
 //
 // Three conditions, all required, all fail-closed:
 //
@@ -659,8 +671,8 @@ func triggerOwnerAttribution(ctx context.Context, q *db.Queries, triggerID, work
 //     cannot select the principal. The membership check below is not a substitute:
 //     it proves the resolved human is in the workspace passed in, which a member of
 //     two workspaces satisfies even when the trigger came from the other one;
-//   - created_by names a member — a legacy trigger predating the column (and with
-//     no published_by to backfill from) resolves nobody rather than a guess;
+//   - created_by names a member — a legacy trigger that neither backfill could
+//     fill resolves nobody;
 //   - that member is STILL in the autopilot's workspace, re-checked on every
 //     dispatch, so removing someone actually revokes what their triggers can do.
 func ResolveAutopilotTriggerPrincipal(ctx context.Context, q *db.Queries, triggerID, autopilotID, workspaceID pgtype.UUID) pgtype.UUID {
@@ -716,7 +728,7 @@ func isDuplicatePendingTaskErr(err error) bool {
 		return false
 	}
 	switch pgErr.ConstraintName {
-	case "idx_one_pending_task_per_issue_agent", "idx_one_pending_task_per_issue_agent_v2":
+	case "idx_one_pending_task_per_issue_agent", "idx_one_pending_task_per_issue_agent_v2", "idx_one_pending_task_per_issue_agent_thread":
 		return true
 	default:
 		return false
@@ -803,7 +815,7 @@ func (s *TaskService) OriginatorForIssueTask(ctx context.Context, issue db.Issue
 func (s *TaskService) captureTaskDispatched(ctx context.Context, task db.AgentTaskQueue) {
 	if s.Metrics != nil {
 		source, runtimeMode, _ := s.taskMetricsContext(ctx, task)
-		s.Metrics.RecordTaskDispatched(util.UUIDToString(task.ID), source, runtimeMode, taskQueueWaitSeconds(task))
+		s.Metrics.RecordTaskDispatched(util.UUIDToString(task.ID), source, runtimeMode, taskQueueWaitSeconds(task), taskClaimableWaitSeconds(task))
 	}
 }
 
@@ -1046,6 +1058,16 @@ func taskQueueWaitSeconds(task db.AgentTaskQueue) float64 {
 	return durationSeconds(task.CreatedAt, task.DispatchedAt)
 }
 
+// taskClaimableWaitSeconds excludes an intentional deferred delay when fire_at
+// is still available on the claimed row. Immediate tasks start at creation.
+func taskClaimableWaitSeconds(task db.AgentTaskQueue) float64 {
+	claimableAt := task.CreatedAt
+	if task.FireAt.Valid && (!claimableAt.Valid || task.FireAt.Time.After(claimableAt.Time)) {
+		claimableAt = task.FireAt
+	}
+	return durationSeconds(claimableAt, task.DispatchedAt)
+}
+
 func taskRunSeconds(task db.AgentTaskQueue) float64 {
 	return durationSeconds(task.StartedAt, task.CompletedAt)
 }
@@ -1103,7 +1125,14 @@ func (s *TaskService) EnqueueTaskForIssue(ctx context.Context, issue db.Issue, t
 // crash-safe fallback; the channel router promotes the task as soon as the
 // detached attachment transaction settles.
 func (s *TaskService) EnqueueDeferredChannelIssueTask(ctx context.Context, issue db.Issue, fireAt time.Time) (db.AgentTaskQueue, error) {
-	return s.enqueueIssueTask(ctx, issue, pgtype.UUID{}, false, "", pgtype.UUID{}, pgtype.UUID{}, pgtype.Timestamptz{Time: fireAt, Valid: true})
+	task, err := s.enqueueIssueTask(ctx, issue, pgtype.UUID{}, false, "", pgtype.UUID{}, pgtype.UUID{}, pgtype.Timestamptz{Time: fireAt, Valid: true})
+	if err != nil {
+		return db.AgentTaskQueue{}, err
+	}
+	// The task is durable but not claimable yet. Wake once without a task ID so
+	// the daemon refreshes its deferred schedule without treating it as ready.
+	s.notifyRuntimeMayHaveWork(task.RuntimeID, "")
+	return task, nil
 }
 
 // createDeferredChannelIssueTaskWithQueries inserts the inert media-gated task
@@ -1149,12 +1178,18 @@ func (s *TaskService) hydrateDeferredChannelIssueTaskOverlay(ctx context.Context
 	return nil
 }
 
-// EnqueueTaskForIssueWithHandoff is the assign/promote variant that carries a
-// handoff note into the run's opening context (MUL-3375). The note rides a
-// dedicated task column; the daemon renders it via the assignment-handoff
-// branch. Empty note behaves exactly like EnqueueTaskForIssue. actorUserID is the
-// member who performed the assign/promote and becomes the accountable human for
-// the run (MUL-4302 §4); invalid when the caller has no member actor.
+// EnqueueTaskForIssueByActor is the assign/promote variant of
+// EnqueueTaskForIssue. actorUserID is the member who performed the
+// assign/promote and becomes the accountable human for the run (MUL-4302 §4);
+// invalid when the caller has no member actor.
+func (s *TaskService) EnqueueTaskForIssueByActor(ctx context.Context, issue db.Issue, actorUserID pgtype.UUID) (db.AgentTaskQueue, error) {
+	return s.enqueueIssueTask(ctx, issue, pgtype.UUID{}, false, "", actorUserID, pgtype.UUID{}, pgtype.Timestamptz{})
+}
+
+// EnqueueTaskForIssueWithHandoff is the backward-compatible assign/promote
+// variant used when an installed client still sends handoff_note. The note is
+// persisted on the task so both old and current daemons can render it in the
+// run's opening prompt. Empty text behaves like EnqueueTaskForIssueByActor.
 func (s *TaskService) EnqueueTaskForIssueWithHandoff(ctx context.Context, issue db.Issue, handoffNote string, actorUserID pgtype.UUID) (db.AgentTaskQueue, error) {
 	return s.enqueueIssueTask(ctx, issue, pgtype.UUID{}, false, handoffNote, actorUserID, pgtype.UUID{}, pgtype.Timestamptz{})
 }
@@ -1353,11 +1388,16 @@ func (s *TaskService) EnqueueTaskForSquadLeader(ctx context.Context, issue db.Is
 	return s.enqueueMentionTask(ctx, issue, leaderID, triggerCommentID, true, squadID, false, "", pgtype.UUID{}, pgtype.UUID{})
 }
 
-// EnqueueTaskForSquadLeaderWithHandoff is the assign/promote variant carrying a
-// handoff note into the leader run's opening context (MUL-3375). Empty note
-// behaves exactly like EnqueueTaskForSquadLeader. actorUserID is the member who
-// performed the assign/promote and becomes the accountable human (MUL-4302 §4);
-// invalid when the caller has no member actor.
+// EnqueueTaskForSquadLeaderByActor is the assign/promote variant of
+// EnqueueTaskForSquadLeader. actorUserID is the member who performed the
+// assign/promote and becomes the accountable human (MUL-4302 §4); invalid when
+// the caller has no member actor.
+func (s *TaskService) EnqueueTaskForSquadLeaderByActor(ctx context.Context, issue db.Issue, leaderID pgtype.UUID, squadID pgtype.UUID, actorUserID pgtype.UUID) (db.AgentTaskQueue, error) {
+	return s.enqueueMentionTask(ctx, issue, leaderID, pgtype.UUID{}, true, squadID, false, "", actorUserID, pgtype.UUID{})
+}
+
+// EnqueueTaskForSquadLeaderWithHandoff is the squad equivalent of
+// EnqueueTaskForIssueWithHandoff.
 func (s *TaskService) EnqueueTaskForSquadLeaderWithHandoff(ctx context.Context, issue db.Issue, leaderID pgtype.UUID, squadID pgtype.UUID, handoffNote string, actorUserID pgtype.UUID) (db.AgentTaskQueue, error) {
 	return s.enqueueMentionTask(ctx, issue, leaderID, pgtype.UUID{}, true, squadID, false, handoffNote, actorUserID, pgtype.UUID{})
 }
@@ -1441,73 +1481,6 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 	// See EnqueueTaskForIssue for ordering rationale.
 	s.broadcastTaskEvent(ctx, protocol.EventTaskQueued, task)
 	s.NotifyTaskEnqueued(ctx, task)
-	return task, nil
-}
-
-// EnqueueDeferredAssigneeFallback creates an inert task that becomes claimable
-// only after PromoteDueDeferredTasksForRuntime flips it from deferred to queued.
-func (s *TaskService) EnqueueDeferredAssigneeFallback(ctx context.Context, issue db.Issue, agentID, squadID pgtype.UUID, escalationForTaskID pgtype.UUID, triggerCommentID pgtype.UUID, fireAt time.Time) (db.AgentTaskQueue, error) {
-	agent, err := s.Queries.GetAgent(ctx, agentID)
-	if err != nil {
-		slog.Error("deferred fallback enqueue failed: agent not found", "issue_id", util.UUIDToString(issue.ID), "agent_id", util.UUIDToString(agentID), "error", err)
-		return db.AgentTaskQueue{}, fmt.Errorf("load agent: %w", err)
-	}
-	if agent.ArchivedAt.Valid {
-		slog.Debug("deferred fallback enqueue skipped: agent is archived", "issue_id", util.UUIDToString(issue.ID), "agent_id", util.UUIDToString(agentID))
-		return db.AgentTaskQueue{}, fmt.Errorf("agent is archived")
-	}
-	if !agent.RuntimeID.Valid {
-		slog.Error("deferred fallback enqueue failed: agent has no runtime", "issue_id", util.UUIDToString(issue.ID), "agent_id", util.UUIDToString(agentID))
-		return db.AgentTaskQueue{}, fmt.Errorf("agent has no runtime")
-	}
-
-	// The fallback assignee is reacting to the same trigger comment as the primary
-	// routed task, so resolve attribution from that comment (member author →
-	// direct_human; agent author → comment_source chain) and stamp it at creation.
-	// Promotion later only flips status, so stamping here keeps the eventual run
-	// off the NULL-source bypass (MUL-4302 §2). Overlay is intentionally left for
-	// the existing promotion path — this change is attribution-only. No direct
-	// actor here: the fallback is comment-routed, so attribution rides the comment.
-	attr := s.attributionForIssueTask(ctx, issue, triggerCommentID, attribution.SourceCommentSource, pgtype.UUID{})
-	// No precise human resolved → owner_fallback (accountable = agent owner), or
-	// refuse if the workspace is fail-closed (MUL-4302 §3.5).
-	attr, err = s.applyAttributionFallback(ctx, attr, agent)
-	if err != nil {
-		slog.Warn("deferred fallback enqueue refused: attribution fail-closed", "issue_id", util.UUIDToString(issue.ID), "agent_id", util.UUIDToString(agentID))
-		return db.AgentTaskQueue{}, err
-	}
-	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
-	isLeader := squadID.Valid
-	task, err := s.Queries.CreateDeferredAgentTask(ctx, db.CreateDeferredAgentTaskParams{
-		ID:                   dbid.NewV7(),
-		AgentID:              agentID,
-		RuntimeID:            agent.RuntimeID,
-		IssueID:              issue.ID,
-		Priority:             priorityToInt(issue.Priority),
-		TriggerCommentID:     triggerCommentID,
-		TriggerSummary:       s.buildCommentTriggerSummary(ctx, issue.WorkspaceID, triggerCommentID),
-		IsLeaderTask:         pgtype.Bool{Bool: isLeader, Valid: isLeader},
-		SquadID:              squadID,
-		EscalationForTaskID:  escalationForTaskID,
-		FireAt:               pgtype.Timestamptz{Time: fireAt, Valid: true},
-		OriginatorUserID:     attr.UserID,
-		AccountableUserID:    attr.AccountableUserID,
-		OriginatorSource:     attrSource,
-		DelegatedFromTaskID:  attrDelegatedFrom,
-		TriggerEvidenceKind:  attrEvidenceKind,
-		TriggerEvidenceRefID: attrEvidenceRef,
-	})
-	if err != nil {
-		slog.Error("deferred fallback enqueue failed", "issue_id", util.UUIDToString(issue.ID), "agent_id", util.UUIDToString(agentID), "error", err)
-		return db.AgentTaskQueue{}, fmt.Errorf("create deferred task: %w", err)
-	}
-
-	slog.Info("deferred fallback task enqueued",
-		"task_id", util.UUIDToString(task.ID),
-		"issue_id", util.UUIDToString(issue.ID),
-		"agent_id", util.UUIDToString(agentID),
-		"fire_at", fireAt.UTC().Format(time.RFC3339),
-	)
 	return task, nil
 }
 
@@ -2088,6 +2061,7 @@ func (s *TaskService) enqueueChatTaskTx(
 		if _, err := qtx.CreateChannelTaskDeliveryFromSession(
 			ctx, db.CreateChannelTaskDeliveryFromSessionParams{
 				TaskID: task.ID, ChatSessionID: chatSession.ID,
+				ContextRevision: contextRevision,
 			},
 		); err != nil {
 			return db.AgentTaskQueue{}, fmt.Errorf("snapshot channel task delivery: %w", err)
@@ -2766,6 +2740,15 @@ type CancelTaskResult struct {
 
 var ErrTaskNoLongerQueued = errors.New("task is no longer queued")
 
+// TaskCancellationActor is the point-in-time identity written onto a task when
+// an authenticated member or agent explicitly stops it. Automatic paths leave
+// this empty and the SQL transition records the system actor instead.
+type TaskCancellationActor struct {
+	Type string
+	ID   pgtype.UUID
+	Name string
+}
+
 // CancelTaskOptions carries what the caller knows about the client that asked
 // for the cancellation.
 type CancelTaskOptions struct {
@@ -2787,6 +2770,7 @@ type CancelTaskOptions struct {
 	// daemon log the user never sees.
 	ErrorMessage  string
 	FailureReason string
+	CancelledBy   TaskCancellationActor
 	// UserInitiated distinguishes the issue UI/API cancel action from automatic
 	// server repairs. An explicit user cancellation terminally acknowledges any
 	// delegated-failure recovery signal planned into the task; automatic
@@ -2815,9 +2799,10 @@ func (s *TaskService) CancelTask(ctx context.Context, taskID pgtype.UUID) (*db.A
 // automatic server cancellation, it terminally acknowledges any delegated-
 // failure recovery signal carried by the task so the sweeper respects the
 // user's decision instead of recreating the task.
-func (s *TaskService) CancelTaskByUser(ctx context.Context, taskID pgtype.UUID) (*db.AgentTaskQueue, error) {
+func (s *TaskService) CancelTaskByUser(ctx context.Context, taskID pgtype.UUID, actor TaskCancellationActor) (*db.AgentTaskQueue, error) {
 	result, err := s.CancelTaskWithResult(ctx, taskID, CancelTaskOptions{
 		ClientSupportsDraftRestore: true,
+		CancelledBy:                actor,
 		UserInitiated:              true,
 	})
 	if err != nil {
@@ -2853,9 +2838,17 @@ func (s *TaskService) CancelTaskWithResult(ctx context.Context, taskID pgtype.UU
 	// task running — the same wedge as GH #7098 on the fail/complete paths.
 	opts.ErrorMessage = util.SanitizeTextForPostgres(opts.ErrorMessage)
 	opts.FailureReason = util.SanitizeTextForPostgres(opts.FailureReason)
+	opts.CancelledBy.Name = util.SanitizeTextForPostgres(opts.CancelledBy.Name)
 
 	if opts.UserInitiated && (opts.ErrorMessage != "" || opts.FailureReason != "") {
 		return nil, errors.New("user-initiated cancellation cannot carry a server failure reason")
+	}
+	if opts.UserInitiated &&
+		(opts.CancelledBy.Type != "member" && opts.CancelledBy.Type != "agent") {
+		return nil, errors.New("user-initiated cancellation requires a member or agent actor")
+	}
+	if opts.UserInitiated && !opts.CancelledBy.ID.Valid {
+		return nil, errors.New("user-initiated cancellation requires an actor id")
 	}
 	var (
 		task                 db.AgentTaskQueue
@@ -2871,8 +2864,11 @@ func (s *TaskService) CancelTaskWithResult(ctx context.Context, taskID pgtype.UU
 				return fmt.Errorf("lock queued chat session: %w", err)
 			}
 			task, err = qtx.CancelQueuedAgentTask(ctx, db.CancelQueuedAgentTaskParams{
-				ID:            taskID,
-				ChatSessionID: opts.ExpectedChatSession,
+				ID:              taskID,
+				ChatSessionID:   opts.ExpectedChatSession,
+				CancelledByType: pgtype.Text{String: opts.CancelledBy.Type, Valid: opts.CancelledBy.Type != ""},
+				CancelledByID:   opts.CancelledBy.ID,
+				CancelledByName: pgtype.Text{String: opts.CancelledBy.Name, Valid: opts.CancelledBy.Name != ""},
 			})
 			if errors.Is(err, pgx.ErrNoRows) {
 				return ErrTaskNoLongerQueued
@@ -2897,7 +2893,12 @@ func (s *TaskService) CancelTaskWithResult(ctx context.Context, taskID pgtype.UU
 				err       error
 			)
 			if opts.UserInitiated {
-				cancelled, err = qtx.CancelAgentTaskByUser(ctx, taskID)
+				cancelled, err = qtx.CancelAgentTaskByUser(ctx, db.CancelAgentTaskByUserParams{
+					ID:              taskID,
+					CancelledByType: pgtype.Text{String: opts.CancelledBy.Type, Valid: true},
+					CancelledByID:   opts.CancelledBy.ID,
+					CancelledByName: pgtype.Text{String: opts.CancelledBy.Name, Valid: opts.CancelledBy.Name != ""},
+				})
 			} else if opts.ErrorMessage != "" || opts.FailureReason != "" {
 				cancelled, err = qtx.CancelAgentTaskWithReason(ctx, db.CancelAgentTaskWithReasonParams{
 					ID:            taskID,
@@ -3857,7 +3858,7 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 		return nil, fmt.Errorf("promote deferred tasks: %w", err)
 	}
 	for _, task := range promoted {
-		slog.Info("deferred fallback task promoted (batch)",
+		slog.Info("deferred task promoted (batch)",
 			"task_id", util.UUIDToString(task.ID),
 			"runtime_id", util.UUIDToString(task.RuntimeID),
 			"agent_id", util.UUIDToString(task.AgentID),
@@ -4051,7 +4052,7 @@ func (s *TaskService) PromoteDueDeferredTasksForRuntime(ctx context.Context, run
 		return fmt.Errorf("promote due deferred tasks: %w", err)
 	}
 	for _, task := range tasks {
-		slog.Info("deferred fallback task promoted",
+		slog.Info("deferred task promoted",
 			"task_id", util.UUIDToString(task.ID),
 			"runtime_id", util.UUIDToString(runtimeID),
 			"agent_id", util.UUIDToString(task.AgentID),
@@ -4093,7 +4094,6 @@ func (s *TaskService) StartTask(ctx context.Context, taskID pgtype.UUID) (*db.Ag
 		return nil, fmt.Errorf("start task: %w", err)
 	}
 	s.forgetTaskReclaim(task)
-	s.cancelDeferredEscalationsForTask(ctx, task.ID)
 
 	slog.Info("task started", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID))
 	s.captureTaskStarted(ctx, task)
@@ -4110,43 +4110,6 @@ func (s *TaskService) StartTask(ctx context.Context, taskID pgtype.UUID) (*db.Ag
 	// on the transition users care about most.
 	s.broadcastTaskEvent(ctx, protocol.EventTaskRunning, task)
 	return &task, nil
-}
-
-func (s *TaskService) cancelDeferredEscalationsForTask(ctx context.Context, taskID pgtype.UUID) {
-	cancelled, err := s.Queries.CancelDeferredEscalationsForTask(ctx, taskID)
-	if err != nil {
-		slog.Warn("cancel deferred escalations for task failed", "task_id", util.UUIDToString(taskID), "error", err)
-		return
-	}
-	for _, task := range cancelled {
-		slog.Info("deferred fallback task cancelled",
-			"task_id", util.UUIDToString(task.ID),
-			"primary_task_id", util.UUIDToString(taskID),
-			"reason", "primary_acknowledged",
-		)
-	}
-}
-
-func (s *TaskService) CancelDeferredEscalationsForIssueAgent(ctx context.Context, issueID, agentID pgtype.UUID) {
-	cancelled, err := s.Queries.CancelDeferredEscalationsForIssueAgent(ctx, db.CancelDeferredEscalationsForIssueAgentParams{
-		IssueID: issueID,
-		AgentID: agentID,
-	})
-	if err != nil {
-		slog.Warn("cancel deferred escalations for issue agent failed",
-			"issue_id", util.UUIDToString(issueID),
-			"agent_id", util.UUIDToString(agentID),
-			"error", err)
-		return
-	}
-	for _, task := range cancelled {
-		slog.Info("deferred fallback task cancelled",
-			"task_id", util.UUIDToString(task.ID),
-			"issue_id", util.UUIDToString(issueID),
-			"agent_id", util.UUIDToString(agentID),
-			"reason", "agent_comment_acknowledged",
-		)
-	}
 }
 
 // ExtendTaskPrepareLease keeps a claimed-but-not-started task protected while
@@ -5264,9 +5227,10 @@ func hasRunnableSuccessor(ctx context.Context, q *db.Queries, task db.AgentTaskQ
 	if !task.IssueID.Valid {
 		return false, nil
 	}
-	return q.HasPendingTaskForIssueAndAgent(ctx, db.HasPendingTaskForIssueAndAgentParams{
-		IssueID: task.IssueID,
-		AgentID: task.AgentID,
+	return q.HasPendingTaskForIssueAndAgentInThread(ctx, db.HasPendingTaskForIssueAndAgentInThreadParams{
+		ThreadCommentID: task.TriggerCommentID,
+		IssueID:         task.IssueID,
+		AgentID:         task.AgentID,
 	})
 }
 
@@ -5590,9 +5554,10 @@ func (s *TaskService) RerunIssue(ctx context.Context, issueID pgtype.UUID, sourc
 		// that failed after this committed.
 		cerr := s.runInTx(ctx, func(qtx *db.Queries) error {
 			var err error
-			cancelled, err = qtx.CancelPendingTasksByIssueAndAgent(ctx, db.CancelPendingTasksByIssueAndAgentParams{
-				IssueID: issueID,
-				AgentID: agentID,
+			cancelled, err = qtx.CancelPendingTasksByIssueAndAgentInThread(ctx, db.CancelPendingTasksByIssueAndAgentInThreadParams{
+				ThreadCommentID: triggerCommentID,
+				IssueID:         issueID,
+				AgentID:         agentID,
 			})
 			if err != nil {
 				return err
@@ -5777,13 +5742,24 @@ func (s *TaskService) RecoverOrphanedTasksForRuntime(ctx context.Context, runtim
 // CancelTasksForArchivedAgent cancels every active task belonging to an agent
 // being archived and settles their recovery receipts in the same transaction.
 //
-// Unlike CancelTasksForAgent it emits no per-task task:cancelled event: the
-// agent:archived event the caller publishes already invalidates every client's
-// active-task view, so per-row events would be redundant noise.
+// After commit, cancellation side effects are captured before chat tasks emit
+// task:cancelled so existing consumers can clear processing indicators, release
+// streams, and refresh chat state. The caller still publishes agent:archived;
+// non-chat tasks keep their existing behavior.
 func (s *TaskService) CancelTasksForArchivedAgent(ctx context.Context, agentID pgtype.UUID) ([]db.AgentTaskQueue, error) {
-	return s.terminateTasksInTx(ctx, func(qtx *db.Queries) ([]db.AgentTaskQueue, error) {
+	cancelled, err := s.terminateTasksInTx(ctx, func(qtx *db.Queries) ([]db.AgentTaskQueue, error) {
 		return qtx.CancelAgentTasksByAgent(ctx, agentID)
 	})
+	if err != nil {
+		return nil, err
+	}
+	s.CaptureCancelledTasks(ctx, cancelled)
+	for _, task := range cancelled {
+		if task.ChatSessionID.Valid {
+			s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, task)
+		}
+	}
+	return cancelled, nil
 }
 
 func (s *TaskService) terminateTasksInTx(ctx context.Context, fail func(*db.Queries) ([]db.AgentTaskQueue, error)) ([]db.AgentTaskQueue, error) {
@@ -6631,12 +6607,12 @@ func (s *TaskService) skillsWithFiles(ctx context.Context, skills []db.Skill) ([
 // It fails closed on a workspace-skill read error for the reason in
 // LoadAgentSkills: a bundle set built from a partial read is indistinguishable
 // from a correct one.
-func (s *TaskService) LoadAgentSkillBundles(ctx context.Context, agentID pgtype.UUID) ([]AgentSkillData, []AgentSkillRefData, error) {
+func (s *TaskService) LoadAgentSkillBundles(ctx context.Context, agentID pgtype.UUID, agentSystemKey string, legacyRedirects bool) ([]AgentSkillData, []AgentSkillRefData, error) {
 	skills, err := s.LoadAgentSkills(ctx, agentID)
 	if err != nil {
 		return nil, nil, err
 	}
-	skills = append(skills, s.BuiltinSkills()...)
+	skills = append(skills, s.BuiltinSkills(agentSystemKey, legacyRedirects)...)
 	bundles, refs := BuildAgentSkillBundles(skills)
 	return bundles, refs, nil
 }
@@ -6717,7 +6693,8 @@ func (s *TaskService) LoadRequestedAgentSkillBundles(ctx context.Context, agentI
 		}
 	}
 	if len(wantBuiltin) > 0 {
-		for _, builtin := range s.BuiltinSkills() {
+		// Every built-in, not the agent-scoped subset — see AllBuiltinSkills.
+		for _, builtin := range s.AllBuiltinSkills() {
 			if _, ok := wantBuiltin[BuiltinSkillID(builtin.Name)]; ok {
 				requested = append(requested, builtin)
 			}
@@ -7039,27 +7016,74 @@ func (s *TaskService) broadcastTaskFailedEvent(ctx context.Context, task db.Agen
 	s.publishTaskFailedEvent(workspaceID, task, errMsg, failureReason, retryPending)
 }
 
-// ResolveTaskWorkspaceID determines the workspace ID for a task.
-// For issue tasks, it comes from the issue. For chat tasks, from the chat session.
-// For autopilot tasks, from the autopilot via its run.
-// Returns "" when none of the links resolve — callers treat that as "not found".
+// ResolveTaskWorkspaceID determines the workspace ID for a task, best-effort.
+// Returns "" when the workspace could not be determined, whether because the
+// link target is genuinely gone or because a lookup failed.
+//
+// Use this only where "" is an acceptable answer — event broadcasts skip
+// themselves rather than fabricating a workspace. Anything that turns the
+// result into an HTTP status MUST use ResolveTaskWorkspaceIDChecked instead:
+// collapsing both cases to "" is what let a transient DB error be reported to
+// the daemon as `404 task not found`, which it acts on by killing a healthy
+// run (MUL-7259 / GH #8272).
 func (s *TaskService) ResolveTaskWorkspaceID(ctx context.Context, task db.AgentTaskQueue) string {
-	if task.IssueID.Valid {
-		if issue, err := s.Queries.GetIssue(ctx, task.IssueID); err == nil {
-			return util.UUIDToString(issue.WorkspaceID)
+	workspaceID, _ := s.ResolveTaskWorkspaceIDChecked(ctx, task)
+	return workspaceID
+}
+
+// ResolveTaskWorkspaceIDChecked resolves a task's workspace and keeps the two
+// failure modes apart:
+//
+//   - ("", nil)  — every link this task carries was looked up successfully and
+//     the target is genuinely absent. The task is unreachable; a 404 is honest.
+//   - ("", err)  — a lookup could not be completed (DB timeout, pool exhaustion,
+//     …). We do not know whether the task is reachable, and the caller must NOT
+//     report absence. This is a 5xx.
+//
+// For issue tasks the workspace comes from the issue, for chat tasks from the
+// chat session, for autopilot tasks from the autopilot via its run, and for
+// quick-create tasks from the context JSONB (they carry no link at all).
+//
+// A failed lookup does not stop the walk. If a later link resolves, its
+// workspace is returned and the earlier error is dropped, because that answer
+// is still trustworthy; the error is surfaced only when nothing resolved. That
+// keeps a task carrying several links working during a partial outage while
+// still refusing to call an unknown state "not found".
+func (s *TaskService) ResolveTaskWorkspaceIDChecked(ctx context.Context, task db.AgentTaskQueue) (string, error) {
+	// isNotFound is the "genuinely absent" signal; every other error means the
+	// lookup itself did not complete. pgx.ErrNoRows is the only error the
+	// queries below use to say "this row does not exist".
+	var lookupErr error
+	note := func(err error) {
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) && lookupErr == nil {
+			lookupErr = err
 		}
+	}
+
+	if task.IssueID.Valid {
+		issue, err := s.Queries.GetIssue(ctx, task.IssueID)
+		if err == nil {
+			return util.UUIDToString(issue.WorkspaceID), nil
+		}
+		note(err)
 	}
 	if task.ChatSessionID.Valid {
-		if cs, err := s.Queries.GetChatSession(ctx, task.ChatSessionID); err == nil {
-			return util.UUIDToString(cs.WorkspaceID)
+		cs, err := s.Queries.GetChatSession(ctx, task.ChatSessionID)
+		if err == nil {
+			return util.UUIDToString(cs.WorkspaceID), nil
 		}
+		note(err)
 	}
 	if task.AutopilotRunID.Valid {
-		if run, err := s.Queries.GetAutopilotRun(ctx, task.AutopilotRunID); err == nil {
-			if ap, err := s.Queries.GetAutopilot(ctx, run.AutopilotID); err == nil {
-				return util.UUIDToString(ap.WorkspaceID)
+		run, err := s.Queries.GetAutopilotRun(ctx, task.AutopilotRunID)
+		if err == nil {
+			ap, apErr := s.Queries.GetAutopilot(ctx, run.AutopilotID)
+			if apErr == nil {
+				return util.UUIDToString(ap.WorkspaceID), nil
 			}
+			note(apErr)
 		}
+		note(err)
 	}
 	// Quick-create tasks have no issue / chat / autopilot link — workspace
 	// lives in the context JSONB. Returning "" here is what blocked
@@ -7067,9 +7091,12 @@ func (s *TaskService) ResolveTaskWorkspaceID(ctx context.Context, task db.AgentT
 	// for the daemon) and silently dropped task:dispatch / task:completed
 	// broadcasts, which is why quick-create tasks appeared stuck queued.
 	if qc, ok := s.parseQuickCreateContext(task); ok {
-		return qc.WorkspaceID
+		return qc.WorkspaceID, nil
 	}
-	return ""
+	if lookupErr != nil {
+		return "", fmt.Errorf("resolve task workspace: %w", lookupErr)
+	}
+	return "", nil
 }
 
 func (s *TaskService) broadcastChatDone(ctx context.Context, task db.AgentTaskQueue, msg *db.ChatMessage, quickActionsPending bool) {
@@ -7207,7 +7234,6 @@ func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID p
 		return
 	}
 	comment := created.Comment()
-	s.CancelDeferredEscalationsForIssueAgent(ctx, issueID, agentID)
 	commentFields := commentEventFields(comment)
 	commentFields["revision"] = comment.Revision
 	s.Bus.Publish(events.Event{
@@ -7492,11 +7518,12 @@ func (s *TaskService) notifyQuickCreateCompleted(ctx context.Context, task db.Ag
 		return
 	}
 
-	// Link the new issue back to this task so subsequent reads of the task
-	// (Activity tab, Recent work, etc.) render it as a normal issue task
-	// (kind = "direct") instead of staying on the "Creating issue" active-
-	// wording label. Best-effort: a write failure here doesn't block the
-	// inbox notification, which is the more important signal to the user.
+	// Link the new issue back to this task so subsequent reads (Activity tab,
+	// Recent work, etc.) can navigate to the result instead of leaving it on
+	// the "Creating issue" active wording. The task's source kind remains
+	// quick_create, derived from its typed context. Best-effort: a write failure
+	// here doesn't block the inbox notification, which is the more important
+	// signal to the user.
 	if err := s.Queries.LinkTaskToIssue(ctx, db.LinkTaskToIssueParams{
 		ID:      task.ID,
 		IssueID: issue.ID,

@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
 	"go/ast"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"strings"
 	"testing"
@@ -70,6 +72,15 @@ import (
 //
 // A nil pool is deliberate: nothing in the WeCom boot block queries the
 // database, and metrics_test.go boots the same way.
+// routerSourceFile is the file these wiring tests parse. It used to live in
+// wecom_media_allow_wiring_test.go, which upstream removed in #7932 as
+// implementation-only coverage; the tests that still parse the router keep the
+// constant here.
+const routerSourceFile = "router.go"
+
+// wecomMediaAllowEnv came from the same removed file as the helpers below.
+const wecomMediaAllowEnv = "MULTICA_WECOM_MEDIA_ALLOW_CIDRS"
+
 func TestWecomBootWiringSubscribesExactlyOnce(t *testing.T) {
 	key := make([]byte, secretbox.KeySize)
 	if _, err := rand.Read(key); err != nil {
@@ -396,4 +407,38 @@ func selectorName(call *ast.CallExpr) string {
 		return sel.Sel.Name
 	}
 	return ""
+}
+
+// The three AST helpers below used to live in main_test.go and in
+// wecom_media_allow_wiring_test.go, both of which upstream removed in #7932.
+// The wiring tests that still parse router.go keep them here.
+// exprText renders an expression back to source for error messages.
+func exprText(fset *token.FileSet, expr ast.Expr) string {
+	var buf bytes.Buffer
+	if err := printer.Fprint(&buf, fset, expr); err != nil {
+		return "<unprintable expression>"
+	}
+	return buf.String()
+}
+
+// calleeName renders a call's target as "pkg.Func" or "Func" for matching.
+func calleeName(call *ast.CallExpr) string {
+	switch fn := call.Fun.(type) {
+	case *ast.Ident:
+		return fn.Name
+	case *ast.SelectorExpr:
+		if pkg, ok := fn.X.(*ast.Ident); ok {
+			return pkg.Name + "." + fn.Sel.Name
+		}
+		return fn.Sel.Name
+	}
+	return ""
+}
+
+func stringLit(e ast.Expr) string {
+	lit, ok := e.(*ast.BasicLit)
+	if !ok || lit.Kind != token.STRING || len(lit.Value) < 2 {
+		return ""
+	}
+	return lit.Value[1 : len(lit.Value)-1]
 }

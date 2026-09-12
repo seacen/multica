@@ -754,7 +754,7 @@ func (m *TypingIndicatorManager) handleTaskFailed(e events.Event) {
 		if m.senders == nil {
 			return
 		}
-		m.writeClosing(ctx, sessionID, t.Handle, copyFor(t.Handle.Locale).StreamFailed, "task failed")
+		m.writeClosing(ctx, sessionID, t.Handle, failureText(e, t.Handle.Locale), "task failed")
 		return
 	}
 	// No bubble to write into: the round was never painted, or its stream has
@@ -767,7 +767,23 @@ func (m *TypingIndicatorManager) handleTaskFailed(e events.Event) {
 		bound = found
 	}
 	m.sayAsPlainMessage(ctx, sessionID, bound,
-		copyFor(localeFor(ctx, m.languages, bound.InstallationID, bound.ChatType, bound.ChatID)).StreamFailed)
+		failureText(e, localeFor(ctx, m.languages, bound.InstallationID, bound.ChatType, bound.ChatID)))
+}
+
+// failureText is what a failed run says in the chat.
+//
+// The platform's own redacted reason when it published one — that is the text
+// the web transcript shows and the one #7952 established for this channel,
+// and "上下文超出模型限制" tells a person what to do next where a generic line
+// does not. The copy pack's StreamFailed is the fallback for a failure that
+// arrived without a reason, and for retry_pending, which taskFailedContent
+// reports as empty because an attempt the platform is already retrying is not
+// an ending.
+func failureText(e events.Event, l Locale) string {
+	if reason := taskFailedContent(e.Payload); reason != "" {
+		return reason
+	}
+	return copyFor(l).StreamFailed
 }
 
 // failureBelongsOnWecom asks where this run's input came from: the channel, or

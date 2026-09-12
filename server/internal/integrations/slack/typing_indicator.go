@@ -230,9 +230,10 @@ func (m *TypingIndicatorManager) apiForInstallation(ctx context.Context, id pgty
 // just deleted, and an event with no workspace is dropped before it reaches the
 // bus. It now takes the workspace from its caller.
 //
-// One hole is left, and it is not a missing subscription.
+// Archiving an agent also publishes task:cancelled for its chat tasks after
+// commit, so these reactions are cleared through the same subscription.
 //
-// An ending that arrives while the reaction is still being added clears
+// An ending during Add can still clear
 // nothing: Add records its state only after the Slack call returns, so Clear
 // finds an empty map, and the reaction lands after it with nothing left to take
 // it off. The Router adds on a detached goroutine, so a cancelled or very fast

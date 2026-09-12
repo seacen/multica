@@ -137,9 +137,16 @@ type relaySendRig struct {
 // relayRetryConfig is a whole retry chain measured in milliseconds, so a test
 // can watch one run out. LeaseSettle/RetryBackoff are the only two knobs the
 // chain is built from, and retryPlan is asked for the length rather than told.
-var relayRetryConfig = RelayConfig{Shards: 1, LeaseSettle: 40 * time.Millisecond, RetryBackoff: 5 * time.Millisecond}
+var relayRetryConfig = RelayConfig{Shards: 1, LeaseSettle: 40 * time.Millisecond, RetryBackoff: 5 * time.Millisecond, DeliveryBudget: 20 * time.Millisecond}
 
 func newRelaySendRig(t *testing.T, failOn func(n int) bool) *relaySendRig {
+	t.Helper()
+	return newRelaySendRigWithDedupe(t, failOn, nil)
+}
+
+// newRelaySendRigWithDedupe is the rig with a claim store, for the paths the
+// claim gate takes part in.
+func newRelaySendRigWithDedupe(t *testing.T, failOn func(n int) bool, dedupe DedupeStore) *relaySendRig {
 	t.Helper()
 	reg := newSendersRegistry()
 	instID := mustTestUUID(t)
@@ -152,7 +159,7 @@ func newRelaySendRig(t *testing.T, failOn func(n int) bool) *relaySendRig {
 
 	// No dedupe store: that is the single-replica claim gate, and it leaves the
 	// retry chain — the thing under test — exactly as it is in production.
-	router := NewRelayOutbound(&fanoutRelay{}, nil, relayRetryConfig, testLogger())
+	router := NewRelayOutbound(&fanoutRelay{}, dedupe, relayRetryConfig, testLogger())
 	router.SetMetrics(mx)
 	router.Attach(o)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -181,6 +188,10 @@ func (r *relaySendRig) route(t *testing.T, content string) {
 	}
 	r.router.DeliverWecomOutbound(util.UUIDToString(r.instID), body, "ev-1")
 }
+
+// lastEventID is the id route hands every frame, which is what its claim is
+// keyed on.
+func (r *relaySendRig) lastEventID() string { return "ev-1" }
 
 // stop cancels the dispatcher and waits for it, which drains whatever is parked
 // waiting out a backoff. Used where the assertion is that NOTHING is parked:
@@ -268,6 +279,191 @@ func TestRelayedReply_ARetryThatSucceedsIsNotAlsoADrop(t *testing.T) {
 // 2. a re-offer must not repeat what the user already read
 // ---------------------------------------------------------------------------
 
+// A release whose result is UNKNOWN — the DEL never reached the server, the
+// key still holds this replica's token — is not a verdict. The next offer's
+// Claim finds its own token and re-takes the claim, the delivery runs again,
+// and the reply ends with one record: delivered.
+//
+// REVERSE VERIFICATION: make Claim refuse a key that holds the caller's own
+// token (drop the `v == ARGV[1]` / `v == token` branch) and this fails: every
+// re-offer loses the claim and nothing is ever delivered or counted.
+func TestRelayedReply_AReleaseWhoseResultIsUnknownIsReclaimedByTheNextOffer(t *testing.T) {
+	t.Parallel()
+	dedupe := newSharedDedupe()
+	dedupe.releaseFails = true // the DEL never lands; the key keeps our token
+	rig := newRelaySendRigWithDedupe(t, func(n int) bool { return n == 1 }, dedupe)
+
+	rig.route(t, "the agent reply")
+	waitFor(t, "the re-offer to deliver", func() bool {
+		return rig.mx.get("outbound_delivered") == 1
+	})
+	time.Sleep(rig.router.outcomeGrace())
+
+	if got := rig.mx.get("outbound_dropped"); got != 0 {
+		t.Fatalf("outbound_dropped = %d, want 0: an unknown release is not a loss", got)
+	}
+	if got := rig.conn.writeAttempts(); got != 2 {
+		t.Fatalf("%d offers, want 2: the failed one and the re-claimed one", got)
+	}
+	if dedupe.heldCount() != 1 || dedupe.valueOf(dedupeKey(rig.lastEventID())) != claimSettledValue {
+		t.Fatalf("claim store holds %d key(s) with value %q, want the one key settled by its holder",
+			dedupe.heldCount(), dedupe.valueOf(dedupeKey(rig.lastEventID())))
+	}
+}
+
+// The other face of an unknown release: the DEL DID land and only its response
+// was lost. The key is gone, the next offer's Claim takes it fresh, and the
+// reply again ends with exactly one record. Nothing was recorded on the
+// strength of the error — that is the whole point.
+//
+// REVERSE VERIFICATION: record a drop on a Release error in perform (the
+// round-2 shape) and this fails with outbound_dropped = 1 beside
+// outbound_delivered = 1.
+func TestRelayedReply_AReleaseThatLandedButErroredIsTakenFreshByTheNextOffer(t *testing.T) {
+	t.Parallel()
+	dedupe := newSharedDedupe()
+	dedupe.releaseErrAfterDelete = true
+	rig := newRelaySendRigWithDedupe(t, func(n int) bool { return n == 1 }, dedupe)
+
+	rig.route(t, "the agent reply")
+	waitFor(t, "the re-offer to deliver", func() bool {
+		return rig.mx.get("outbound_delivered") == 1
+	})
+	time.Sleep(rig.router.outcomeGrace())
+
+	if got := rig.mx.get("outbound_dropped"); got != 0 {
+		t.Fatalf("outbound_dropped = %d, want 0", got)
+	}
+	if got := rig.conn.writeAttempts(); got != 2 {
+		t.Fatalf("%d offers, want 2", got)
+	}
+}
+
+// The boundary the settle retry deliberately stops at, pinned so it can only
+// move on purpose.
+//
+// Every attempt here executes the settle and loses its answer, so the store
+// ends up settled while the holder never learns it did. The holder cannot tell
+// that from a settle that never ran, and the two want opposite records — so it
+// makes none. What the user got is unaffected: the reply reached the chat
+// once, and an unconfirmed settle never re-sends it.
+//
+// This is the accepted cost of not double-counting the far more common case
+// where the settles never landed and the publisher ends the reply itself
+// (TestTwoReplicas_ASettleNobodyCanCompleteIsEndedOnceByThePublisher covers
+// that side, publisher included). A store failing this way this long is a
+// monitoring gap, not a lost answer, and settleClaim logs a warning naming it.
+func TestRelayedReply_ASettleThatNeverConfirmsLeavesTheOutcomeUnrecorded(t *testing.T) {
+	t.Parallel()
+	dedupe := newSharedDedupe()
+	dedupe.settleErrAfterWrite = claimSettleAttempts
+	rig := newRelaySendRigWithDedupe(t, nil, dedupe)
+
+	rig.route(t, "the agent reply")
+	waitFor(t, "the settled state the holder never gets to hear about", func() bool {
+		return dedupe.valueOf(dedupeKey(rig.lastEventID())) == claimSettledValue
+	})
+	time.Sleep(rig.router.outcomeGrace())
+
+	if got := rig.conn.writeAttempts(); got != 1 {
+		t.Fatalf("%d offers, want 1: the reply reached the chat, and an unconfirmed settle must not re-send it", got)
+	}
+	if got := rig.mx.get("outbound_delivered") + rig.mx.get("outbound_dropped"); got != 0 {
+		t.Fatalf("the holder recorded %d outcome(s), want 0: it cannot know whether its settle landed", got)
+	}
+}
+
+// A settle whose request never reached the store is retried, and the retry
+// settles it. The holder records once — no reliance on the publisher, which
+// would have counted this delivered reply as a drop.
+//
+// REVERSE VERIFICATION: drop the retry loop from settleClaim and this fails
+// with outbound_delivered = 0.
+func TestRelayedReply_ASettleThatNeverExecutedIsRetried(t *testing.T) {
+	t.Parallel()
+	dedupe := newSharedDedupe()
+	dedupe.settleErrBeforeWrite = 1
+	rig := newRelaySendRigWithDedupe(t, nil, dedupe)
+
+	rig.route(t, "the agent reply")
+	waitFor(t, "the delivery to be recorded after the settle retry", func() bool {
+		return rig.mx.get("outbound_delivered") == 1
+	})
+	time.Sleep(rig.router.outcomeGrace())
+
+	if got := rig.mx.get("outbound_delivered"); got != 1 {
+		t.Fatalf("outbound_delivered = %d, want 1", got)
+	}
+	if got := rig.mx.get("outbound_dropped"); got != 0 {
+		t.Fatalf("outbound_dropped = %d, want 0", got)
+	}
+	if got := rig.conn.writeAttempts(); got != 1 {
+		t.Fatalf("%d offers, want 1: a settle retry is not a re-delivery", got)
+	}
+	if v := dedupe.valueOf(dedupeKey(rig.lastEventID())); v != claimSettledValue {
+		t.Fatalf("claim value = %q, want %q", v, claimSettledValue)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 4. the reader's language survives the relay
+// ---------------------------------------------------------------------------
+
+// deliverRelayed is the SECOND caller of attachmentTarget, and the locale is a
+// field the caller fills while it still holds a context to read a profile with
+// (outbound_media.go). Leaving it zero is not "unset": copyFor falls through to
+// the deployment's own language, so the same person reads the same failure in
+// Chinese or English depending on which replica held the socket.
+//
+// Driven through deliverRelayed rather than by building the target by hand —
+// the wiring IS the defect, and a hand-built target would test the pack.
+//
+// REVERSE VERIFICATION: delete the Locale line from deliverRelayed's
+// attachmentTarget and the english subtest reports the Chinese notice. Build
+// and vet stay silent: the field is simply left at its zero value.
+func TestRelayedAttachmentFailureNoticeReadsTheDestinationsLanguage(t *testing.T) {
+	t.Parallel()
+	for _, tc := range localeCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			q := oneAttachmentQueries(t, db.Attachment{
+				ID: mustTestUUID(t), Filename: "big.bin", Url: "https://cdn.example/obj/bin",
+			})
+			// A 1:1 with the asker, so their own profile answers.
+			q.userLanguage = tc.language
+			q.userBindingID = localeTestUserID
+
+			o, instID, conn := newOutboundWithMedia(t, q, &fakeObjectStore{key: "obj/bin", data: []byte("DATA")})
+			conn.refuse[cmdUploadMediaInit] = 40058 // the server will not take the file
+
+			o.deliverRelayed(context.Background(), relayFrame{
+				Kind:           relayKindReply,
+				InstallationID: util.UUIDToString(instID),
+				ChatID:         "T-asker",
+				ChatType:       chatTypeSingleInt,
+				Content:        "See the attached dump.",
+				MessageID:      testMessageID,
+				WorkspaceID:    testWorkspaceID,
+				SessionID:      testSessionID,
+				TaskID:         testTaskID,
+				CarriesFiles:   true,
+			})
+
+			got := markdownSends(t, conn)
+			want := copyPacks[tc.locale].MediaSendFailed
+			if len(got) == 0 || got[len(got)-1] != want {
+				t.Fatalf("sends = %q, want the %s failure notice %q last — the relayed path "+
+					"has to resolve the reader's language the same way the local one does",
+					got, tc.locale, want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 2. a re-offer must not repeat what the user already read
+// ---------------------------------------------------------------------------
+
 // An answer past the 20480-byte cap leaves as several aibot_send_msg frames
 // (splitForWire). When a later piece fails, the earlier ones are already in the
 // chat — so the SEND is not provably unsent, whatever the failing frame alone
@@ -340,7 +536,7 @@ func TestRelayedReply_WhitespaceOnlyContentIsNotSentAndTheFilesCarryTheReply(t *
 		WithOutboundMetrics(mx), WithAttachments(&fakeObjectStore{key: "obj/bin", data: []byte("DATA")}))
 	o.spawn = func(f func()) { f() }
 
-	outcome := o.deliverRelayed(context.Background(), relayFrame{
+	res := o.deliverRelayed(context.Background(), relayFrame{
 		Kind:           relayKindReply,
 		InstallationID: util.UUIDToString(instID),
 		ChatID:         "CHAT_1",
@@ -352,8 +548,8 @@ func TestRelayedReply_WhitespaceOnlyContentIsNotSentAndTheFilesCarryTheReply(t *
 		TaskID:         testTaskID,
 		CarriesFiles:   true,
 	})
-	if outcome != outcomeDone {
-		t.Fatalf("outcome = %v, want outcomeDone", outcome)
+	if res.outcome != outcomeDone {
+		t.Fatalf("outcome = %v, want outcomeDone", res.outcome)
 	}
 
 	if got := markdownSends(t, conn); len(got) != 0 {
@@ -366,60 +562,5 @@ func TestRelayedReply_WhitespaceOnlyContentIsNotSentAndTheFilesCarryTheReply(t *
 	if got := mx.get("outbound_skipped:" + string(skipNothingToSay)); got != 1 {
 		t.Errorf("outbound_skipped:%s = %d, want 1 — with no words, the files carry this "+
 			"reply's outcome, and there turned out to be none", skipNothingToSay, got)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// 4. the reader's language survives the relay
-// ---------------------------------------------------------------------------
-
-// deliverRelayed is the SECOND caller of attachmentTarget, and the locale is a
-// field the caller fills while it still holds a context to read a profile with
-// (outbound_media.go). Leaving it zero is not "unset": copyFor falls through to
-// the deployment's own language, so the same person reads the same failure in
-// Chinese or English depending on which replica held the socket.
-//
-// Driven through deliverRelayed rather than by building the target by hand —
-// the wiring IS the defect, and a hand-built target would test the pack.
-//
-// REVERSE VERIFICATION: delete the Locale line from deliverRelayed's
-// attachmentTarget and the english subtest reports the Chinese notice. Build
-// and vet stay silent: the field is simply left at its zero value.
-func TestRelayedAttachmentFailureNoticeReadsTheDestinationsLanguage(t *testing.T) {
-	t.Parallel()
-	for _, tc := range localeCases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			q := oneAttachmentQueries(t, db.Attachment{
-				ID: mustTestUUID(t), Filename: "big.bin", Url: "https://cdn.example/obj/bin",
-			})
-			// A 1:1 with the asker, so their own profile answers.
-			q.userLanguage = tc.language
-			q.userBindingID = localeTestUserID
-
-			o, instID, conn := newOutboundWithMedia(t, q, &fakeObjectStore{key: "obj/bin", data: []byte("DATA")})
-			conn.refuse[cmdUploadMediaInit] = 40058 // the server will not take the file
-
-			o.deliverRelayed(context.Background(), relayFrame{
-				Kind:           relayKindReply,
-				InstallationID: util.UUIDToString(instID),
-				ChatID:         "T-asker",
-				ChatType:       chatTypeSingleInt,
-				Content:        "See the attached dump.",
-				MessageID:      testMessageID,
-				WorkspaceID:    testWorkspaceID,
-				SessionID:      testSessionID,
-				TaskID:         testTaskID,
-				CarriesFiles:   true,
-			})
-
-			got := markdownSends(t, conn)
-			want := copyPacks[tc.locale].MediaSendFailed
-			if len(got) == 0 || got[len(got)-1] != want {
-				t.Fatalf("sends = %q, want the %s failure notice %q last — the relayed path "+
-					"has to resolve the reader's language the same way the local one does",
-					got, tc.locale, want)
-			}
-		})
 	}
 }

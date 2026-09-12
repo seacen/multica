@@ -92,10 +92,12 @@ function ListRowContent({
           className="relative flex shrink-0 items-center justify-center w-4 h-4"
           {...checkboxProps}
         >
-          <PriorityIcon
-            priority={issue.priority}
-            className={selected ? "hidden" : "group-hover/row:hidden"}
-          />
+          {storeProperties.priority && issue.priority !== "none" && (
+            <PriorityIcon
+              priority={issue.priority}
+              className={selected ? "hidden" : "group-hover/row:hidden"}
+            />
+          )}
           <input
             type="checkbox"
             checked={selected}
@@ -110,7 +112,7 @@ function ListRowContent({
           newTabTitle={issue.identifier}
           className={`flex flex-1 items-center gap-2 min-w-0 ${isDragging ? "pointer-events-none" : ""}`}
         >
-          <span className="w-16 shrink-0 text-caption text-muted-foreground">
+          <span className="min-w-16 shrink-0 text-caption text-muted-foreground">
             {issue.identifier}
           </span>
           <IssueAgentActivityIndicator issueId={issue.id} />

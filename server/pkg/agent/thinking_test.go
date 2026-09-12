@@ -142,19 +142,6 @@ func TestProjectClaudeLevels_PerModelSubset(t *testing.T) {
 //     binary on PATH and verifies that what *actually* reaches the
 //     process matches the pinned argv, not just what the var holds.
 
-func TestCodexDebugModelsArgs_Pinned(t *testing.T) {
-	t.Parallel()
-	want := []string{"debug", "models", "--bundled"}
-	if !reflect.DeepEqual(codexDebugModelsArgs, want) {
-		t.Fatalf("codexDebugModelsArgs drifted: got %v, want %v", codexDebugModelsArgs, want)
-	}
-	for _, arg := range codexDebugModelsArgs {
-		if arg == "--output" || arg == "-o" {
-			t.Errorf("--output / -o leaked back into argv (codex CLI does not accept it): %v", codexDebugModelsArgs)
-		}
-	}
-}
-
 // TestRunCodexDebugModels_ArgvSeenByBinary executes runCodexDebugModels
 // against a shell-script stand-in for `codex` that records its argv to
 // a file and prints a minimal valid JSON payload. The check is on what
@@ -290,6 +277,12 @@ func TestParseCodexModelCatalog(t *testing.T) {
 				"display_name": "No Reasoning",
 				"visibility": "list",
 				"supported_reasoning_levels": []
+			},
+			{
+				"slug": "gpt-6-astra",
+				"display_name": "GPT-6-Astra",
+				"visibility": "list",
+				"supported_reasoning_levels": []
 			}
 		]
 	}`)
@@ -297,8 +290,8 @@ func TestParseCodexModelCatalog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseCodexModelCatalog: %v", err)
 	}
-	if len(got) != 4 {
-		t.Fatalf("expected four visible models, got %+v", got)
+	if len(got) != 5 {
+		t.Fatalf("expected five visible models, got %+v", got)
 	}
 	if got[0].ID != "gpt-5.6-sol" || got[0].Label != "GPT-5.6 Sol" || !got[0].Default {
 		t.Errorf("unexpected first model: %+v", got[0])
@@ -310,6 +303,7 @@ func TestParseCodexModelCatalog(t *testing.T) {
 		{"gpt-5.6-sol", "GPT-5.6 Sol"},
 		{"gpt-5.6-terra", "GPT-5.6 Terra"},
 		{"gpt-5.6-luna", "GPT-5.6 Luna"},
+		{"gpt-6-astra", "GPT-6 Astra"},
 	} {
 		var found *Model
 		for i := range got {
@@ -380,7 +374,7 @@ echo '{"models":[{"slug":"runtime-model","display_name":"Runtime Model","visibil
 		writeTestExecutable(t, fake, []byte(script))
 
 		got := discoverCodexModels(context.Background(), Command{Path: fake})
-		if len(got) == 0 || got[0].ID != "gpt-5.6-sol" {
+		if len(got) == 0 || got[0].ID != "gpt-6-astra" {
 			t.Fatalf("expected static fallback, got %+v", got)
 		}
 		if got[0].SupportsExplicitStandardServiceTier {
@@ -397,7 +391,7 @@ echo '{"models":[{"slug":"runtime-model","display_name":"Runtime Model","visibil
 		writeTestExecutable(t, fake, []byte(script))
 
 		got := discoverCodexModels(context.Background(), Command{Path: fake})
-		if len(got) == 0 || got[0].ID != "gpt-5.6-sol" || got[0].Thinking == nil {
+		if len(got) == 0 || got[0].ID != "gpt-6-astra" || got[0].Thinking == nil {
 			t.Fatalf("expected model + thinking fallback, got %+v", got)
 		}
 		if !got[0].SupportsExplicitStandardServiceTier {
@@ -413,6 +407,9 @@ func TestValidateThinkingLevelCodexPerModelFallbackCatalog(t *testing.T) {
 		level string
 		want  bool
 	}{
+		{model: "gpt-6-astra", level: "low", want: true},
+		{model: "gpt-6-astra", level: "max", want: true},
+		{model: "gpt-6-astra", level: "ultra", want: true},
 		{model: "gpt-5.6-sol", level: "ultra", want: true},
 		{model: "gpt-5.6-terra", level: "ultra", want: true},
 		{model: "gpt-5.6-luna", level: "max", want: true},
@@ -804,10 +801,11 @@ func TestValidateThinkingLevel_ExplicitModel(t *testing.T) {
 // fix: an explicit codex model is validated against its own per-model
 // catalog, but an EMPTY model (follow config.toml, which can resolve to any
 // installed model) must NOT borrow the flagged Default entry's catalog. The
-// Default (gpt-5.6-sol) alone advertises `ultra`; letting an empty model
-// inherit it would green-light a level Luna / gpt-5.5 don't support and Codex
-// won't reject. So an empty codex model fails closed for every level and the
-// daemon drops it — users must pick an explicit model to pin an effort.
+// flagged Default (currently Astra) advertises `ultra`; letting an empty
+// model inherit that catalog would green-light a level Luna / gpt-5.5 don't
+// support and Codex won't reject. So an empty codex model fails closed for
+// every level and the daemon drops it — users must pick an explicit model to
+// pin an effort.
 func TestValidateThinkingLevel_CodexEmptyModelFailsClosed(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell-script fake binary requires a POSIX shell")
@@ -835,7 +833,7 @@ func TestValidateThinkingLevel_CodexEmptyModelFailsClosed(t *testing.T) {
 	check("gpt-5.6-luna", "medium", true) // as are the base levels
 
 	// Empty model cannot be validated per-model, so it fails closed for EVERY
-	// level — including `ultra` (must not pass via the Sol Default) and even a
+	// level — including `ultra` (must not pass via the flagged Default) and even a
 	// level every model supports (`medium`). The daemon drops it.
 	check("", "ultra", false)
 	check("", "medium", false)

@@ -51,6 +51,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -189,6 +190,16 @@ func NewOutbound(q outboundQueries, senders *sendersRegistry, streams *streamSto
 // Register subscribes to the chat-done and inbox events on the bus.
 func (o *Outbound) Register(bus *events.Bus) {
 	bus.Subscribe(protocol.EventChatDone, o.handleEvent)
+	// task:failed and task:cancelled are NOT subscribed here, and that is the
+	// one place this tree deliberately departs from #7952 as merged.
+	//
+	// A run that ends has a bubble waiting on it, and only the typing
+	// indicator can seal that bubble — sending the notice from here would
+	// leave the bubble spinning beside it, and subscribing in both places
+	// would put two messages in the chat for one failure. So the indicator
+	// owns every ending (typing_indicator.go), and it carries the same words
+	// #7952 established: the platform's own redacted reason when there is
+	// one, through taskFailedContent below.
 	// Inbox notifications delivered through the smart bot: when the
 	// recipient member has a WeCom binding with a live connection, their
 	// inbox:new items are pushed to the aibot as a markdown card.
@@ -591,6 +602,43 @@ func wecomBindingFromTaskDelivery(delivery db.ChannelTaskDelivery) db.ChannelCha
 		LastMessageID: delivery.ChannelMessageID, LastThreadID: delivery.ChannelThreadID,
 		RouteRevision: delivery.RouteRevision, Config: delivery.Config,
 	}
+}
+
+// chatDoneTaskID recovers the task id an EventChatDone belongs to. The
+// envelope's TaskID is preferred, with the payload as the fallback —
+// service.broadcastChatDone sets ChatDonePayload.TaskID and leaves the
+// envelope's empty, so in practice the fallback is the live path.
+// taskFailedPrefix marks a failure notice apart from a reply in the chat, the
+// way DingTalk's and Lark's do.
+const taskFailedPrefix = "⚠️ "
+
+// deliverableContent is what this event has to say in the chat.
+//
+// chat:done carries the agent's reply. task:failed carries the platform's own
+// redacted failure text in `error` — the same text the web transcript shows —
+// and nothing while an auto-retry is pending: the retry attempt reports its
+// own outcome, and announcing a failure the next attempt may undo would be
+// noise. Empty means the turn ends silently, exactly as an empty reply does.
+func deliverableContent(e events.Event) string {
+	if e.Type == protocol.EventTaskFailed {
+		return taskFailedContent(e.Payload)
+	}
+	return chatDoneContent(e.Payload)
+}
+
+func taskFailedContent(payload any) string {
+	p, ok := payload.(map[string]any)
+	if !ok {
+		return ""
+	}
+	if pending, _ := p["retry_pending"].(bool); pending {
+		return ""
+	}
+	msg, _ := p["error"].(string)
+	if strings.TrimSpace(msg) == "" {
+		return ""
+	}
+	return taskFailedPrefix + msg
 }
 
 // rounds builds the matcher that turns a task id on an event into the round it

@@ -1289,16 +1289,18 @@ func (q *Queries) ListRecentThreadCommentsForIssue(ctx context.Context, arg List
 const listReconcilableCommentsForIssueSince = `-- name: ListReconcilableCommentsForIssueSince :many
 SELECT id, issue_id, author_type, author_id, content, type, created_at, updated_at, parent_id, workspace_id, resolved_at, resolved_by_type, resolved_by_id, source_task_id, quick_action_id, via_plugin_id, revision, recovery_settled_at FROM comment
 WHERE issue_id = $1
+  AND (id = ANY($2::uuid[])
+       OR comment_thread_root_id(id) = $3::uuid)
   AND (
       (
           author_type IN ('member', 'agent')
-          AND (created_at > $2 OR id = ANY($3::uuid[]))
+          AND (created_at > $4 OR id = ANY($2::uuid[]))
       )
       OR (
           author_type = 'system'
           AND type = 'progress_update'
           AND source_task_id IS NOT NULL
-          AND id = ANY($3::uuid[])
+          AND id = ANY($2::uuid[])
       )
   )
 ORDER BY created_at ASC, id ASC
@@ -1306,8 +1308,9 @@ ORDER BY created_at ASC, id ASC
 
 type ListReconcilableCommentsForIssueSinceParams struct {
 	IssueID           pgtype.UUID        `json:"issue_id"`
-	Since             pgtype.Timestamptz `json:"since"`
 	PlannedCommentIds []pgtype.UUID      `json:"planned_comment_ids"`
+	CommentThreadID   pgtype.UUID        `json:"comment_thread_id"`
+	Since             pgtype.Timestamptz `json:"since"`
 }
 
 // MUL-4195 / MUL-4304 completion reconciliation: every MEMBER- or AGENT-authored
@@ -1331,19 +1334,18 @@ type ListReconcilableCommentsForIssueSinceParams struct {
 // compensated here, because agent-authored comments were excluded. We now also
 // return 'agent' comments so those explicit mentions can be replayed.
 //
-// This does NOT reopen the anti-loop guarantees the member-only filter was
-// protecting. The reconcile pass runs each returned comment through
-// computeCommentAgentTriggers under its OWN author_type, and for an agent author
-// it then keeps ONLY explicit @agent/@squad mention triggers
-// (keepExplicitMentionTriggers) — the assigned-squad-leader fallback and all
-// other conversational routing are dropped, so a plain agent reply /
-// acknowledgement yields nothing regardless of issue assignment. The reconcile
-// pass further keeps only triggers routing to the agent that just completed, so
-// an agent comment can never fan out to an unrelated agent. Ordered ASC so
-// replaying in order lets later comments coalesce onto the follow-up created by
-// the first.
+// The handler rechecks current routing and permissions. For agent authors it
+// accepts explicit mentions, plus worker-to-assigned-leader replies already
+// recorded in this run's planned inputs. Timestamp-only implicit agent replies
+// remain excluded. Replays are scoped to the completing agent, never a fan-out.
+// Ordered ASC so later comments coalesce onto the follow-up created by the first.
 func (q *Queries) ListReconcilableCommentsForIssueSince(ctx context.Context, arg ListReconcilableCommentsForIssueSinceParams) ([]Comment, error) {
-	rows, err := q.db.Query(ctx, listReconcilableCommentsForIssueSince, arg.IssueID, arg.Since, arg.PlannedCommentIds)
+	rows, err := q.db.Query(ctx, listReconcilableCommentsForIssueSince,
+		arg.IssueID,
+		arg.PlannedCommentIds,
+		arg.CommentThreadID,
+		arg.Since,
+	)
 	if err != nil {
 		return nil, err
 	}
