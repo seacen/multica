@@ -402,3 +402,92 @@ func TestRelayedReply_ASettleThatNeverExecutedIsRetried(t *testing.T) {
 		t.Fatalf("claim value = %q, want %q", v, claimSettledValue)
 	}
 }
+
+// DeliveryBudget is the number outcomeGrace is computed from, so a delivery
+// that outlives it makes the publisher's grace a wrong answer: a Resolve
+// landing inside an ack wait fences a reply that is still being written. It
+// was documented as the bound on "the send and its ack wait" and never
+// applied — the only limit the send had was ackTimeout, the constant.
+//
+// The socket here writes and never answers, which before this was a five
+// second wait whatever the config said.
+//
+// REVERSE VERIFICATION: hand deliverRelayed the dispatcher's ctx again and
+// this fails with the delivery taking ackTimeout (5s) against a 120ms budget.
+func TestADeliveryIsBoundedByTheBudgetItsGraceIsComputedFrom(t *testing.T) {
+	t.Parallel()
+	budget := 120 * time.Millisecond
+	cfg := RelayConfig{Shards: 1, LeaseSettle: 40 * time.Millisecond, RetryBackoff: 5 * time.Millisecond, DeliveryBudget: budget}
+
+	reg := newSendersRegistry()
+	instID := mustTestUUID(t)
+	conn := &silentAckConn{}
+	reg.set(instID, conn.newSender())
+	mx := newCountingMetrics()
+	o := NewOutbound(&fakeOutboundQueries{}, reg, testLogger(), WithOutboundMetrics(mx))
+	o.spawn = func(f func()) { f() }
+	router := NewRelayOutbound(&fanoutRelay{}, nil, cfg, testLogger())
+	router.SetMetrics(mx)
+	router.Attach(o)
+	ctx, cancel := context.WithCancel(context.Background())
+	router.Start(ctx)
+	t.Cleanup(func() { cancel(); router.Wait() })
+
+	body, err := json.Marshal(relayFrame{
+		Kind: relayKindReply, InstallationID: util.UUIDToString(instID),
+		ChatID: "CHAT_1", ChatType: chatTypeGroupInt, Content: "答案",
+		SessionID: testSessionID, TaskID: testTaskID,
+	})
+	if err != nil {
+		t.Fatalf("marshal relay frame: %v", err)
+	}
+	started := time.Now()
+	router.DeliverWecomOutbound(util.UUIDToString(instID), body, "ev-budget")
+	// The delivery is over when its outcome is filed. A send cut by the
+	// budget ends in a context error, which unconfirmedReason reads as
+	// unknown — the frame went out and no verdict came back.
+	waitFor(t, "the delivery to record an outcome inside its budget rather than at ackTimeout", func() bool {
+		return mx.get("outbound_unconfirmed")+mx.get("outbound_dropped")+mx.get("outbound_delivered") > 0
+	})
+	took := time.Since(started)
+
+	if conn.attempts() == 0 {
+		t.Fatal("nothing was written; this test is not measuring a delivery")
+	}
+	if got := mx.get("outbound_unconfirmed"); got != 1 {
+		t.Errorf("outbound_unconfirmed = %d, want 1 — a delivery cut by its own budget is unknown, not failed", got)
+	}
+	// ackTimeout is five seconds. Anything near it means the budget was not
+	// applied; a small multiple of the budget is scheduling noise.
+	if took > 2*time.Second {
+		t.Fatalf("the delivery took %s against a %s budget — the send is still bounded by ackTimeout, not by the number the grace is computed from", took, budget)
+	}
+}
+
+// silentAckConn writes and never answers, which is the shape of a peer that
+// took the bytes and went quiet.
+type silentAckConn struct {
+	mu     sync.Mutex
+	sender *wsSender
+	writes int
+}
+
+func (c *silentAckConn) newSender() *wsSender {
+	s := newWSSender(c, testLogger())
+	c.mu.Lock()
+	c.sender = s
+	c.mu.Unlock()
+	return s
+}
+
+func (c *silentAckConn) WriteMessage(int, []byte) error {
+	c.mu.Lock()
+	c.writes++
+	c.mu.Unlock()
+	return nil
+}
+func (c *silentAckConn) ReadMessage() (int, []byte, error) { return 0, nil, nil }
+func (c *silentAckConn) SetReadDeadline(time.Time) error   { return nil }
+func (c *silentAckConn) SetWriteDeadline(time.Time) error  { return nil }
+func (c *silentAckConn) Close() error                      { return nil }
+func (c *silentAckConn) attempts() int                     { c.mu.Lock(); defer c.mu.Unlock(); return c.writes }
