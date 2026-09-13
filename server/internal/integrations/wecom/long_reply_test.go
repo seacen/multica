@@ -233,8 +233,8 @@ func TestTheCutPrefersALineBoundary(t *testing.T) {
 // reader can get to.
 func TestALongAnswerInABubbleIsReadableToTheEnd(t *testing.T) {
 	rig := newBubbleRig(t)
-	rig.ask(t, "REQ-LONG", 1)
-	rig.runStarted(t, 1, "task-1")
+	rig.ask(t, "REQ-LONG")
+	rig.queued(t, "task-1")
 
 	answer := aLongAnswer()
 	rig.answer(t, answer, "task-1")
@@ -279,8 +279,8 @@ func TestALongAnswerInABubbleIsReadableToTheEnd(t *testing.T) {
 // would be a new defect, not a fix.
 func TestABubbleThatStillFitsIsNotSplit(t *testing.T) {
 	rig := newBubbleRig(t)
-	rig.ask(t, "REQ-SHORT", 1)
-	rig.runStarted(t, 1, "task-1")
+	rig.ask(t, "REQ-SHORT")
+	rig.queued(t, "task-1")
 	rig.answer(t, "答案是 42", "task-1")
 
 	if n := len(rig.conn.pushes(t)); n != 0 {
@@ -411,7 +411,7 @@ func TestABubbleAnswerThatBreaksAfterTheBubbleIsCountedTruncated(t *testing.T) {
 	rig, mx, logs := truncationRig(t)
 	rig.conn.refusePushesFrom = 1 // nothing under the bubble gets through
 
-	rig.ran(t, "REQ-TRUNC-B", 1, "task-1")
+	rig.ran(t, "REQ-TRUNC-B", "task-1")
 	rig.answer(t, aLongAnswer(), "task-1")
 
 	// The premise: the bubble was sealed and nothing followed it.
@@ -471,7 +471,7 @@ func TestAPlainAnswerThatBreaksMidwayIsCountedTruncated(t *testing.T) {
 func TestALongAnswerThatArrivesWholeIsNotCountedTruncated(t *testing.T) {
 	rig, mx, logs := truncationRig(t)
 
-	rig.ran(t, "REQ-TRUNC-OK", 1, "task-1")
+	rig.ran(t, "REQ-TRUNC-OK", "task-1")
 	rig.answer(t, aLongAnswer(), "task-1")
 
 	if got := mx.get("outbound_truncated"); got != 0 {

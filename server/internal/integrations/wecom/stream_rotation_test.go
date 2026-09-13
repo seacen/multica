@@ -26,9 +26,9 @@ import (
 func TestTheGuardRotatesTheRoundOntoAFreshStream(t *testing.T) {
 	t.Parallel()
 	rig := newBubbleRig(t)
-	rig.ran(t, "REQ-ROT", 1, "task-1")
+	rig.ran(t, "REQ-ROT", "task-1")
 
-	old, next := rig.rotated(t, 1)
+	old, next := rig.rotated(t, "task-1")
 
 	frames := rig.conn.streamFrames(t)
 	if len(frames) != 3 {
@@ -75,17 +75,17 @@ func TestTheGuardRotatesTheRoundOntoAFreshStream(t *testing.T) {
 func TestTheGuardRotatesTheSameRoundAgain(t *testing.T) {
 	t.Parallel()
 	rig := newBubbleRig(t)
-	rig.ran(t, "REQ-ROT2", 1, "task-1")
+	rig.ran(t, "REQ-ROT2", "task-1")
 
 	// The first guard, nine minutes in.
 	rig.now = rig.now.Add(streamGuardAfter)
-	first, second := rig.rotated(t, 1)
+	first, second := rig.rotated(t, "task-1")
 	// The second, nine minutes after that: eighteen minutes since the
 	// question, past the FIRST stream's window and inside the second's. A
 	// rotation that had not reset the window would refuse to move the round
 	// now.
 	rig.now = rig.now.Add(streamGuardAfter)
-	second2, third := rig.rotated(t, 1)
+	second2, third := rig.rotated(t, "task-1")
 	if second2 != second {
 		t.Fatalf("the second rotation left stream %s, want %s", second2, second)
 	}
@@ -126,11 +126,11 @@ func TestARefusedHandOverStopsRotatingAndTheAnswerGoesPlain(t *testing.T) {
 	t.Parallel()
 	rig := newBubbleRig(t)
 	rig.conn.refuseClosingCode = errcodeStreamExpired
-	rig.ran(t, "REQ-ROT3", 1, "task-1")
+	rig.ran(t, "REQ-ROT3", "task-1")
 	sessionID := bubbleSessionID(t)
 
-	rig.stepped(t, 1)
-	rig.typing.fireGuard(context.Background(), sessionID, 1)
+	rig.stepped(t, "task-1")
+	rig.typing.fireGuard(context.Background(), sessionID, rig.seqOf(t, "task-1"))
 	frames := rig.conn.streamFrames(t)
 	if len(frames) != 2 || frames[1]["finish"] != true {
 		t.Fatalf("a refused hand-over wrote %d stream frames, want 2 (open, the refused seal): %v", len(frames), frames)
@@ -141,7 +141,7 @@ func TestARefusedHandOverStopsRotatingAndTheAnswerGoesPlain(t *testing.T) {
 
 	// The guard again, as the re-armed timer would do if rotating had not
 	// stopped. Nothing may be written.
-	rig.typing.fireGuard(context.Background(), sessionID, 1)
+	rig.typing.fireGuard(context.Background(), sessionID, rig.seqOf(t, "task-1"))
 	if got := len(rig.conn.streamFrames(t)); got != 2 {
 		t.Fatalf("after a refused hand-over the guard wrote %d more frame(s); a stream the server has disowned is written to again", got-2)
 	}
@@ -156,22 +156,34 @@ func TestARefusedHandOverStopsRotatingAndTheAnswerGoesPlain(t *testing.T) {
 	}
 }
 
-// A round that was never painted has nothing to hand over, and the guard
-// leaves it alone: no frame, no change.
-func TestTheGuardLeavesAnUnpaintedRoundAlone(t *testing.T) {
+// A guard that names a round nothing on file answers to has nothing to hand
+// over, and leaves the session alone: no frame, and nothing forgotten.
+//
+// The case is real because the enqueue can beat the bubble — the Router
+// detaches the ingest goroutine and a session's first message enqueues inside
+// dispatch — so a run can be waiting for a bubble at the moment some OTHER
+// round's timer fires. A guard that reached for "whatever this session has"
+// instead of the round it was armed for would seal or strand it.
+func TestTheGuardLeavesARoundItWasNotArmedForAlone(t *testing.T) {
 	t.Parallel()
 	rig := newBubbleRig(t)
-	// The flush wins the race: the run is bound and no opening frame has been
-	// written.
-	rig.runStarted(t, 1, "task-1")
+	// The enqueue wins the race: the run is queued and no opening frame has
+	// been written, so there is no round for any seq to name.
+	rig.queued(t, "task-1")
 
-	rig.typing.fireGuard(context.Background(), bubbleSessionID(t), 1)
+	rig.typing.fireGuard(context.Background(), bubbleSessionID(t), roundSeq(1))
 
 	if got := len(rig.conn.streamFrames(t)); got != 0 {
-		t.Fatalf("the guard wrote %d frame(s) for a round with no bubble", got)
+		t.Fatalf("the guard wrote %d frame(s) for a round that is not on file", got)
 	}
+	if !rig.streams.holding() {
+		t.Fatal("the guard dropped a run that is still waiting for the bubble it will be answered in")
+	}
+	// And the bubble that lands a moment later still takes that run, so its
+	// answer has somewhere to go.
+	rig.ask(t, "REQ-LATE")
 	if !rig.streams.has(bubbleSessionID(t), taskUUID(t, "task-1")) {
-		t.Fatal("the guard retired a round that still has an answer coming")
+		t.Fatal("the bubble did not take the run that was waiting for it")
 	}
 }
 
@@ -187,22 +199,22 @@ func TestTheGuardLeavesAnUnpaintedRoundAlone(t *testing.T) {
 func TestTheGuardLeavesAQuietRoundAlone(t *testing.T) {
 	t.Parallel()
 	rig := newBubbleRig(t)
-	rig.ran(t, "REQ-QUIET", 1, "task-1")
-	before := rig.streamIDOf(t, 1)
+	rig.ran(t, "REQ-QUIET", "task-1")
+	before := rig.streamIDOf(t, "task-1")
 	frames := len(rig.conn.streamFrames(t))
 
-	rig.typing.fireGuard(context.Background(), bubbleSessionID(t), 1)
+	rig.typing.fireGuard(context.Background(), bubbleSessionID(t), rig.seqOf(t, "task-1"))
 
-	if after := rig.streamIDOf(t, 1); after != before {
+	if after := rig.streamIDOf(t, "task-1"); after != before {
 		t.Fatalf("a quiet round was rotated from %s to %s", before, after)
 	}
 	if n := len(rig.conn.streamFrames(t)); n != frames {
 		t.Fatalf("%d stream frames after the guard, want %d: nothing is written for a quiet round", n, frames)
 	}
 	// A step brings it back to life for the next guard.
-	rig.stepped(t, 1)
-	rig.typing.fireGuard(context.Background(), bubbleSessionID(t), 1)
-	if after := rig.streamIDOf(t, 1); after == before {
+	rig.stepped(t, "task-1")
+	rig.typing.fireGuard(context.Background(), bubbleSessionID(t), rig.seqOf(t, "task-1"))
+	if after := rig.streamIDOf(t, "task-1"); after == before {
 		t.Fatalf("the round stepped and was still not rotated")
 	}
 }
@@ -215,14 +227,94 @@ func TestTheGuardLeavesAQuietRoundAlone(t *testing.T) {
 func TestRotationStopsAtItsCap(t *testing.T) {
 	t.Parallel()
 	rig := newBubbleRig(t)
-	rig.ran(t, "REQ-CAP", 1, "task-1")
+	rig.ran(t, "REQ-CAP", "task-1")
 	for i := 0; i < maxRotations; i++ {
-		rig.rotated(t, 1)
+		rig.rotated(t, "task-1")
 	}
-	before := rig.streamIDOf(t, 1)
-	rig.stepped(t, 1)
-	rig.typing.fireGuard(context.Background(), bubbleSessionID(t), 1)
-	if after := rig.streamIDOf(t, 1); after != before {
+	before := rig.streamIDOf(t, "task-1")
+	rig.stepped(t, "task-1")
+	rig.typing.fireGuard(context.Background(), bubbleSessionID(t), rig.seqOf(t, "task-1"))
+	if after := rig.streamIDOf(t, "task-1"); after != before {
 		t.Fatalf("rotated past the cap of %d: %s -> %s", maxRotations, before, after)
+	}
+}
+
+// A rotation moves a round onto a fresh stream and MUST NOT move anything else
+// about it — which matters now that the round's run arrives on the bus rather
+// than from the engine, and "which round does this run belong to" is answered
+// by position.
+//
+// The reasoning the store relies on: bindNext hands a newly queued run the
+// oldest round with NO run bound to it, and rotate touches only the handle. So
+// a rotated round is still bound, still in the same place in the list, and
+// still named by the same sequence number the guard was armed with. Break any
+// of those and the failure is the worst one this feature has: the long run's
+// answer seals the new question's bubble, and the new question's own answer
+// has nowhere left to land.
+//
+// REVERSE VERIFICATION: clear e.taskID in streamStore.rotate (the round "moves
+// on" to a fresh run) and this fails at the binding check — the second
+// question's task:queued takes the rotated round, because it is now the oldest
+// unbound one.
+func TestARotationLeavesTheRoundBoundToItsOwnRun(t *testing.T) {
+	t.Parallel()
+	rig := newBubbleRig(t)
+
+	// A long run, nine minutes in, handed a fresh stream. The round is followed
+	// by the store's own name for it rather than through the run bound to it,
+	// since the binding is what this test is checking.
+	rig.ran(t, "REQ-ROT-BIND", "task-1")
+	seq := rig.seqOf(t, "task-1")
+	rig.stepped(t, "task-1")
+	rig.typing.fireGuard(context.Background(), bubbleSessionID(t), seq)
+	rotated := rig.streamIDOfSeq(t, seq)
+
+	// A new question arrives and its own run is queued, the way the next turn
+	// in the same chat does.
+	rig.ask(t, "REQ-AFTER-ROT")
+	second := rig.unboundStreamID(t)
+	rig.queued(t, "task-2")
+
+	// The binding: each run is on its own round, and neither took the other's.
+	if got := rig.streamIDOfSeq(t, seq); got != rotated {
+		t.Fatalf("the rotated round is on stream %s, want %s", got, rotated)
+	}
+	if got := rig.streamIDOf(t, "task-2"); got == rotated {
+		t.Fatalf("the second question's run bound itself to the ROTATED round (stream %s). "+
+			"A rotation left the round looking unbound, so bindNext handed it the next "+
+			"question's run — the long run's answer will now seal a question it never "+
+			"answered, and the second question's bubble will spin forever", got)
+	} else if got != second {
+		t.Fatalf("the second question's run is on stream %s, want its own bubble (%s)", got, second)
+	}
+	if !rig.streams.has(bubbleSessionID(t), taskUUID(t, "task-1")) {
+		t.Fatal("the long run is no longer bound to any round after its rotation; its answer " +
+			"has nothing to find and lands as a plain message under a spinner nothing closes")
+	}
+	if got := rig.streamIDOf(t, "task-1"); got != rotated {
+		t.Fatalf("the long run is on stream %s, want the one its rotation opened (%s)", got, rotated)
+	}
+
+	// And the answer follows the binding: the long run seals the stream it was
+	// rotated onto, leaving the second question's bubble alone.
+	rig.answer(t, "the long run's answer", "task-1")
+	frames := rig.conn.streamFrames(t)
+	sealed := frames[len(frames)-1]
+	if sealed["id"] == second {
+		t.Fatal("the long run's answer sealed the second question's bubble; that asker reads " +
+			"someone else's answer and their own run has nowhere to land")
+	}
+	if sealed["id"] != rotated || sealed["finish"] != true || sealed["content"] != "the long run's answer" {
+		t.Fatalf("the long run's answer did not seal its rotated bubble %s in place: %v", rotated, sealed)
+	}
+
+	rig.answer(t, "the second answer", "task-2")
+	frames = rig.conn.streamFrames(t)
+	last := frames[len(frames)-1]
+	if last["id"] != second || last["finish"] != true || last["content"] != "the second answer" {
+		t.Fatalf("the second question's own answer did not seal its bubble: %v", last)
+	}
+	if pushes := rig.conn.pushes(t); len(pushes) != 0 {
+		t.Errorf("%d answer(s) went out as plain messages; both bubbles were writable", len(pushes))
 	}
 }

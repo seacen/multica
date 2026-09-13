@@ -33,7 +33,6 @@ import (
 
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
-	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
@@ -90,10 +89,10 @@ func newProgressRig(t *testing.T) *progressRig {
 // flush creates its run, and the task row that names the run's chat session is
 // on file — which is what a transcript event is resolved through, since
 // task:message carries a task id and nothing else.
-func (p *progressRig) running(t *testing.T, reqID string, batch engine.RunBatchID, taskName string) {
+func (p *progressRig) running(t *testing.T, reqID, taskName string) {
 	t.Helper()
-	p.askFrom(t, reqID, batch, p.chatType)
-	p.runStarted(t, batch, taskName)
+	p.askFrom(t, reqID, p.chatType)
+	p.queued(t, taskName)
 	p.fileTask(t, taskName, taskName)
 }
 
@@ -211,7 +210,7 @@ func (p *progressRig) tick() {
 func TestATaskMessagePaintsTheToolCallIntoTheBubble(t *testing.T) {
 	t.Parallel()
 	rig := newProgressRig(t)
-	rig.running(t, "REQ-A", 1, "task-1")
+	rig.running(t, "REQ-A", "task-1")
 
 	rig.toolCall(t, "task-1", "Read", map[string]any{"file_path": "/srv/app/router.go"})
 
@@ -253,7 +252,7 @@ func TestATaskMessagePaintsTheToolCallIntoTheBubble(t *testing.T) {
 func TestATaskProgressEventRewritesTheOpenBubble(t *testing.T) {
 	t.Parallel()
 	rig := newProgressRig(t)
-	rig.running(t, "REQ-A", 1, "task-1")
+	rig.running(t, "REQ-A", "task-1")
 
 	rig.milestone(t, "task-1", "Launching claude")
 
@@ -285,7 +284,7 @@ func TestATaskProgressEventRewritesTheOpenBubble(t *testing.T) {
 func TestTheRoundBehindARunIsReadOnce(t *testing.T) {
 	t.Parallel()
 	rig := newProgressRig(t)
-	rig.running(t, "REQ-A", 1, "task-1")
+	rig.running(t, "REQ-A", "task-1")
 
 	before := rig.q.taskGets
 	for i := 0; i < 5; i++ {
@@ -304,7 +303,7 @@ func TestTheRoundBehindARunIsReadOnce(t *testing.T) {
 func TestARunWithNoChatSessionWritesNothingAndIsRememberedAsSuch(t *testing.T) {
 	t.Parallel()
 	rig := newProgressRig(t)
-	rig.running(t, "REQ-A", 1, "task-1")
+	rig.running(t, "REQ-A", "task-1")
 	// The issue run's row: no chat session.
 	id := mustParseTestUUID(t, "issue-run")
 	rig.q.tasks[util.UUIDToString(id)] = db.AgentTaskQueue{ID: id, ChatInputTaskID: id}
@@ -328,7 +327,7 @@ func TestARunWithNoChatSessionWritesNothingAndIsRememberedAsSuch(t *testing.T) {
 func TestADatabaseThatCannotAnswerIsNotAskedAgainImmediately(t *testing.T) {
 	t.Parallel()
 	rig := newProgressRig(t)
-	rig.running(t, "REQ-A", 1, "task-1")
+	rig.running(t, "REQ-A", "task-1")
 	rig.q.taskErr = pgx.ErrTxClosed
 
 	before := rig.q.taskGets
@@ -348,7 +347,7 @@ func TestADatabaseThatCannotAnswerIsNotAskedAgainImmediately(t *testing.T) {
 func TestABurstOfToolCallsBecomesOneFrame(t *testing.T) {
 	t.Parallel()
 	rig := newProgressRig(t)
-	rig.running(t, "REQ-A", 1, "task-1")
+	rig.running(t, "REQ-A", "task-1")
 
 	for _, tool := range []string{"Read", "Grep", "Edit"} {
 		rig.toolCall(t, "task-1", tool, map[string]any{"file_path": "/srv/" + tool + ".go", "pattern": tool})
@@ -390,7 +389,7 @@ func TestABurstOfToolCallsBecomesOneFrame(t *testing.T) {
 func TestReasoningCutMidSentenceDoesNotWeldTwoWordsTogether(t *testing.T) {
 	t.Parallel()
 	rig := newProgressRig(t)
-	rig.running(t, "REQ-A", 1, "task-1")
+	rig.running(t, "REQ-A", "task-1")
 
 	const head = "先看 handler.go 里的分支，再看 "
 	const tail = "router.go 的注册顺序。"
@@ -423,7 +422,7 @@ func TestReasoningCutMidSentenceDoesNotWeldTwoWordsTogether(t *testing.T) {
 func TestTwoReasoningBlocksDoNotRunTogetherAcrossAFlush(t *testing.T) {
 	t.Parallel()
 	rig := newProgressRig(t)
-	rig.running(t, "REQ-A", 1, "task-1")
+	rig.running(t, "REQ-A", "task-1")
 
 	const first = "先确认 handler.go 里的分支。"
 	const second = "\n\n再决定要不要改 router.go 的注册顺序。"
@@ -457,7 +456,7 @@ func TestTwoReasoningBlocksDoNotRunTogetherAcrossAFlush(t *testing.T) {
 func TestARetryClonesStepsLandInTheRoundItsParentOpened(t *testing.T) {
 	t.Parallel()
 	rig := newProgressRig(t)
-	rig.running(t, "REQ-A", 1, "task-1")
+	rig.running(t, "REQ-A", "task-1")
 	// FailTask's clone: its own id, its parent's round.
 	rig.fileTask(t, "retry", "task-1")
 
@@ -512,7 +511,7 @@ func TestAChatThatIsNotThePrincipalsShowsNoSteps(t *testing.T) {
 			t.Parallel()
 			rig := newProgressRig(t)
 			tc.setUp(rig)
-			rig.running(t, "REQ-A", 1, "task-1")
+			rig.running(t, "REQ-A", "task-1")
 
 			rig.toolCall(t, "task-1", "Read", map[string]any{"file_path": "/home/dana/salary-review.md"})
 
@@ -536,7 +535,7 @@ func TestTheAudienceIsDecidedAgainForEveryRound(t *testing.T) {
 	t.Parallel()
 	rig := newProgressRig(t)
 
-	rig.running(t, "REQ-A", 1, "task-1")
+	rig.running(t, "REQ-A", "task-1")
 	rig.toolCall(t, "task-1", "Read", map[string]any{"file_path": "/home/dana/salary-review.md"})
 	if got := len(rig.refreshes(t)); got != 1 {
 		t.Fatalf("the principal's own round showed %d steps, want 1 — "+
@@ -551,7 +550,7 @@ func TestTheAudienceIsDecidedAgainForEveryRound(t *testing.T) {
 	rig.tick()
 	before := len(rig.refreshes(t))
 	asked := rig.identities.calls
-	rig.running(t, "REQ-B", 2, "task-2")
+	rig.running(t, "REQ-B", "task-2")
 	rig.toolCall(t, "task-2", "Read", map[string]any{"file_path": "/home/dana/salary-review.md"})
 
 	if rig.identities.calls == asked {
@@ -580,12 +579,12 @@ func TestTheAudienceIsDecidedAgainForEveryRound(t *testing.T) {
 func TestASealedBubbleIsNotRefreshed(t *testing.T) {
 	t.Parallel()
 	rig := newProgressRig(t)
-	rig.running(t, "REQ-A", 1, "task-1")
+	rig.running(t, "REQ-A", "task-1")
 	// A second question, with a run of its own, so the store is not empty and
 	// the cheap "nothing open" rejection cannot be what makes this pass.
-	rig.running(t, "REQ-B", 2, "task-2")
+	rig.running(t, "REQ-B", "task-2")
 
-	old, next := rig.rotated(t, 1)
+	old, next := rig.rotated(t, "task-1")
 	before := len(rig.conn.streamFrames(t))
 	beforePushes := len(rig.conn.pushes(t))
 
@@ -633,19 +632,19 @@ func TestAFinishedRunsStepsNeverLandInTheNextQuestionsBubble(t *testing.T) {
 		stillOpen bool
 	}{
 		{"answered", func(t *testing.T, rig *progressRig) { rig.answer(t, "all done", "task-1") }, false},
-		{"rotated", func(t *testing.T, rig *progressRig) { rig.rotated(t, 1) }, true},
+		{"rotated", func(t *testing.T, rig *progressRig) { rig.rotated(t, "task-1") }, true},
 		{"cancelled", func(t *testing.T, rig *progressRig) { rig.cancelled(t, "task-1") }, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			rig := newProgressRig(t)
-			rig.running(t, "REQ-A", 1, "task-1")
+			rig.running(t, "REQ-A", "task-1")
 			tc.end(t, rig)
 
 			// The next question. Its bubble is painted immediately; the flush
 			// that names its run has not happened yet.
-			rig.ask(t, "REQ-B", 2)
-			nextQuestion := rig.streamIDOf(t, 2)
+			rig.ask(t, "REQ-B")
+			nextQuestion := rig.unboundStreamID(t)
 			before := len(rig.conn.streamFrames(t))
 
 			rig.toolCall(t, "task-1", "Read", map[string]any{"file_path": "/srv/app/last-round.go"})
@@ -686,7 +685,7 @@ func TestAFinishedRunsStepsNeverLandInTheNextQuestionsBubble(t *testing.T) {
 func TestADisownedBubbleStopsRefreshingAfterTheFirstRefusal(t *testing.T) {
 	t.Parallel()
 	rig := newProgressRig(t)
-	rig.running(t, "REQ-A", 1, "task-1")
+	rig.running(t, "REQ-A", "task-1")
 	rig.conn.disownAfterFrames = 1 // the opening frame lands; the takeover happens right after
 
 	const steps = 40
@@ -719,7 +718,7 @@ func TestADisownedBubbleStopsRefreshingAfterTheFirstRefusal(t *testing.T) {
 func TestADisownedBubblesAnswerArrivesAsANewMessage(t *testing.T) {
 	t.Parallel()
 	rig := newProgressRig(t)
-	rig.running(t, "REQ-A", 1, "task-1")
+	rig.running(t, "REQ-A", "task-1")
 	rig.conn.disownAfterFrames = 1 // the opening frame lands; the takeover happens right after
 	rig.toolCall(t, "task-1", "Read", map[string]any{"file_path": "/srv/app/router.go"})
 
@@ -739,5 +738,62 @@ func TestADisownedBubblesAnswerArrivesAsANewMessage(t *testing.T) {
 	if !delivered {
 		t.Error("the answer never reached the chat at all: its bubble could not be sealed and " +
 			"nothing sent it as a message instead")
+	}
+}
+
+// Two questions running at once, each with its own bubble: every step goes to
+// the bubble of the run that produced it, and to no other.
+//
+// This is the same addressing the answer uses, exercised while both rounds are
+// still open — which is the only moment it can go wrong. A step is addressed by
+// task id (feedFor), and that id is on the round because the session's
+// task:queued bound it there. Read the two apart and one asker watches the
+// other's file paths scroll past under their own question.
+//
+// REVERSE VERIFICATION: make streamStore.feedFor return the first round of the
+// session instead of matching on r.taskID, and this fails with both steps in
+// the first bubble.
+func TestTwoOpenBubblesEachShowOnlyTheirOwnRunsSteps(t *testing.T) {
+	t.Parallel()
+	rig := newProgressRig(t)
+	rig.running(t, "REQ-A", "task-1")
+	first := rig.streamIDOf(t, "task-1")
+	rig.running(t, "REQ-B", "task-2")
+	second := rig.streamIDOf(t, "task-2")
+	if first == second {
+		t.Fatalf("both rounds are on stream %s; there is nothing to tell apart", first)
+	}
+
+	rig.toolCall(t, "task-1", "Read", map[string]any{"file_path": "/srv/app/first-round.go"})
+	rig.tick()
+	rig.toolCall(t, "task-2", "Read", map[string]any{"file_path": "/srv/app/second-round.go"})
+	rig.tick()
+
+	var sawFirst, sawSecond bool
+	for _, f := range rig.conn.streamFrames(t) {
+		content, _ := f["content"].(string)
+		if f["finish"] == true || content == streamThinkingPlaceholder {
+			continue
+		}
+		switch f["id"] {
+		case first:
+			if strings.Contains(content, "second-round.go") {
+				t.Errorf("the second run's step was painted into the first question's bubble: %q", content)
+			}
+			sawFirst = sawFirst || strings.Contains(content, "first-round.go")
+		case second:
+			if strings.Contains(content, "first-round.go") {
+				t.Errorf("the first run's step was painted into the second question's bubble: %q", content)
+			}
+			sawSecond = sawSecond || strings.Contains(content, "second-round.go")
+		default:
+			t.Errorf("a refresh was written to stream %v, which belongs to neither round", f["id"])
+		}
+	}
+	if !sawFirst {
+		t.Error("the first run's step never reached its own bubble")
+	}
+	if !sawSecond {
+		t.Error("the second run's step never reached its own bubble")
 	}
 }

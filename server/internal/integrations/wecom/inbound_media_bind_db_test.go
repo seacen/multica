@@ -265,7 +265,7 @@ func TestInboundImageBecomesAnAttachmentOnTheChatMessage(t *testing.T) {
 		MediaTimeout: 20 * time.Second,
 		Logger:       testLogger(),
 	})
-	router.Register(TypeWecom, NewResolverSet(NewStore(queries), session, nil, resolver, nil))
+	router.Register(TypeWecom, NewResolverSet(NewStore(queries), session, nil, resolver))
 
 	msgID := fmt.Sprintf("MSGID-BIND-%d", time.Now().UnixNano())
 	if err := router.Handle(ctx, wecomImageCallback(t, fixture.botID, fixture.senderID, msgID, srv.URL)); err != nil {
@@ -407,7 +407,7 @@ func TestInboundImageMessageHoldsTheAgentRunUntilMediaLands(t *testing.T) {
 		MediaTimeout: 25 * time.Second,
 		Logger:       testLogger(),
 	})
-	router.Register(TypeWecom, NewResolverSet(NewStore(queries), session, nil, resolver, nil))
+	router.Register(TypeWecom, NewResolverSet(NewStore(queries), session, nil, resolver))
 
 	msgID := fmt.Sprintf("MSGID-HOLD-%d", time.Now().UnixNano())
 	if err := router.Handle(ctx, wecomImageCallback(t, fixture.botID, fixture.senderID, msgID, srv.URL)); err != nil {
@@ -523,7 +523,7 @@ func runMixedIssueThroughTheRouter(t *testing.T, botDisplayName, chatType, chatI
 		MediaTimeout: 20 * time.Second,
 		Logger:       testLogger(),
 	})
-	router.Register(TypeWecom, NewResolverSet(NewStore(queries), session, nil, resolver, nil))
+	router.Register(TypeWecom, NewResolverSet(NewStore(queries), session, nil, resolver))
 
 	if chatID == "" {
 		chatID = fixture.senderID
@@ -709,7 +709,7 @@ func TestTheQuotedPictureIsNamedWhenTwoArriveTogether(t *testing.T) {
 		MediaTimeout: 20 * time.Second,
 		Logger:       testLogger(),
 	})
-	router.Register(TypeWecom, NewResolverSet(NewStore(queries), session, nil, resolver, nil))
+	router.Register(TypeWecom, NewResolverSet(NewStore(queries), session, nil, resolver))
 
 	msgID := fmt.Sprintf("MSGID-QUOTE2-%d", time.Now().UnixNano())
 	if err := router.Handle(ctx, wecomQuotedPlusOwnCallback(t, fixture.botID, fixture.senderID, msgID, theirs.URL, mine.URL)); err != nil {
@@ -831,7 +831,7 @@ func TestAQuotedPictureThatNeverArrivesSaysSo(t *testing.T) {
 		MediaTimeout: 20 * time.Second,
 		Logger:       testLogger(),
 	})
-	router.Register(TypeWecom, NewResolverSet(NewStore(queries), session, nil, resolver, nil))
+	router.Register(TypeWecom, NewResolverSet(NewStore(queries), session, nil, resolver))
 
 	msgID := fmt.Sprintf("MSGID-QUOTEFAIL-%d", time.Now().UnixNano())
 	if err := router.Handle(ctx, wecomQuotedPlusOwnCallback(t, fixture.botID, fixture.senderID, msgID, gone.URL, mine.URL)); err != nil {

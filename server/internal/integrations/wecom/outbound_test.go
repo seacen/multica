@@ -506,7 +506,7 @@ func TestAWebUIAnswerDoesNotConsumeTheRoomsBubble(t *testing.T) {
 	rig := newBubbleRig(t)
 
 	// The room asks something. Its bubble is open and its round is waiting.
-	rig.ran(t, "REQ-1", 1, "task-1")
+	rig.ran(t, "REQ-1", "task-1")
 
 	// The installer asks the same session something in their browser, and that
 	// run finishes first.
@@ -568,7 +568,7 @@ func TestAGateThatCannotAnswerDoesNotCostTheAskerTheirBubble(t *testing.T) {
 
 	// The room asks, and this is its own round — the id on the answer is the
 	// one the flush bound, so the take will match it.
-	rig.ran(t, "REQ-1", 1, "task-1")
+	rig.ran(t, "REQ-1", "task-1")
 
 	// The database stops answering the one question the gate asks.
 	rig.q.originErr = errors.New("connection reset by peer")

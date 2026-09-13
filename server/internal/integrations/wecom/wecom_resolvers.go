@@ -44,22 +44,23 @@ func wecomMsgFromRaw(msg channel.InboundMessage) (InboundMessage, error) {
 }
 
 // NewResolverSet assembles the wecom ResolverSet from the store, the shared
-// chat-session service, an outbound replier, the media resolver and the typing
-// indicator.
+// chat-session service, an outbound replier and the media resolver.
 //
-// The last three are optional. Pass nil for replier to disable outbound
-// binding prompts; pass nil for media when no object-storage backend is
-// configured, and inbound attachments degrade to their placeholder text; pass
-// nil for typing to disable the streaming bubble. Typing is taken as the
-// concrete *TypingIndicatorManager rather than the engine interface so a nil
-// argument leaves the field nil instead of a typed-nil interface the Router
-// would happily call.
+// The last two are optional: pass nil for replier to disable outbound binding
+// prompts, and nil for media when no object-storage backend is configured, in
+// which case inbound attachments degrade to their placeholder text.
+//
+// Typing is deliberately NOT a parameter, even though on this platform the
+// indicator is the whole streaming bubble. The set's shape belongs to the
+// engine, and the engine's own tests build a WeCom set without one; boot
+// assigns the field after the set is built (cmd/server/router.go), which is
+// also what keeps a nil manager out of the interface — a typed nil in
+// set.Typing is a value the Router would happily call.
 func NewResolverSet(
 	store *Store,
 	session engineSessionBinder,
 	replier engine.OutboundReplier,
 	media engine.MediaResolver,
-	typing *TypingIndicatorManager,
 ) engine.ResolverSet {
 	set := engine.ResolverSet{
 		Installation: &installationResolver{store: store},
@@ -78,9 +79,6 @@ func NewResolverSet(
 	}
 	if replier != nil {
 		set.Replier = replier
-	}
-	if typing != nil {
-		set.Typing = typing
 	}
 	return set
 }

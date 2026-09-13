@@ -348,14 +348,14 @@ func TestEmptyCompletionWithFilesDoesNotClaimNothingIsComing(t *testing.T) {
 		t.Fatalf("parse session uuid: %v", err)
 	}
 	// A round with a bubble on screen, bound to the task this event answers.
-	streams.open(sessionID, 1, streamHandle{
+	streams.open(sessionID, streamHandle{
 		ReqID: "REQ-1", StreamID: "S-1",
 		InstallationID: instID, ChatID: "CHAT_1", ChatType: chatTypeGroupInt,
 		// Stated rather than left zero: the closing words are read out of the
 		// handle's pack, and the assertion below names a pack of its own.
 		Locale: DefaultLocale,
 	})
-	streams.bind(sessionID, 1, testTaskID)
+	streams.bindNext(sessionID, testTaskID)
 
 	if err := o.processEvent(context.Background(), chatDoneEvent("")); err != nil {
 		t.Fatalf("processEvent: %v", err)

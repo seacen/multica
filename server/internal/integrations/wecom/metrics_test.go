@@ -456,7 +456,7 @@ func TestAnAnswerThatLandsInTheBubbleIsCountedAsFinished(t *testing.T) {
 	rig := newBubbleRig(t)
 	rig.senders.WithMetrics(mx)
 
-	rig.ran(t, "REQ-M1", 1, "task-1")
+	rig.ran(t, "REQ-M1", "task-1")
 	rig.answer(t, "the agent reply", "task-1")
 
 	if got := mx.get("stream_finished"); got != 1 {
@@ -474,7 +474,7 @@ func TestAnAnswerSentAsANewMessageIsCountedAsFallenBack(t *testing.T) {
 	rig.senders.WithMetrics(mx)
 	rig.conn.refuseClosingCode = errcodeStreamExpired
 
-	rig.ran(t, "REQ-M2", 1, "task-1")
+	rig.ran(t, "REQ-M2", "task-1")
 	rig.answer(t, "the agent reply", "task-1")
 
 	// The answer still reaches the user, which is why nobody reports this.
@@ -517,7 +517,7 @@ func TestAFailureNoticeSentAsANewMessageIsCountedAsFallenBack(t *testing.T) {
 	rig.senders.WithMetrics(mx)
 	rig.conn.refuseClosingCode = errcodeStreamExpired
 
-	rig.ran(t, "REQ-M3", 1, "task-1")
+	rig.ran(t, "REQ-M3", "task-1")
 	rig.failed(t, "task-1", false)
 
 	// The user is still told the run failed, which is why nobody reports this.
@@ -543,7 +543,7 @@ func TestAFailureNoticeThatSealsTheBubbleIsCountedAsFinished(t *testing.T) {
 	rig := newBubbleRig(t)
 	rig.senders.WithMetrics(mx)
 
-	rig.ran(t, "REQ-M4", 1, "task-1")
+	rig.ran(t, "REQ-M4", "task-1")
 	rig.failed(t, "task-1", false)
 
 	if got := mx.get("stream_finished"); got != 1 {
