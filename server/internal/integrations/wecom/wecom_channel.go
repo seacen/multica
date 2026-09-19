@@ -536,7 +536,7 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 		// The receipt below and the quote block routableText renders are both
 		// the destination's copy, so the pack is resolved once, up front.
 		pack := c.packFor(ctx, mc)
-		text, ok := mc.routableText(pack)
+		text, ok := mc.routableText()
 		// Traced with the RESOLVED body, not mc.Text.Content: that field is
 		// empty for every media, voice and 图文混排 callback, so tracing it
 		// would print len=0 for exactly the messages an operator turned

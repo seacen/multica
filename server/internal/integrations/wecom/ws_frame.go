@@ -131,15 +131,56 @@ type quotedMessage struct {
 // adapter does not know contributes nothing, the same way a mixed run does.
 func (q quotedMessage) render() string {
 	if !strings.EqualFold(q.MsgType, "mixed") {
-		return q.mixedItem.render()
+		return q.mixedItem.renderQuoted()
 	}
 	var runs []string
 	for _, item := range q.Mixed.MsgItem {
-		if s := item.render(); s != "" {
+		if s := item.renderQuoted(); s != "" {
 			runs = append(runs, s)
 		}
 	}
 	return strings.Join(runs, "\n")
+}
+
+// media lists the quoted message's downloadable attachments, in the order
+// render lays their markers out, each stamped with the marker it stands for.
+//
+// FETCHING THEM IS THE WHOLE OF THE FIX. "[Image]" is all a quote of a picture
+// could be rendered as — the payload carries no sender, no message id and no
+// timestamp to say WHICH picture — so an agent reading that line cannot tell a
+// screenshot it read a minute ago from one it has never seen, and answers
+// "左下角那块看不清" about a picture it does not have. The url and aeskey on
+// the quote are the only thing that resolves it, and the callback hands them
+// over exactly the way it hands over an attachment the sender just made.
+//
+// The stamp closes the other half. Fetching the bytes puts the picture in the
+// attachment list; the marker's occurrence number is what says WHICH entry of
+// that list the quote's marker is, and without it a message carrying two
+// attachments — one quoted, one just sent — hands the agent two markers and
+// two ids with nothing joining them.
+func (q quotedMessage) media() []InboundMedia {
+	var out []InboundMedia
+	if strings.EqualFold(q.MsgType, "mixed") {
+		for _, item := range q.Mixed.MsgItem {
+			out = append(out, item.media()...)
+		}
+	} else {
+		out = q.mixedItem.media()
+	}
+	// Counted PER MARKER, not over the whole list: "[Image: unavailable]" and
+	// "[File: unavailable]" are different strings, so the second picture in a
+	// quote that also carried a document is still that marker's first
+	// occurrence. Counting them together would send the binder looking for a
+	// second "[Image: unavailable]" that is not there, and leave the picture
+	// unnamed.
+	seen := make(map[string]int, len(out))
+	for i := range out {
+		marker := quotedMediaPlaceholder(out[i].Kind)
+		out[i].InlinePlaceholder = marker
+		out[i].InlineIndex = seen[marker]
+		seen[marker]++
+	}
+	return out
 }
 
 // mediaBody is the {url, aeskey} pair every downloadable kind carries. In
@@ -301,6 +342,9 @@ func mediaFor(msgType string, image, file, video mediaBody) (mediaBody, channel.
 // user sent it. A body with no url is skipped: there is nothing to fetch, and
 // carrying it forward would only produce an intent-ledger row for an object
 // that can never exist.
+// The quoted message's attachments come FIRST, because the quote block renders
+// above the sender's own words and the two lists have to agree on order — the
+// engine binds a marker by its occurrence number in the body.
 func (mc aibotMsgCallback) attachments() []InboundMedia {
 	// The quoted message's attachments come FIRST, because that is where its
 	// placeholders are: routableText renders the quote block above the
@@ -362,39 +406,28 @@ func (mc aibotMsgCallback) needsCopy() bool {
 // A quote decorates a message that was readable on its own; it does not
 // rescue one that was not. Ingesting the quote off the back of a kind we
 // cannot read would put somebody else's words in as this person's message.
-func (mc aibotMsgCallback) routableText(c copyPack) (string, bool) {
-	own, ok := mc.ownText()
-	quoted := mc.Quote.render()
-	if quoted == "" {
-		return own, ok
-	}
-	if !ok {
-		return "", false
-	}
-	block := renderQuoteBlock(c, quoted)
-	if strings.TrimSpace(own) == "" {
-		// Quoting something and saying nothing is "look at this", which is a
-		// message worth answering.
-		return block, true
-	}
-	return block + "\n" + own, true
-}
-
-// renderQuoteBlock marks every line of the quote, not only the first: an
-// unmarked second paragraph reads as the sender's own words.
-func renderQuoteBlock(c copyPack, quoted string) string {
-	var b strings.Builder
-	for i, line := range strings.Split(quoted, "\n") {
-		if i > 0 {
-			b.WriteString("\n")
-		}
-		b.WriteString("> ")
-		if i == 0 {
-			b.WriteString(c.QuotePrefix)
-		}
-		b.WriteString(line)
-	}
-	return b.String()
+func (mc aibotMsgCallback) routableText() (string, bool) {
+	// A QUOTE DOES NOT CHANGE WHETHER THIS MESSAGE IS READABLE. It decorates
+	// one that was readable on its own; it does not rescue one that was not.
+	// A location card carrying a quote stays unreadable, or the stored message
+	// would be entirely somebody else's words.
+	//
+	// It still rescues a readable kind with no WORDS: a text message whose
+	// body is empty is ("", true) here, and quoting something while saying
+	// nothing is "look at this", which is a message worth answering. The quote
+	// itself is rendered by quotedContext, in channelMessageFromCallback,
+	// which is the ONE place it happens.
+	//
+	// It used to happen here too, localized through the copy pack. Two
+	// renderings put the quote in the body twice the moment main's landed, and
+	// dropping this one is the right way round for three reasons: upstream's
+	// carries a 500-rune bound this one never had; it is deliberately kept out
+	// of ownCommandSource, so a quoted "/issue …" cannot file an issue nobody
+	// asked for; and the marker vocabulary is the AGENT's rather than the
+	// chat's — the same argument mediaUnavailable is English for. An agent
+	// reads every channel through one prompt, so a quote should not look
+	// different because of whose room it came from.
+	return mc.ownText()
 }
 
 // ownText is the agent-readable body of this callback, and whether there is

@@ -279,18 +279,31 @@ func TestAControlDirectiveBehindAQuoteNeverReachesTheAgent(t *testing.T) {
 		own string
 		// directive is the literal that must not survive into the body.
 		directive string
-		// wantQuoted is whether the quoted figure belongs in the body: it is
-		// the subject of a question, and there is no question in a bare
-		// directive.
+		// wantQuoted is whether the quoted figure belongs in the body.
+		//
+		// It is true for every case now, and that is upstream's answer rather
+		// than this adapter's. This file used to hold the opposite for a BARE
+		// directive — no question was asked, so quoting somebody else's line
+		// into a fresh session puts words there its owner never typed. #7980
+		// settled it the other way and gave the reason a name:
+		// channel.InboundMessage.HasSelectedContext. A quote is context the
+		// sender PICKED by replying to it, so it is input even when the
+		// directive carries no body of its own.
+		//
+		// Converging rather than keeping our side: diverging here means
+		// re-fighting it on every merge, and the case that actually matters —
+		// a directive WITH a question behind a quote — upstream already gets
+		// right. If we ever want the bare case back, the argument is in this
+		// comment and belongs upstream, not in a local fork of the behaviour.
 		wantQuoted bool
 		// startsAChat is /new (StartSession) rather than /clear (which either
 		// appends or marks the session pending).
 		startsAChat bool
 	}{
 		{name: "clear carrying a question", own: "/clear 重新分析这个数", directive: "/clear", wantQuoted: true},
-		{name: "bare clear", own: "/clear", directive: "/clear"},
+		{name: "bare clear", own: "/clear", directive: "/clear", wantQuoted: true},
 		{name: "new carrying a question", own: "/new 重新分析这个数", directive: "/new", wantQuoted: true, startsAChat: true},
-		{name: "bare new", own: "/new", directive: "/new", startsAChat: true},
+		{name: "bare new", own: "/new", directive: "/new", wantQuoted: true, startsAChat: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, conn, _, binder := freshSessionRig(t)

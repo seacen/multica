@@ -664,7 +664,7 @@ func wecomQuotedPlusOwnCallback(t *testing.T, botID, senderID, msgID, quotedURL,
 		t.Fatalf("decode callback: %v", err)
 	}
 	c := copyFor(DefaultLocale)
-	text, ok := mc.routableText(c)
+	text, ok := mc.routableText()
 	if !ok {
 		t.Fatal("the callback is not routable; the fixture is wrong")
 	}
@@ -780,8 +780,7 @@ func TestTheQuotedPictureIsNamedWhenTwoArriveTogether(t *testing.T) {
 	}
 
 	// The whole point, stated as the body the agent is handed.
-	c := copyFor(DefaultLocale)
-	want := "> " + c.QuotePrefix + "[Image: " + quotedID + "]\n这版好一些吗\n[Image]"
+	want := "> " + quotePrefix + " " + "[Image: " + quotedID + "]\n\n这版好一些吗\n[Image]"
 	if body != want {
 		t.Fatalf("durable body = %q\nwant %q\n\n"+
 			"the message carries two attachments — %s (the quoted picture) and %s (the one just sent) — and the "+
@@ -869,8 +868,7 @@ func TestAQuotedPictureThatNeverArrivesSaysSo(t *testing.T) {
 	if attachments != 1 {
 		t.Fatalf("attachment rows = %d, want 1 — only the sender's own picture can land, the quoted url returns 500", attachments)
 	}
-	c := copyFor(DefaultLocale)
-	if want := "> " + c.QuotePrefix + "[Image: unavailable]\n这版好一些吗\n[Image]"; body != want {
+	if want := "> " + quotePrefix + " " + "[Image: unavailable]\n\n这版好一些吗\n[Image]"; body != want {
 		t.Fatalf("durable body = %q, want %q — a marker with no id is how the agent reads "+
 			"\"there was a picture here and it did not arrive\"; no marker at all is how it reads \"there was no picture\"",
 			body, want)

@@ -15,6 +15,8 @@ import (
 	"testing"
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
+
+	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
 )
 
 // quotingFrame is a text message that quotes something.
@@ -41,8 +43,7 @@ func TestQuotedTextReachesTheAgent(t *testing.T) {
 		"text":    map[string]any{"content": "Q3 毛利率 42.1%"},
 	}))
 
-	c := copyFor(DefaultLocale)
-	want := "> " + c.QuotePrefix + "Q3 毛利率 42.1%\n这个数对吗"
+	want := "> " + quotePrefix + " " + "Q3 毛利率 42.1%\n\n这个数对吗"
 	if got.Text != want {
 		t.Fatalf("Text = %q, want %q — without the quoted line the agent is asked whether a number it was never shown is correct", got.Text, want)
 	}
@@ -57,8 +58,7 @@ func TestQuotedMultiLineTextStaysOneBlock(t *testing.T) {
 		"text":    map[string]any{"content": "1. 对齐口径\n2. 回填数据"},
 	}))
 
-	c := copyFor(DefaultLocale)
-	want := "> " + c.QuotePrefix + "1. 对齐口径\n> 2. 回填数据\n第二条还没做"
+	want := "> " + quotePrefix + " " + "1. 对齐口径\n> 2. 回填数据\n\n第二条还没做"
 	if got.Text != want {
 		t.Fatalf("Text = %q, want %q", got.Text, want)
 	}
@@ -89,8 +89,7 @@ func TestAQuotedImageArrivesWithItsBytes(t *testing.T) {
 		"image":   map[string]any{"url": "https://cos.invalid/quoted.enc", "aeskey": testAESKey},
 	}))
 
-	c := copyFor(DefaultLocale)
-	want := "> " + c.QuotePrefix + "[Image: unavailable]\n左下角那块看不清"
+	want := "> " + quotePrefix + " " + "[Image: unavailable]\n\n左下角那块看不清"
 	if got.Text != want {
 		t.Fatalf("Text = %q, want %q", got.Text, want)
 	}
@@ -132,13 +131,12 @@ func TestAQuotedImageArrivesWithItsBytes(t *testing.T) {
 // id, the second is no marker.
 func TestAQuotedPlaceholderSaysSoWhenNothingArrived(t *testing.T) {
 	t.Parallel()
-	c := copyFor(DefaultLocale)
 
 	got, _, _ := dispatchOne(t, quotingFrame("msg-q-unavail", "这张呢", map[string]any{
 		"msgtype": "image",
 		"image":   map[string]any{"url": "https://cos.invalid/gone.enc", "aeskey": testAESKey},
 	}))
-	if want := "> " + c.QuotePrefix + "[Image: unavailable]\n这张呢"; got.Text != want {
+	if want := "> " + quotePrefix + " " + "[Image: unavailable]\n\n这张呢"; got.Text != want {
 		t.Fatalf("Text = %q, want %q", got.Text, want)
 	}
 
@@ -201,8 +199,7 @@ func TestAQuotedPictureComesBeforeTheSendersOwn(t *testing.T) {
 		t.Errorf("the sender's own picture was stamped with %q; its placeholder must be left exactly as it was",
 			wm.Media[1].InlinePlaceholder)
 	}
-	c := copyFor(DefaultLocale)
-	if want := "> " + c.QuotePrefix + "[Image: unavailable]\n这版好一些吗\n[Image]"; got.Text != want {
+	if want := "> " + quotePrefix + " " + "[Image: unavailable]\n\n这版好一些吗\n[Image]"; got.Text != want {
 		t.Fatalf("Text = %q, want %q", got.Text, want)
 	}
 }
@@ -301,7 +298,6 @@ func TestAQuotedAttachmentWithNoURLIsNotQueued(t *testing.T) {
 // original was, and each one renders the way it would as a message of its own.
 func TestQuotedKindsEachRenderTheirOwnWay(t *testing.T) {
 	t.Parallel()
-	c := copyFor(DefaultLocale)
 	cases := []struct {
 		name  string
 		quote map[string]any
@@ -334,11 +330,11 @@ func TestQuotedKindsEachRenderTheirOwnWay(t *testing.T) {
 				if i > 0 {
 					b.WriteString("\n> ")
 				} else {
-					b.WriteString("> " + c.QuotePrefix)
+					b.WriteString("> " + quotePrefix + " ")
 				}
 				b.WriteString(line)
 			}
-			want := b.String() + "\n问题在这"
+			want := b.String() + "\n\n问题在这"
 			if got.Text != want {
 				t.Fatalf("Text = %q, want %q", got.Text, want)
 			}
@@ -354,8 +350,7 @@ func TestQuoteWithNoQuestionIsStillAMessage(t *testing.T) {
 		"msgtype": "text",
 		"text":    map[string]any{"content": "客户改主意了"},
 	}))
-	c := copyFor(DefaultLocale)
-	if got.Text != "> "+c.QuotePrefix+"客户改主意了" {
+	if got.Text != "> "+quotePrefix+" "+"客户改主意了" {
 		t.Fatalf("Text = %q", got.Text)
 	}
 	if n := len(conn.frames); n != 0 {
@@ -515,8 +510,17 @@ func TestABareFreshCommandUnderAQuoteIsNotRecomposed(t *testing.T) {
 		"msgtype": "text",
 		"text":    map[string]any{"content": "Q3 毛利率 42.1%"},
 	}))
-	if got.ForceFresh {
-		t.Fatal("a bare /clear must not claim the adapter already stripped anything")
+	// ForceFresh is true, and accurately so: a quote counts as content
+	// (HasSelectedContext, #7980), so normalizeWeComControlLayout rebuilds the
+	// body and the directive really is gone from Text. This file used to
+	// assert the opposite — see the note in
+	// regression_fresh_session_behind_quote_test.go for the position we gave up
+	// and why converging on upstream is the right trade.
+	if !got.ForceFresh {
+		t.Fatal("the adapter stripped the directive and did not say so, so Router will strip it again")
+	}
+	if strings.Contains(got.Text, "/clear") {
+		t.Fatalf("Text = %q, want the directive gone — ForceFresh claims it already is", got.Text)
 	}
 }
 
@@ -531,11 +535,22 @@ func TestABareFreshCommandUnderAQuotedImageIsNotRecomposed(t *testing.T) {
 		"msgtype": "image",
 		"image":   map[string]any{"url": "https://cos.invalid/theirs.enc", "aeskey": testAESKey},
 	}))
-	if got.ForceFresh {
-		t.Fatal("a quoted picture made a bare /clear look like an attachment-bearing turn")
+	if !got.ForceFresh {
+		t.Fatal("the adapter stripped the directive and did not say so, so Router will strip it again")
 	}
-	if got.CommandText != "/clear" {
-		t.Fatalf("CommandText = %q, want the bare directive — emptied, the router cannot see a command at all", got.CommandText)
+	// CommandText is the enriched body, not the directive, and that follows
+	// from the same decision: a quote counts as content, so this is a real turn
+	// and the bare /clear has already been consumed. Handing the directive on
+	// would have Router consume it twice.
+	//
+	// Safe because the body left cannot parse as a command — a quote opens with
+	// "> " and a placeholder with "[" — which is the argument the block in
+	// ws_frame.go makes for doing it at all.
+	if _, isCommand := engine.ParseControlCommand(got.CommandText); isCommand {
+		t.Fatalf("CommandText = %q parses as a command; Router would consume it a second time", got.CommandText)
+	}
+	if got.CommandText == "/clear" {
+		t.Fatal("the directive was handed on after being consumed")
 	}
 	if !strings.Contains(got.Text, "[Image: unavailable]") {
 		t.Fatalf("Text = %q, want the quoted picture's placeholder still in it", got.Text)

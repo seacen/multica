@@ -514,7 +514,6 @@ func TestZhHansPackIsTheCopyThatAlreadyShipped(t *testing.T) {
 		"InboxDetailLink":      "查看详情",
 		"InboxTypeFallback":    "新消息",
 
-		"QuotePrefix":     "引用：",
 		"MediaTooLarge":   "抱歉，附件太大了，我这边收不下。",
 		"MediaUnreadable": "抱歉，有附件没能收到，麻烦重新发一次。",
 		"MediaSendFailed": "⚠️ 有文件没能发出来，我这边保留着，需要的话我再试一次。",

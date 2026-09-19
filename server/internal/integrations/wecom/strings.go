@@ -126,11 +126,6 @@ type copyPack struct {
 	// only handles text reads that as the bot being broken.
 	UnsupportedMsgType string
 
-	// QuotePrefix heads the block a quoted message is rendered as. Every
-	// line of the quote is marked, not just the first — an unmarked second
-	// paragraph reads as the sender's own words.
-	QuotePrefix string
-
 	// FreshPending confirms /clear: the next chat message stays in the
 	// conversation it is already in and runs without the context before it.
 	// ChatStarted confirms /new, which is the other half of that split — a
@@ -390,7 +385,6 @@ var copyPacks = map[Locale]copyPack{
 		AgentOffline:         "⚠️ 智能体当前不在线，你的消息已收到，等它上线后会处理。",
 		AgentArchived:        "⚠️ 该智能体已归档，无法回复。请联系工作区管理员。",
 		UnsupportedMsgType:   "抱歉，我暂时无法处理这类消息。",
-		QuotePrefix:          "引用：",
 		FreshPending:         "✅ 已准备从空上下文运行。你的下一条聊天消息仍会进入当前对话，但不会带上之前的上下文。",
 		ChatStarted:          "✅ 已新建 Multica 对话。你的下一条消息会进入该对话。",
 		IssueUsage:           "请填写任务标题，格式如下：\n\n`/issue <标题>`\n`[描述]`（可选）",
@@ -470,7 +464,6 @@ var copyPacks = map[Locale]copyPack{
 		ChatStarted:          "✅ Started a new Multica chat. Your next message will enter it.",
 		IssueUsage:           "Give the task a title, like this:\n\n`/issue <title>`\n`[description]` (optional)",
 		UnsupportedMsgType:   "Sorry, I can't read that kind of message.",
-		QuotePrefix:          "Quoted: ",
 		MediaTooLarge:        "Sorry, that attachment is too big for me to take.",
 		MediaUnreadable:      "Sorry, an attachment didn't come through — please send it again.",
 		MediaSendFailed:      "⚠️ I couldn't send one of the files. It is still here — say the word and I'll try again.",
