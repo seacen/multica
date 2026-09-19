@@ -591,12 +591,19 @@ func TestOnlyAMessageThatReadsThePackPaysForTheLookup(t *testing.T) {
 		t.Error("a plain sentence asked for a locale lookup it has no string to spend it on")
 	}
 
+	// A QUOTING MESSAGE NO LONGER PAYS EITHER, and that is the point of this
+	// case rather than an accident. It used to: routableText rendered the quote
+	// block through the copy pack, so the destination's language had to be
+	// resolved before the body could be built. quotedContext renders it now,
+	// with the fixed "[Quote]" marker — agent vocabulary, not the chat's — so
+	// the pack buys this path nothing, and the lookup it was costing is a
+	// per-destination database read on every quoted message.
 	quoting := plain
 	quoting.Quote = quotedMessage{}
 	quoting.Quote.MsgType = "text"
 	quoting.Quote.Text.Content = "客户改主意了"
-	if !quoting.needsCopy() {
-		t.Error("a quoting message skipped the lookup, so its quote prefix would be written in the deployment default rather than the destination's language")
+	if quoting.needsCopy() {
+		t.Error("a quoting message still paid for a locale lookup whose result nothing reads")
 	}
 
 	unreadable := aibotMsgCallback{MsgType: "location"}

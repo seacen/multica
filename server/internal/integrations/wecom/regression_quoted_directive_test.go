@@ -43,7 +43,7 @@ func quotedDirectiveCallback(directive string) aibotMsgCallback {
 func TestABareNewBehindAQuoteLeavesOnlyTheQuote(t *testing.T) {
 	t.Parallel()
 	mc := quotedDirectiveCallback("/new")
-	msg := channelMessageFromCallback("bot-1", "", mc, copyFor(DefaultLocale), mc.Text.Content, "req-qn")
+	msg := channelMessageFromCallback("bot-1", "", mc, mc.Text.Content, "req-qn")
 
 	if strings.Contains(msg.Text, "/new") {
 		t.Fatalf("Text = %q — the directive survived into the body Router will persist as the "+
@@ -72,7 +72,7 @@ func TestABareNewBehindAQuoteLeavesOnlyTheQuote(t *testing.T) {
 func TestABareClearBehindAQuoteKeepsTheQuoteAndForcesFresh(t *testing.T) {
 	t.Parallel()
 	mc := quotedDirectiveCallback("/clear")
-	msg := channelMessageFromCallback("bot-1", "", mc, copyFor(DefaultLocale), mc.Text.Content, "req-qc")
+	msg := channelMessageFromCallback("bot-1", "", mc, mc.Text.Content, "req-qc")
 
 	if msg.Text != "> [Quote] Q3 毛利率 42.1%" {
 		t.Fatalf("Text = %q, want the quote alone", msg.Text)
@@ -113,7 +113,7 @@ func TestAQuotedScreenshotHandsRouterTheSendersOwnBody(t *testing.T) {
 	mc.Quote.Text.Content = "生产库连接数打满了"
 
 	own, _ := mc.ownText()
-	msg := channelMessageFromCallback("bot-1", "", mc, copyFor(DefaultLocale), own, "req-qimg")
+	msg := channelMessageFromCallback("bot-1", "", mc, own, "req-qimg")
 
 	if msg.Text != "> [Quote] 生产库连接数打满了\n\n[Image]" {
 		t.Fatalf("Text = %q, want the quote above the placeholder", msg.Text)
@@ -148,7 +148,7 @@ func TestAQuotedScreenshotWithWordsKeepsTheTypedCommand(t *testing.T) {
 	mc.Quote.Text.Content = "生产库连接数打满了"
 
 	own, _ := mc.ownText()
-	msg := channelMessageFromCallback("bot-1", "", mc, copyFor(DefaultLocale), own, "req-qmixed")
+	msg := channelMessageFromCallback("bot-1", "", mc, own, "req-qmixed")
 
 	if msg.CommandText != "/issue 登录坏了" {
 		t.Fatalf("CommandText = %q, want the sender's own typed command", msg.CommandText)
@@ -170,7 +170,7 @@ func TestABareDirectiveWithNoQuoteIsStillTheSentinel(t *testing.T) {
 			mc.From.UserID = "TUSER"
 			mc.Text.Content = directive
 
-			msg := channelMessageFromCallback("bot-1", "", mc, copyFor(DefaultLocale), mc.Text.Content, "req-bare")
+			msg := channelMessageFromCallback("bot-1", "", mc, mc.Text.Content, "req-bare")
 
 			if msg.Text != directive {
 				t.Fatalf("Text = %q, want %q left intact for Router's sentinel path", msg.Text, directive)
@@ -198,7 +198,7 @@ func TestAQuotedDocumentDoesNotBecomeTheBody(t *testing.T) {
 	mc.Quote.MsgType = "text"
 	mc.Quote.Text.Content = strings.Repeat("很长的报告内容", 400) // 2800 runes
 
-	msg := channelMessageFromCallback("bot-1", "", mc, copyFor(DefaultLocale), mc.Text.Content, "req-long")
+	msg := channelMessageFromCallback("bot-1", "", mc, mc.Text.Content, "req-long")
 
 	if !strings.HasSuffix(msg.Text, "…\n\n这个怎么处理") {
 		t.Fatalf("Text does not end with an elided quote followed by the sender's words; got tail %q",

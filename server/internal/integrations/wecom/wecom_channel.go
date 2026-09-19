@@ -536,13 +536,13 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 		// The receipt below and the quote block routableText renders are both
 		// the destination's copy, so the pack is resolved once, up front.
 		pack := c.packFor(ctx, mc)
-		text, ok := mc.routableText()
+		text, ok := mc.ownText()
 		// Traced with the RESOLVED body, not mc.Text.Content: that field is
 		// empty for every media, voice and 图文混排 callback, so tracing it
 		// would print len=0 for exactly the messages an operator turned
 		// tracing on to look at.
 		traceInbound(log, mc, text)
-		msg := channelMessageFromCallback(c.botID, c.botDisplayName, mc, pack, text, env.Headers.ReqID)
+		msg := channelMessageFromCallback(c.botID, c.botDisplayName, mc, text, env.Headers.ReqID)
 		if !ok {
 			// Nothing in this message can be read: a kind the adapter does
 			// not know (a location card), or a known kind that arrived

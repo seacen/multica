@@ -220,7 +220,7 @@ func wecomImageCallback(t *testing.T, botID, senderID, msgID, url string) channe
 	if !ok {
 		t.Fatal("image callback is not routable; the fixture is wrong")
 	}
-	return channelMessageFromCallback(botID, "", mc, copyFor(DefaultLocale), text, "req-bind-1")
+	return channelMessageFromCallback(botID, "", mc, text, "req-bind-1")
 }
 
 // stalledCOSServer accepts the request and then holds it open, so the media
@@ -497,7 +497,7 @@ func wecomMixedCallback(t *testing.T, botID, botDisplayName, senderID, msgID, ch
 	if !ok {
 		t.Fatal("mixed callback is not routable; the fixture is wrong")
 	}
-	return channelMessageFromCallback(botID, botDisplayName, mc, copyFor(DefaultLocale), text, "req-mixed-1")
+	return channelMessageFromCallback(botID, botDisplayName, mc, text, "req-mixed-1")
 }
 
 // runMixedIssueThroughTheRouter drives one 图文混排 through the real Router,
@@ -663,12 +663,11 @@ func wecomQuotedPlusOwnCallback(t *testing.T, botID, senderID, msgID, quotedURL,
 	if err := json.Unmarshal(raw, &mc); err != nil {
 		t.Fatalf("decode callback: %v", err)
 	}
-	c := copyFor(DefaultLocale)
-	text, ok := mc.routableText()
+	text, ok := mc.ownText()
 	if !ok {
 		t.Fatal("the callback is not routable; the fixture is wrong")
 	}
-	return channelMessageFromCallback(botID, "", mc, c, text, "req-quote-1")
+	return channelMessageFromCallback(botID, "", mc, text, "req-quote-1")
 }
 
 // TestTheQuotedPictureIsNamedWhenTwoArriveTogether is the case one attachment

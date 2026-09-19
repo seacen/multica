@@ -387,47 +387,18 @@ func (mc aibotMsgCallback) ownAttachments() []InboundMedia {
 // what lets the read loop skip the per-destination language lookup for the
 // overwhelmingly common case.
 func (mc aibotMsgCallback) needsCopy() bool {
-	if strings.EqualFold(mc.MsgType, "text") {
-		return mc.Quote.render() != ""
-	}
-	return true
-}
-
-// routableText returns the text this callback is stored and read as, and
-// whether there is any. It is the message's own body with any quoted message
-// rendered above it — see ownText for the body and quotedMessage.render for
-// the quote.
-//
-// Quoting is how a person asks about one specific thing in a busy room: they
-// long-press the message, hit 引用, and type their question under it. Without
-// the quote the agent is handed the question with its subject removed — "这个
-// 数对吗" about nothing — and answers into the void.
-//
-// A quote decorates a message that was readable on its own; it does not
-// rescue one that was not. Ingesting the quote off the back of a kind we
-// cannot read would put somebody else's words in as this person's message.
-func (mc aibotMsgCallback) routableText() (string, bool) {
-	// A QUOTE DOES NOT CHANGE WHETHER THIS MESSAGE IS READABLE. It decorates
-	// one that was readable on its own; it does not rescue one that was not.
-	// A location card carrying a quote stays unreadable, or the stored message
-	// would be entirely somebody else's words.
+	// A QUOTE NO LONGER COSTS A LOOKUP. It used to: routableText rendered the
+	// quote block through the copy pack, so a plain sentence carrying a quote
+	// needed the destination's language resolved before the body could be
+	// built. quotedContext renders it now, with a fixed marker that is the
+	// agent's vocabulary rather than the chat's, so the pack buys that path
+	// nothing — and the lookup is a per-destination database read on every
+	// quoted message.
 	//
-	// It still rescues a readable kind with no WORDS: a text message whose
-	// body is empty is ("", true) here, and quoting something while saying
-	// nothing is "look at this", which is a message worth answering. The quote
-	// itself is rendered by quotedContext, in channelMessageFromCallback,
-	// which is the ONE place it happens.
-	//
-	// It used to happen here too, localized through the copy pack. Two
-	// renderings put the quote in the body twice the moment main's landed, and
-	// dropping this one is the right way round for three reasons: upstream's
-	// carries a 500-rune bound this one never had; it is deliberately kept out
-	// of ownCommandSource, so a quoted "/issue …" cannot file an issue nobody
-	// asked for; and the marker vocabulary is the AGENT's rather than the
-	// chat's — the same argument mediaUnavailable is English for. An agent
-	// reads every channel through one prompt, so a quote should not look
-	// different because of whose room it came from.
-	return mc.ownText()
+	// A kind this adapter cannot read still needs one: its receipt is a
+	// sentence the person reads.
+	_, readable := mc.ownText()
+	return !readable
 }
 
 // ownText is the agent-readable body of this callback, and whether there is
@@ -707,7 +678,7 @@ func (m InboundMedia) inline(ref channel.MediaRef) channel.MediaRef {
 // botDisplayName is the bot's name in a chat, from the installation config. It
 // is used for one thing: recognising where the sender's @-mention ends. Empty
 // is fine and falls back to a whitespace heuristic; see stripLeadingMentions.
-func channelMessageFromCallback(botID, botDisplayName string, mc aibotMsgCallback, c copyPack, text, reqID string) channel.InboundMessage {
+func channelMessageFromCallback(botID, botDisplayName string, mc aibotMsgCallback, text, reqID string) channel.InboundMessage {
 	chatType := channel.ChatTypeP2P
 	if strings.EqualFold(mc.ChatType, "group") {
 		chatType = channel.ChatTypeGroup
