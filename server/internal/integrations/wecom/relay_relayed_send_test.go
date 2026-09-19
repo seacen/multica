@@ -503,64 +503,6 @@ func TestRelayedReply_ALongAnswerIsNotResentFromTheTop(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// 3. a completion of whitespace is not a message
-// ---------------------------------------------------------------------------
-
-// The two paths have to read an all-whitespace completion the same way, because
-// which one runs is decided by where the WS lease happens to sit. Locally,
-// sendAsMessage asks hasVisibleChar, sends nothing, and lets the file carry the
-// reply's outcome; a frame routed here was asking `f.Content != ""`, so "\n"
-// became a blank message in the chat plus a delivered reply, and the file was
-// told the words had already answered.
-//
-// REVERSE VERIFICATION: restore `f.Content != ""` and `f.Content == ""` in
-// deliverRelayed and this reports a blank message on the socket, outbound
-// _delivered = 1, and no skip. Build and vet stay silent — both spellings
-// compile.
-func TestRelayedReply_WhitespaceOnlyContentIsNotSentAndTheFilesCarryTheReply(t *testing.T) {
-	t.Parallel()
-	q := &fakeOutboundQueries{
-		sessionBinding: db.ChannelChatSessionBinding{ChannelChatID: "CHAT_1", ChatType: "group"},
-		installation:   db.ChannelInstallation{Status: string(InstallationActive)},
-		// No file bound after all, which is what makes the reply's own outcome
-		// observable: with the files carrying it, an empty turn is a skip.
-		attachments: nil,
-	}
-	reg := newSendersRegistry()
-	instID := mustTestUUID(t)
-	conn := newMediaConn()
-	reg.set(instID, conn.newSender())
-	mx := newCountingMetrics()
-	o := NewOutbound(q, reg, nil, testLogger(),
-		WithOutboundMetrics(mx), WithAttachments(&fakeObjectStore{key: "obj/bin", data: []byte("DATA")}))
-	o.spawn = func(f func()) { f() }
-
-	res := o.deliverRelayed(context.Background(), relayFrame{
-		Kind:           relayKindReply,
-		InstallationID: util.UUIDToString(instID),
-		ChatID:         "CHAT_1",
-		ChatType:       chatTypeGroupInt,
-		Content:        "\n",
-		MessageID:      testMessageID,
-		WorkspaceID:    testWorkspaceID,
-		SessionID:      testSessionID,
-		TaskID:         testTaskID,
-		CarriesFiles:   true,
-	})
-	if res.outcome != outcomeDone {
-		t.Fatalf("outcome = %v, want outcomeDone", res.outcome)
-	}
-
-	if got := markdownSends(t, conn); len(got) != 0 {
-		t.Errorf("the chat received %q, want nothing — a completion of whitespace is not a "+
-			"message, and the local path sends none", got)
-	}
-	if got := mx.get("outbound_delivered"); got != 0 {
-		t.Errorf("outbound_delivered = %d, want 0 — no words reached anybody", got)
-	}
-	if got := mx.get("outbound_skipped:" + string(skipNothingToSay)); got != 1 {
-		t.Errorf("outbound_skipped:%s = %d, want 1 — with no words, the files carry this "+
-			"reply's outcome, and there turned out to be none", skipNothingToSay, got)
-	}
-}
+// The whitespace-only relayed reply is asserted in outbound_whitespace_test.go,
+// which is where #8347 put it upstream. The copy that used to live here was
+// the same test before that extraction.

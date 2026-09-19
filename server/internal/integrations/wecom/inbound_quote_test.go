@@ -577,7 +577,7 @@ func TestOnlyAMessageThatReadsThePackPaysForTheLookup(t *testing.T) {
 	}
 
 	quoting := plain
-	quoting.Quote = &quotedMessage{}
+	quoting.Quote = quotedMessage{}
 	quoting.Quote.MsgType = "text"
 	quoting.Quote.Text.Content = "客户改主意了"
 	if !quoting.needsCopy() {

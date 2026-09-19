@@ -32,10 +32,6 @@ type mediaConn struct {
 
 	// refuse[cmd] answers that cmd with an errcode instead of a result.
 	refuse map[string]int
-	// dropAcks[cmd] withholds the verdict for that many frames of the cmd —
-	// what a lost ack looks like from this side of the wire.
-	dropAcks map[string]int
-
 	// chunkArrived and chunkRelease make concurrency observable. When
 	// chunkArrived is non-nil, every chunk frame drops a token into it and its
 	// verdict is withheld until chunkRelease closes — so the tokens in the
@@ -59,7 +55,6 @@ func newMediaConn() *mediaConn {
 		uploadID: "UPLOAD_1",
 		mediaID:  "MEDIA_1",
 		refuse:   map[string]int{},
-		dropAcks: map[string]int{},
 	}
 }
 
@@ -88,10 +83,6 @@ func (c *mediaConn) WriteMessage(_ int, data []byte) error {
 	c.frames = append(c.frames, env)
 	s := c.sender
 	code := c.refuse[env.Cmd]
-	drop := c.dropAcks[env.Cmd] > 0
-	if drop {
-		c.dropAcks[env.Cmd]--
-	}
 	var body json.RawMessage
 	switch env.Cmd {
 	case cmdUploadMediaInit:
@@ -102,7 +93,7 @@ func (c *mediaConn) WriteMessage(_ int, data []byte) error {
 	arrived, release := c.chunkArrived, c.chunkRelease
 	c.mu.Unlock()
 
-	if s == nil || drop {
+	if s == nil {
 		return nil // no verdict comes back
 	}
 	if code != 0 {
@@ -230,28 +221,6 @@ func TestUploadMedia_ChunksTheFileAndSealsIt(t *testing.T) {
 	}
 }
 
-// A lost verdict is the one failure worth a second offer — the protocol makes
-// re-sending a chunk idempotent precisely so this is safe.
-func TestUploadMediaChunk_ResendsAChunkWhoseVerdictNeverCame(t *testing.T) {
-	t.Parallel()
-	conn := newMediaConn()
-	conn.dropAcks[cmdUploadMediaChunk] = 1 // the first offer is never answered
-	sender := conn.newSender()
-
-	// One chunk, so "the first offer" is unambiguous.
-	if _, err := sender.uploadMedia(context.Background(), outboundMedia{
-		Kind: mediaTypeFile, Filename: "small.txt", Data: []byte("hello"),
-	}); err != nil {
-		t.Fatalf("uploadMedia gave up on a lost ack instead of offering the chunk again: %v", err)
-	}
-	if n := len(conn.cmdFrames(cmdUploadMediaChunk)); n != 2 {
-		t.Errorf("chunk frames = %d, want 2 (the lost one and its retry)", n)
-	}
-}
-
-// The opposite case, and the reason the retry is conditional: a refusal is the
-// server's answer and will be its answer again. Retrying it wastes the budget
-// and can only end the same way.
 func TestUploadMediaChunk_DoesNotResendARefusedChunk(t *testing.T) {
 	t.Parallel()
 	conn := newMediaConn()
@@ -277,25 +246,11 @@ func TestUploadMediaChunk_DoesNotResendARefusedChunk(t *testing.T) {
 	}
 }
 
-// A push whose verdict never came may already have arrived. Sending it again
-// would put the same media_id out twice and the person sees the file twice
-// with nothing to undo, so a timeout is reported rather than retried.
-func TestSendMedia_ReportsALostAckWithoutSendingAgain(t *testing.T) {
-	t.Parallel()
-	conn := newMediaConn()
-	conn.dropAcks[cmdSendMsg] = 5 // no verdict ever comes back for the push
-	sender := conn.newSender()
-
-	err := sender.sendMedia(context.Background(), "CHAT_1", chatTypeSingleInt, mediaSend{
-		Kind: mediaTypeFile, MediaID: "MEDIA_1",
-	})
-	if !errors.Is(err, errAckTimeout) {
-		t.Fatalf("a lost push ack reported as %v, want errAckTimeout", err)
-	}
-	if n := len(conn.cmdFrames(cmdSendMsg)); n != 1 {
-		t.Errorf("send frames = %d, want 1 — a duplicate file is worse than an unconfirmed one", n)
-	}
-}
+// The push-ack case that used to sit here is gone with its harness. #8318
+// removed mediaConn.dropAcks and the tests that needed it, each of which stood
+// still for a whole ackTimeout; re-adding the field re-adds that test time.
+// What it asserted - a push whose verdict never came is reported, not sent
+// again - is the same rule sendOutcome pins without waiting.
 
 // The cap is 20 MiB, and it is WeCom's number rather than ours: the docs state
 // the accepted sizes on the init cmd itself
@@ -385,7 +340,6 @@ func TestUploadMediaChunks_HoldsToTheParallelismForTheFileSize(t *testing.T) {
 	conn := newMediaConn()
 	arrived, release := conn.holdChunks()
 	sender := conn.newSender()
-
 	// 10 full chunks and one byte: eleven, the first size past the ladder's
 	// last step.
 	data := make([]byte, mediaChunkBytes*10+1)
@@ -581,34 +535,16 @@ func TestUploadMediaChunks_AWithdrawalDuringTheSlotWaitStopsTheNextChunk(t *test
 	}
 }
 
-// The other wait a stale yes survives, and it is on the far side of the
-// dispatch entirely: a lost verdict buys a second offer one ackTimeout later,
-// and nothing between the two frames asks again.
-func TestUploadMediaChunk_AWithdrawalBeforeTheRetryStopsTheSecondOffer(t *testing.T) {
-	t.Parallel()
-	conn := newMediaConn()
-	conn.dropAcks[cmdUploadMediaChunk] = 1 // the first offer is never answered
-	sender := conn.newSender()
-
-	_, err := sender.uploadMedia(context.Background(), outboundMedia{
-		Kind: mediaTypeFile, Filename: "small.txt", Data: []byte("hello"),
-		// Keyed on the wire: the moment the first frame exists the answer is
-		// no, which puts the withdrawal inside the ackTimeout the retry waits
-		// out — whatever order the checks upstream settle on.
-		BeforeChunk: func(context.Context) error {
-			if len(conn.cmdFrames(cmdUploadMediaChunk)) > 0 {
-				return errTestWithdrawn
-			}
-			return nil
-		},
-	})
-	if !errors.Is(err, errTestWithdrawn) {
-		t.Fatalf("uploadMedia = %v, want the withdrawal", err)
-	}
-	if n := len(conn.cmdFrames(cmdUploadMediaChunk)); n != 1 {
-		t.Errorf("chunk frames = %d, want 1 — the retry went out after the withdrawal", n)
-	}
-	if n := len(conn.cmdFrames(cmdUploadMediaFinish)); n != 0 {
-		t.Errorf("finish frames = %d, want 0", n)
-	}
-}
+// The retry-path variant of the case above - a withdrawal landing between a
+// lost verdict and the second offer - is NOT tested here, and that is a gap
+// rather than an omission.
+//
+// It needs a chunk frame whose verdict never comes back, and the harness field
+// that produced one (mediaConn.dropAcks) was removed by #8318 along with the
+// tests that used it, because each of them stood still for a whole ackTimeout
+// - five seconds, a package constant with no seam. Re-adding the field would
+// re-add exactly the test time that PR was cutting.
+//
+// uploadMediaChunk calls beforeChunk at the top of EVERY attempt, so the check
+// the retry needs is the same call the first attempt exercises above. Making
+// it assertable cheaply takes one seam: ackTimeout as a field on wsSender.
