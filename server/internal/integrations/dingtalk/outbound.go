@@ -62,13 +62,9 @@ func NewOutbound(q outboundQueries, decrypt Decrypter, client *Client, ack *ackN
 // and the user is left staring at the "👀 On it" ack forever — and a cancelled
 // run still has to clear the source message's reaction.
 //
-// DingTalk is the odd one out among the channel adapters. Slack and Lark put a
-// reaction on the user's own message and take it off again; the classic robot
-// API this adapter sends through exposes no reaction, so ack.go's indicator is
-// a real, non-retractable message that promised a reply. Closing it can only
-// mean posting a second message withdrawing that promise — which is why the
-// cancel path stays behind processEvent's channel-provenance gate. A badge we
-// remove was ours to remove; a message we post is not.
+// The cancel path stays behind processEvent's channel-provenance gate anyway:
+// whatever this adapter does about a run, it may only do it for runs that came
+// in through DingTalk.
 func (o *Outbound) Register(bus *events.Bus) {
 	bus.Subscribe(protocol.EventChatDone, o.handleEvent)
 	bus.Subscribe(protocol.EventTaskFailed, o.handleEvent)
@@ -264,14 +260,6 @@ func bindingFromTaskDelivery(delivery db.ChannelTaskDelivery) db.ChannelChatSess
 	}
 }
 
-// cancelledNoticeText withdraws the processing ack when a run is cancelled.
-// ack.go posts a real, non-retractable message promising a reply ("👀 On it —
-// I'll reply here when it's ready"), and a cancellation is the one ending that
-// produces nothing at all, so the promise has to be withdrawn in the same place
-// it was made. Kept short and in the ack's own language for the same reason the
-// ack is: it is a message in the user's conversation, not a status badge.
-const cancelledNoticeText = "⚠️ That run was cancelled — no reply is coming for it."
-
 // eventContent extracts the deliverable text from an EventChatDone payload
 // (typed, or its map form after a serialization round trip), an
 // EventTaskFailed payload, or an EventTaskCancelled event. Empty means stay
@@ -282,13 +270,17 @@ const cancelledNoticeText = "⚠️ That run was cancelled — no reply is comin
 // omitted while an auto-retry is pending (the retry attempt reports its own
 // outcome), so error-present means deliverable.
 //
-// Task-cancelled carries no text of its own — broadcastTaskEvent publishes the
-// task row's ids and status and nothing else — so the notice is fixed and read
-// off the event type rather than the payload.
+// Task-cancelled contributes nothing here on purpose. ack.go's indicator is a
+// REACTION, not a message — sendReaction, ack.go — so a cancelled run is
+// withdrawn by taking the reaction off, which is what #8125 does. A second
+// message saying it was cancelled would be an extra line in the conversation
+// for an ending the badge already reports.
+//
+// This file used to post one, on the premise that the classic robot API
+// exposes no reaction and the ack was therefore an unretractable message. That
+// premise is stale: ack.go has used reactions since. The PR built on it (#8346)
+// was declined for exactly this reason, and correctly.
 func eventContent(e events.Event) string {
-	if e.Type == protocol.EventTaskCancelled {
-		return cancelledNoticeText
-	}
 	switch p := e.Payload.(type) {
 	case protocol.ChatDonePayload:
 		return p.Content
