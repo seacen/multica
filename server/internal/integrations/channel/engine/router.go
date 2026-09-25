@@ -25,9 +25,9 @@ import (
 // channel.InboundMessage and calls Handle, which routes by ChannelType to that
 // platform's registered resolver set and runs the same ordered pipeline for
 // every platform — installation route → two-phase dedup → group @bot filter →
-// identity + membership → ensure session → append+mark → /issue → durable
-// debounced run trigger + detached media binding — then drives the detached
-// outbound replier + typing indicator.
+// identity + membership → invoke permission → ensure session → append+mark →
+// /issue → durable debounced run trigger + detached media binding — then drives
+// the detached outbound replier + typing indicator.
 //
 // The core contains no platform specifics: everything platform-shaped lives
 // behind the resolver interfaces (a feishu ResolverSet is the first
@@ -369,6 +369,24 @@ func (r *Router) processClaimed(ctx context.Context, set ResolverSet, msg channe
 		default:
 			return Result{}, finalizeRelease, fmt.Errorf("resolve sender: %w", err)
 		}
+	}
+
+	// 4b. Invoke permission (MUL-3963): the verdict the web chat applies
+	//     before it opens a session. It judges the sender, never the installer
+	//     who owns a group's route, and runs before anything is stored, so a
+	//     refused turn reaches no Chat, no /issue and no later run's context.
+	allowed, err := r.tasks.CanMemberInvokeAgent(ctx, inst.AgentID, identity.UserID)
+	if err != nil {
+		return Result{}, finalizeRelease, fmt.Errorf("check invoke permission: %w", err)
+	}
+	if !allowed {
+		_ = set.Audit.RecordDrop(ctx, inst.ID, msg, DropReasonInvokeDenied)
+		return Result{
+			Outcome:        OutcomeInvokeDenied,
+			DropReason:     DropReasonInvokeDenied,
+			InstallationID: inst.ID,
+			Sender:         msg.Source.SenderID,
+		}, finalizeMark, nil
 	}
 
 	// 5-6. Resolve the current Chat route, then either append normally or

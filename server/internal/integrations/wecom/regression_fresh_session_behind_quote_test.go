@@ -48,6 +48,10 @@ type freshWatchingTasks struct {
 	queued []bool
 }
 
+func (*freshWatchingTasks) CanMemberInvokeAgent(context.Context, pgtype.UUID, pgtype.UUID) (bool, error) {
+	return true, nil
+}
+
 func (f *freshWatchingTasks) EnqueueChannelChatTask(_ context.Context, _ db.ChatSession, _ pgtype.UUID, forceFresh bool, _ int64, _ pgtype.UUID, _ int64) (db.AgentTaskQueue, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

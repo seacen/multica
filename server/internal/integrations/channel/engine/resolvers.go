@@ -31,6 +31,7 @@ const (
 	OutcomeIssueUsage    Outcome = "issue_usage"
 	OutcomeAgentOffline  Outcome = "agent_offline"
 	OutcomeAgentArchived Outcome = "agent_archived"
+	OutcomeInvokeDenied  Outcome = "invoke_denied"
 )
 
 // DropReason enumerates the drop-audit categories. Values match the legacy
@@ -44,6 +45,7 @@ const (
 	DropReasonDuplicate           DropReason = "duplicate"
 	DropReasonRevokedInstallation DropReason = "revoked_installation"
 	DropReasonInvalidEvent        DropReason = "invalid_event"
+	DropReasonInvokeDenied        DropReason = "invocation_not_allowed"
 )
 
 // Result is the typed verdict the Router produces for one inbound message,
@@ -436,6 +438,7 @@ type IssueCreator interface {
 // TaskEnqueuer is the narrow subset of service.TaskService the Router needs to
 // trigger a chat run. Shared across platforms.
 type TaskEnqueuer interface {
+	CanMemberInvokeAgent(ctx context.Context, agentID, userID pgtype.UUID) (bool, error)
 	EnqueueChannelChatTask(ctx context.Context, session db.ChatSession, initiatorUserID pgtype.UUID, forceFreshSession bool, contextRevision int64, bindingID pgtype.UUID, routeRevision int64) (db.AgentTaskQueue, error)
 	PrepareChatTaskEnqueue(ctx context.Context, agentID, initiatorUserID pgtype.UUID) (service.PreparedChatTaskEnqueue, error)
 	EnqueuePreparedChannelChatTaskInTx(ctx context.Context, tx pgx.Tx, session db.ChatSession, initiatorUserID pgtype.UUID, forceFreshSession bool, contextRevision int64, prepared service.PreparedChatTaskEnqueue) (db.AgentTaskQueue, error)
