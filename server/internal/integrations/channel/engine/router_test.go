@@ -336,6 +336,21 @@ type fakeTasks struct {
 	err                 error
 	prepared            bool
 	prepareErr          error
+	// deniedInvoker is the one user CanMemberInvokeAgent refuses; everyone
+	// else may invoke. invokeChecks records who was asked about.
+	deniedInvoker pgtype.UUID
+	invokeChecks  []pgtype.UUID
+	invokeErr     error
+}
+
+func (f *fakeTasks) CanMemberInvokeAgent(_ context.Context, _, userID pgtype.UUID) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.invokeChecks = append(f.invokeChecks, userID)
+	if f.invokeErr != nil {
+		return false, f.invokeErr
+	}
+	return !f.deniedInvoker.Valid || userID != f.deniedInvoker, nil
 }
 
 func (f *fakeTasks) PromoteChannelChatTasksIfMediaReady(_ context.Context, _ pgtype.UUID) error {
@@ -381,6 +396,11 @@ func (f *fakeTasks) wasPrepared() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.prepared
+}
+func (f *fakeTasks) invokeCheckArgs() []pgtype.UUID {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]pgtype.UUID(nil), f.invokeChecks...)
 }
 func (f *fakeTasks) wasCalled() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.called }
 func (f *fakeTasks) freshArg() bool  { f.mu.Lock(); defer f.mu.Unlock(); return f.forceFresh }
@@ -643,6 +663,60 @@ func TestRouter_NonMember_Drops(t *testing.T) {
 	}
 	if h.media.calls() != 0 {
 		t.Fatal("non-member sender must not resolve media")
+	}
+}
+
+// A group route belongs to the installer, but the turn belongs to the sender,
+// so the sender is who the invoke gate judges. The harness installer may invoke
+// and the sender may not: judging the installer would let this through.
+func TestRouter_SenderWhoMayNotInvoke_IsRefusedBeforeAnythingIsStored(t *testing.T) {
+	h := newHarness(t)
+	sender := h.ident.id.UserID
+	h.tasks.deniedInvoker = sender
+	msg := p2pMessage(t)
+	msg.Source.ChatType = channel.ChatTypeGroup
+	msg.AddressedToBot = true
+	if err := h.router.Handle(context.Background(), msg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := h.tasks.invokeCheckArgs(); len(got) != 1 || got[0] != sender {
+		t.Fatalf("invoke gate judged %v, want only the sender %v", got, sender)
+	}
+	if r, _ := h.audit.last(); r != DropReasonInvokeDenied {
+		t.Fatalf("expected invocation_not_allowed audit, got %q", r)
+	}
+	if h.binder.ensureCalls != 0 || h.binder.startCalls != 0 || h.binder.appendedParams().Message.MessageID != "" {
+		t.Fatal("a refused sender's message must not reach the session store")
+	}
+	if h.tasks.wasCalled() || h.tasks.wasPrepared() {
+		t.Fatal("a refused sender must not enqueue a run")
+	}
+	if h.dedup.marks() != 1 {
+		t.Fatalf("invoke refusal must finalize Mark, got %d", h.dedup.marks())
+	}
+	if !waitFor(time.Second, func() bool {
+		for _, r := range h.replier.calls() {
+			if r.Outcome == OutcomeInvokeDenied && r.Sender == "ou_user_a" {
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatal("expected an InvokeDenied reply targeting the sender")
+	}
+}
+
+func TestRouter_InvokeCheckError_Releases(t *testing.T) {
+	h := newHarness(t)
+	h.tasks.invokeErr = errors.New("db down")
+	if err := h.router.Handle(context.Background(), p2pMessage(t)); err == nil {
+		t.Fatal("invoke-permission infra error must surface to the caller")
+	}
+	if h.dedup.releases() != 1 {
+		t.Fatalf("invoke-permission error must Release the claim (1), got %d", h.dedup.releases())
+	}
+	if h.binder.ensureCalls != 0 {
+		t.Fatal("a sender whose permission could not be checked must not reach the session store")
 	}
 }
 

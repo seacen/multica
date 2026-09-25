@@ -102,6 +102,7 @@ func TestReplierNoticesReadTheAskersLanguage(t *testing.T) {
 			}{
 				{"offline", engine.Result{Outcome: engine.OutcomeAgentOffline}, want.AgentOffline},
 				{"archived", engine.Result{Outcome: engine.OutcomeAgentArchived}, want.AgentArchived},
+				{"invoke denied", engine.Result{Outcome: engine.OutcomeInvokeDenied}, want.InvokeDenied},
 				{
 					"issue created",
 					engine.Result{
@@ -541,6 +542,10 @@ func TestZhHansPackIsTheCopyThatAlreadyShipped(t *testing.T) {
 		"FreshPending": "✅ 已准备从空上下文运行。你的下一条聊天消息仍会进入当前对话，但不会带上之前的上下文。",
 		"ChatStarted":  "✅ 已新建 Multica 对话。你的下一条消息会进入该对话。",
 		"IssueUsage":   "请填写任务标题，格式如下：\n\n`/issue <标题>`\n`[描述]`（可选）",
+
+		// New with the channel invoke gate. Worded after the web setting it
+		// answers to, 谁可以运行该智能体, so the member can find it.
+		"InvokeDenied": "⚠️ 你没有权限运行该智能体。如需使用，请联系它的所有者。",
 	}
 	wantLabels := map[string]string{
 		"issue_assigned":     "任务指派",

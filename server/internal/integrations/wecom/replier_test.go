@@ -296,6 +296,39 @@ func TestSendBindingPrompt_P2PSendsOnlyPrivately(t *testing.T) {
 	}
 }
 
+// TestInvokeDenied_GroupTellsOnlyTheSender: a member refused by the agent's
+// invoke permission in a group is told in their own 1:1, and the room gets
+// nothing — a line there would show everyone who was refused and that the
+// agent is someone's private one. The sender is bound, so the private line
+// reads in their profile language, not the room's.
+func TestInvokeDenied_GroupTellsOnlyTheSender(t *testing.T) {
+	t.Parallel()
+	const groupID = "GROUP_CHAT_ID"
+	reg := newSendersRegistry()
+	inst := engine.ResolvedInstallation{ID: mustTestUUID(t)}
+	conn := &recordingConn{}
+	reg.set(inst.ID, conn.autoAck(newWSSender(conn, nil)))
+	asker := languagesFor("en")
+	r := NewOutboundReplier(OutboundReplierConfig{Senders: reg, Languages: asker, AppURL: "https://multica.example"})
+
+	msg := channel.InboundMessage{Source: channel.Source{ChatID: groupID, ChatType: channel.ChatTypeGroup, SenderID: asker.senderID}}
+	r.Reply(context.Background(), inst, msg, engine.Result{Outcome: engine.OutcomeInvokeDenied, Sender: asker.senderID})
+
+	conn.mu.Lock()
+	n := len(conn.frames)
+	conn.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("frames sent = %d, want exactly one (the private notice) and nothing in the room", n)
+	}
+	body := conn.sendBody(t, 0)
+	if body["chatid"] != asker.senderID || body["chat_type"] != float64(chatTypeSingleInt) {
+		t.Fatalf("notice addressed to %v at chat_type %v, want the sender %q at chat_type 1", body["chatid"], body["chat_type"], asker.senderID)
+	}
+	if got, want := sentMarkdown(t, conn, 0), copyPacks[LocaleEn].InvokeDenied; got != want {
+		t.Fatalf("private notice = %q, want the sender's own language %q", got, want)
+	}
+}
+
 // TestSendBindingPrompt_ThrottledSendsNoURL: when the throttle suppresses a
 // mint there is no raw secret to build a link from — the hash is all the table
 // ever held. Building the URL anyway yields "?token=" with nothing after it,

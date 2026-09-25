@@ -169,6 +169,9 @@ type bindTestTasks struct {
 	promoted int
 }
 
+func (*bindTestTasks) CanMemberInvokeAgent(context.Context, pgtype.UUID, pgtype.UUID) (bool, error) {
+	return true, nil
+}
 func (*bindTestTasks) EnqueueChannelChatTask(context.Context, db.ChatSession, pgtype.UUID, bool, int64, pgtype.UUID, int64) (db.AgentTaskQueue, error) {
 	return db.AgentTaskQueue{}, nil
 }

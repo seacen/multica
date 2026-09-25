@@ -119,6 +119,11 @@ type copyPack struct {
 	AgentOffline  string
 	AgentArchived string
 
+	// InvokeDenied answers a bound member the agent's invoke permission
+	// refuses — the verdict the web chat gives the same person. It always goes
+	// to that member alone (replier.go), so it can say plainly what happened.
+	InvokeDenied string
+
 	// UnsupportedMsgType answers a message kind the adapter cannot read at
 	// all — sent from the read loop, which never reaches the Replier. It does
 	// not name text, because photos, files, videos and 图文混排 route: a person
@@ -384,6 +389,7 @@ var copyPacks = map[Locale]copyPack{
 	LocaleZhHans: {
 		AgentOffline:         "⚠️ 智能体当前不在线，你的消息已收到，等它上线后会处理。",
 		AgentArchived:        "⚠️ 该智能体已归档，无法回复。请联系工作区管理员。",
+		InvokeDenied:         "⚠️ 你没有权限运行该智能体。如需使用，请联系它的所有者。",
 		UnsupportedMsgType:   "抱歉，我暂时无法处理这类消息。",
 		FreshPending:         "✅ 已准备从空上下文运行。你的下一条聊天消息仍会进入当前对话，但不会带上之前的上下文。",
 		ChatStarted:          "✅ 已新建 Multica 对话。你的下一条消息会进入该对话。",
@@ -460,6 +466,7 @@ var copyPacks = map[Locale]copyPack{
 	LocaleEn: {
 		AgentOffline:         "⚠️ The agent is offline right now. Your message was received and will be handled once it's back.",
 		AgentArchived:        "⚠️ This agent has been archived and can't reply. Please contact your workspace admin.",
+		InvokeDenied:         "⚠️ You don't have access to run this agent. Ask its owner if you need it.",
 		FreshPending:         "✅ Fresh start ready. Your next chat message will run without previous context.",
 		ChatStarted:          "✅ Started a new Multica chat. Your next message will enter it.",
 		IssueUsage:           "Give the task a title, like this:\n\n`/issue <title>`\n`[description]` (optional)",
