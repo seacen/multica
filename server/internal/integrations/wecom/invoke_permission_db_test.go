@@ -92,7 +92,7 @@ func wecomTextCallback(t *testing.T, botID, chatType, chatID, senderID, msgID, t
 	if !ok {
 		t.Fatal("text callback is not routable; the fixture is wrong")
 	}
-	return channelMessageFromCallback(botID, "", mc, copyFor(DefaultLocale), body, "req-invoke-1")
+	return channelMessageFromCallback(botID, "", mc, body, "req-invoke-1")
 }
 
 // recordingReplier keeps every verdict the Router handed the outbound side.
