@@ -1880,6 +1880,21 @@ func (s *TaskService) PrepareChatTaskEnqueue(
 	}, nil
 }
 
+// CanMemberInvokeAgent reports whether userID may trigger runs for agentID
+// (memberMayInvokeAgent). Channel inbound asks it before storing a sender's
+// message, so a member the web chat would refuse cannot reach the agent through
+// a bot either. An agent that no longer exists admits nobody.
+func (s *TaskService) CanMemberInvokeAgent(ctx context.Context, agentID, userID pgtype.UUID) (bool, error) {
+	agent, err := s.Queries.GetAgent(ctx, agentID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("load agent: %w", err)
+	}
+	return memberMayInvokeAgent(ctx, s.Queries, agent, userID, agent.WorkspaceID)
+}
+
 // EnqueueChatTask creates a Direct Chat task. If the Chat also has a channel
 // binding, its context generation is still snapshotted, but no external delivery
 // snapshot is created: first-party sends reply only to first-party clients.

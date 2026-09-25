@@ -1,9 +1,9 @@
 package wecom
 
 // replier.go — the WeCom OutboundReplier. Handles the engine's needs_binding
-// / agent_offline / agent_archived / issue_created outcomes by sending a
-// text message back over the same aibot WebSocket the inbound loop owns
-// (aibot has no REST outbound; every write is on the socket, looked up via
+// / agent_offline / agent_archived / invoke_denied / issue_created outcomes by
+// sending a text message back over the same aibot WebSocket the inbound loop
+// owns (aibot has no REST outbound; every write is on the socket, looked up via
 // the sendersRegistry).
 
 import (
@@ -137,6 +137,11 @@ func (r *OutboundReplier) Reply(ctx context.Context, inst engine.ResolvedInstall
 			r.logger.WarnContext(ctx, "wecom replier: archived notice failed",
 				"installation_id", util.UUIDToString(inst.ID), "error", err)
 		}
+	case engine.OutcomeInvokeDenied:
+		if err := r.sendInvokeDenied(ctx, inst, msg, c); err != nil {
+			r.logger.WarnContext(ctx, "wecom replier: invoke-denied notice failed",
+				"installation_id", util.UUIDToString(inst.ID), "error", err)
+		}
 	case engine.OutcomeFreshPending:
 		if err := r.post(ctx, inst, msg, c.FreshPending); err != nil {
 			r.logger.WarnContext(ctx, "wecom replier: fresh-start confirmation failed",
@@ -231,6 +236,20 @@ func (r *OutboundReplier) sendBindingPrompt(ctx context.Context, inst engine.Res
 		return r.post(ctx, inst, msg, c.BindingSentPrivately)
 	}
 	return nil
+}
+
+// sendInvokeDenied tells a member the agent is not theirs to run. A 1:1 is
+// answered in place. A group trigger is answered in the sender's own 1:1 and
+// not in the room: a line there would show everyone which member was refused
+// and that the agent is someone's private one. That private line reads in the
+// sender's language rather than the room's — they are bound, so they have one.
+func (r *OutboundReplier) sendInvokeDenied(ctx context.Context, inst engine.ResolvedInstallation, msg channel.InboundMessage, c copyPack) error {
+	if aibotChatTypeFromChannel(msg.Source.ChatType) != chatTypeGroupInt {
+		return r.post(ctx, inst, msg, c.InvokeDenied)
+	}
+	sender := msg.Source.SenderID
+	personal := copyFor(localeFor(ctx, r.languages, inst.ID, chatTypeSingleInt, sender))
+	return r.postPrivate(ctx, inst, sender, personal.InvokeDenied)
 }
 
 // postPrivate delivers text to a single user's 1:1 chat (chat_type=1),
