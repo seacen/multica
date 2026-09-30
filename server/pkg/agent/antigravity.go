@@ -75,7 +75,42 @@ type antigravityStreamEvent struct {
 	Result     *antigravityStreamResult     `json:"result"`
 }
 
+// antigravityNetworkIssueError is the provider sentence some agy releases
+// report when a trailing round trip fails. It carries no Go error text, so it
+// has to stay a literal match alongside the transport patterns below.
 const antigravityNetworkIssueError = "There was a network issue connecting to the server, please try again."
+
+// antigravityTransportErrorRe matches the causes Go's http client reports when
+// a round trip never produced a response: socket, DNS and TLS failures. These
+// are the strings that appear inside the `*url.Error` agy wraps as
+// `API error (attempt N): request failed: Post "...": <cause>`.
+//
+// Two things are deliberately excluded.
+//
+//   - agy's own `request failed:` prefix. It is tempting to match it directly
+//     since it marks an http.Client failure, but only one spelling has been
+//     observed in the field, and nothing rules out agy reusing the same prefix
+//     for an HTTP status error. Matching the cause keeps a provider rejection
+//     from being read as transport noise.
+//   - Provider-side rejections: quota, capacity, overload, policy and auth all
+//     arrive as an HTTP response, so they are decisions about the request
+//     rather than a failure to deliver it. Those must stay failures the user
+//     sees instead of being smoothed over by a complete-looking answer.
+var antigravityTransportErrorRe = regexp.MustCompile(`(?i)(\bEOF\b|connection reset by peer|broken pipe|connection refused|connection timed out|i/o timeout|tls handshake timeout|tls: handshake failure|use of closed network connection|network is unreachable|no such host|server misbehaving|malformed HTTP response|http2: client connection lost|http2: server sent GOAWAY)`)
+
+// antigravityTrailingTransportError reports whether agy's provider error
+// describes a transport-level failure rather than a decision the provider made
+// about the request.
+func antigravityTrailingTransportError(providerError string) bool {
+	trimmed := strings.TrimSpace(providerError)
+	if trimmed == "" {
+		return false
+	}
+	if strings.EqualFold(trimmed, antigravityNetworkIssueError) {
+		return true
+	}
+	return antigravityTransportErrorRe.MatchString(trimmed)
+}
 
 func (u antigravityStreamUsage) hasTokens() bool {
 	return u.InputTokens > 0 || u.OutputTokens > 0 || u.CacheReadTokens > 0 || u.CacheWriteTokens > 0
@@ -121,8 +156,15 @@ func antigravityResultStatus(status string) string {
 	}
 }
 
+// antigravityCompletedDespiteTrailingNetworkError reports whether a turn that
+// agy ended in an error actually delivered a finished answer first. All three
+// conditions are required: the trailing failure has to be transport-level (a
+// provider-side rejection is a real failure), agy has to have handed back a
+// non-empty canonical response, and the latest agent_response step has to have
+// reached DONE — an ACTIVE step means the answer was still being written when
+// the connection went away.
 func antigravityCompletedDespiteTrailingNetworkError(providerError, response string, agentResponseDone bool) bool {
-	return strings.EqualFold(strings.TrimSpace(providerError), antigravityNetworkIssueError) &&
+	return antigravityTrailingTransportError(providerError) &&
 		strings.TrimSpace(response) != "" &&
 		agentResponseDone
 }
@@ -226,7 +268,6 @@ func (b *antigravityBackend) Execute(ctx context.Context, prompt string, opts Ex
 		defer cancel()
 		defer close(msgCh)
 		defer close(resCh)
-		defer os.Remove(logPath)
 
 		startTime := time.Now()
 		var output strings.Builder
@@ -241,6 +282,27 @@ func (b *antigravityBackend) Execute(ctx context.Context, prompt string, opts Ex
 		streamLatestAgentResponseDone := false
 		finalStatus := "completed"
 		var finalError string
+
+		// agy's per-run log is the only record of what the CLI did between the
+		// stream events the daemon sees: the provider calls it made, which ones
+		// failed, and what it concluded. Deleting it unconditionally destroyed
+		// exactly the evidence a failed turn needs — diagnosing a 2026-09-30
+		// stall was impossible because the log for the run was already gone.
+		// Retain it for any non-completed turn and name the path in the daemon
+		// log so it can be found; completed turns are removed as before, since
+		// they are the common case and the log carries conversation content.
+		// The OS temp cleaner bounds how long a retained file survives.
+		defer func() {
+			if finalStatus == "completed" {
+				_ = os.Remove(logPath)
+				return
+			}
+			b.cfg.Logger.Warn("agy log retained for a non-completed turn",
+				"path", logPath,
+				"status", finalStatus,
+				"task_id", b.cfg.TaskID,
+			)
+		}()
 
 		scanner := newAgentStreamScanner(stdout)
 
