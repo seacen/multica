@@ -130,7 +130,7 @@ func TestWecomBubbleClosersAreWiredOnTheRealBootPath(t *testing.T) {
 			field: "Tasks",
 			wired: wiring.Tasks,
 			consequence: "task:progress and task:message are never subscribed at all (Register gates both " +
-				"on it), so a bubble opens and spins with no steps in it; and failureBelongsOnWecom " +
+				"on it), so a bubble opens and spins with no steps in it; and the origin gate " +
 				"can no longer read the run's input batch, so any failure for a run this process holds " +
 				"no round for is refused as unattributable and the user is told nothing",
 		},

@@ -16,8 +16,8 @@ package wecom
 // sees, and it is the only thing that can say the new seam did not degrade.
 
 import (
-	"context"
 	"testing"
+	"time"
 )
 
 // ---- 1. one debounce window, one bubble ----
@@ -28,8 +28,8 @@ import (
 //
 // Nothing is queued between the two messages, which is the whole of what says
 // they are one run. The store never measures the gap itself — see
-// TestTheBubbleCountFollowsTheRunsNotTheClock, which lies with the clock in
-// both directions.
+// TestMessagesInsideTheDebounceWindowShareOneBubble, which moves the clock a
+// window and a half apart and still gets one bubble.
 //
 // REVERSE VERIFICATION: make open always start a new round (drop the
 // collectingLocked branch) and this fails with two bubbles and two messages in
@@ -60,63 +60,7 @@ func TestTwoMessagesInOneWindowShareOneBubbleAndOneAnswer(t *testing.T) {
 	}
 }
 
-// ---- 2. a question asked while the last one is still running ----
-
-// TestASecondQuestionWhileTheFirstRunsKeepsBothBubbles is the proof that this
-// change did not degrade anything, and the reason it is worth the most here.
-//
-// Two runs, overlapping: the second question arrives after the first has its
-// run, so it is a round of its own and gets a bubble of its own immediately.
-// Each answer then has to replace ITS OWN bubble in place. Everything that
-// could go wrong shows up in the same two counts — a store that bound both runs
-// to one bubble, or matched an ending by position, seals one question with the
-// other's answer and leaves the survivor spinning above a plain message.
-//
-// REVERSE VERIFICATION: make bindNext take the NEWEST unbound round instead of
-// the oldest and this fails with the answers swapped between the two bubbles.
-func TestASecondQuestionWhileTheFirstRunsKeepsBothBubbles(t *testing.T) {
-	t.Parallel()
-	rig := newBubbleRig(t)
-
-	rig.ask(t, "REQ-A")
-	rig.queued(t, "task-1")
-	rig.ask(t, "REQ-B")
-	rig.queued(t, "task-2")
-
-	if got := rig.streams.depth(); got != 2 {
-		t.Fatalf("two overlapping questions hold %d bubbles, want 2 — one of the two askers "+
-			"has no receipt at all", got)
-	}
-
-	rig.answer(t, "the first answer", "task-1")
-	rig.answer(t, "the second answer", "task-2")
-
-	frames := rig.conn.streamFrames(t)
-	if len(frames) != 4 {
-		t.Fatalf("got %d stream frames, want 4 (two opens, two seals)", len(frames))
-	}
-	if frames[2]["id"] != frames[0]["id"] {
-		t.Fatalf("the first answer sealed bubble %v, want the first question's %v — the wrong "+
-			"asker read this answer", frames[2]["id"], frames[0]["id"])
-	}
-	if frames[3]["id"] != frames[1]["id"] {
-		t.Fatalf("the second answer sealed bubble %v, want the second question's %v",
-			frames[3]["id"], frames[1]["id"])
-	}
-	if frames[2]["content"] != "the first answer" || frames[3]["content"] != "the second answer" {
-		t.Fatalf("the answers landed in the wrong bubbles: %q then %q",
-			frames[2]["content"], frames[3]["content"])
-	}
-	if pushes := rig.conn.pushes(t); len(pushes) != 0 {
-		t.Fatalf("%d answer(s) went out as a plain message instead of replacing a bubble; "+
-			"a spinner is left above each of them", len(pushes))
-	}
-	if got := said(t, rig.conn); len(got) != 2 {
-		t.Fatalf("the asker read %d message(s) %q, want exactly two — one per question", len(got), got)
-	}
-}
-
-// ---- 3. the run announced before the bubble was painted ----
+// ---- 2. the run announced before the bubble was painted ----
 
 // The Router detaches the ingest goroutine, and a session's first message
 // enqueues its task inside dispatch rather than on the debounced flush, so
@@ -149,7 +93,7 @@ func TestARunQueuedBeforeItsBubbleStillBindsToIt(t *testing.T) {
 	}
 }
 
-// ---- 4. the runs that are not this conversation's ----
+// ---- 3. the runs that are not this conversation's ----
 
 // TestAnIssueRunNeverTakesAWaitingBubble.
 //
@@ -193,7 +137,7 @@ func TestAnIssueRunNeverTakesAWaitingBubble(t *testing.T) {
 	}
 }
 
-// ---- 5. the auto-retry clone ----
+// ---- 4. the auto-retry clone ----
 
 // TestARetryCloneTakesTheRoundItIsReplacingNotTheNextQuestions.
 //
@@ -287,7 +231,7 @@ func TestARetryCloneQueuedAfterTheFailureAlsoFindsItsRound(t *testing.T) {
 	}
 }
 
-// ---- 6. a flush that never became a run ----
+// ---- 5. a flush that never became a run ----
 //
 // Covered by TestAFlushThatStartedNoRunClosesTheBubbleWithNoRun and
 // TestASettledFlushLeavesARoundWaitingForItsRetry in
@@ -340,18 +284,103 @@ func TestEachAnswerFindsItsOwnBubbleWhateverOrderTheyArriveIn(t *testing.T) {
 	}
 }
 
-// OnSettled with nothing waiting is a no-op rather than a closer of whatever is
-// on screen: a session whose only round has a run is a session whose flush
-// produced a task, so there is nothing for this to close.
-func TestASettledFlushWithNothingWaitingClosesNothing(t *testing.T) {
+// A run can be queued before its bubble is painted — the ingest goroutine is
+// detached and the flush runs on the batcher's timer — so a run with nobody to
+// pair with waits. What it must not do is wait long enough to pair with
+// somebody else.
+//
+// The ingest goroutine that owes it a bubble lives for seconds: it resolves a
+// sender, writes one frame and returns. A run still pending after that has no
+// bubble coming at all — the paint was refused, the envelope was unreadable,
+// the round was dropped — and the only thing left for it to pair with is the
+// NEXT question's bubble, which belongs to somebody else and whose answer
+// would then find no round.
+//
+// Bounding it by streamMaxAge — the protocol's ten minutes — is the wrong
+// clock: it is how long the SERVER keeps a stream, not how long an ingest
+// takes.
+//
+// REVERSE VERIFICATION: bound pending by streamMaxAge instead and this fails
+// with the later question's bubble bound to the abandoned run.
+func TestARunLeftPendingDoesNotTakeAMuchLaterQuestionsBubble(t *testing.T) {
 	t.Parallel()
 	rig := newBubbleRig(t)
-	rig.ran(t, "REQ-ONLY", "task-1")
 
-	rig.typing.OnSettled(context.Background(), bubbleSessionID(t))
+	// A run is queued and no bubble ever appears for it.
+	rig.queued(t, "task-1")
 
-	if got := len(rig.conn.streamFrames(t)); got != 1 {
-		t.Fatalf("got %d stream frames, want 1 — a settled flush sealed a bubble whose run is "+
-			"still going, and its answer now has nowhere to land", got)
+	// Long after the ingest that owed it one would have finished.
+	rig.now = rig.now.Add(pendingMaxAge + time.Second)
+
+	// A new question, and its own run.
+	rig.ask(t, "REQ-LATER")
+	rig.queued(t, "task-2")
+	rig.answer(t, "the later answer", "task-2")
+
+	frames := rig.conn.streamFrames(t)
+	sealed := false
+	for _, f := range frames {
+		if f["finish"] == true && f["content"] == "the later answer" {
+			sealed = true
+		}
+	}
+	if !sealed {
+		t.Fatalf("the later question's answer never sealed its own bubble — an abandoned run from before had taken it: %v", frames)
+	}
+	if pushes := rig.conn.pushes(t); len(pushes) != 0 {
+		t.Fatalf("the later answer arrived as %d plain message(s): %v", len(pushes), pushes)
+	}
+}
+
+// ---- a released round and a new question must not be cross-wired ----
+
+// The ordering Bohan drove: the round is released for a retry, the asker types
+// a NEW question which opens its own bubble AND queues its own run, and only
+// then does the clone's task:queued arrive.
+//
+// Both runs are a fresh task row with a fresh id on the same session, and
+// task:queued carries nothing that separates them — so a store that hands the
+// released round to whichever run arrives first gets this one backwards: the
+// new question's run takes the round it did not open, and the clone takes the
+// new question's. Two turns, each sealing the other's bubble, silently.
+//
+// What resolves it is the only authoritative name either run has: the clone
+// inherits its parent's chat_input_task_id, so the ENDING can say which round
+// it belongs to even though the queued event could not.
+func TestANewQuestionsRunDoesNotTakeTheRoundHeldForARetry(t *testing.T) {
+	t.Parallel()
+	rig := newBubbleRig(t)
+
+	rig.ran(t, "REQ-C1", "task-1")
+	rig.failed(t, "task-1", true) // retryable: the round is held for the clone
+
+	// The asker types again while the backoff runs, and this question's own run
+	// is queued before the clone's is.
+	rig.ask(t, "REQ-C2")
+	rig.q.fileTask(t, taskUUID(t, "task-2"))
+	rig.queueTask(t, taskUUID(t, "task-2"), "")
+
+	rig.q.fileRetryClone(t, taskUUID(t, "retry"), taskUUID(t, "task-1"))
+	rig.queueTask(t, taskUUID(t, "retry"), "")
+
+	rig.answer(t, "the retry's answer", "retry")
+	rig.answer(t, "the second answer", "task-2")
+
+	frames := rig.conn.streamFrames(t)
+	if len(frames) != 4 {
+		t.Fatalf("got %d stream frames, want 4 (two opens, two seals)", len(frames))
+	}
+	first, second := frames[0]["id"], frames[1]["id"]
+	sealed := map[any]any{}
+	for _, f := range frames[2:] {
+		sealed[f["id"]] = f["content"]
+	}
+	if sealed[first] != "the retry's answer" {
+		t.Fatalf("the first question's bubble was sealed with %q, want %q — the retry's answer "+
+			"landed in the wrong bubble", sealed[first], "the retry's answer")
+	}
+	if sealed[second] != "the second answer" {
+		t.Fatalf("the second question's bubble was sealed with %q, want %q — two turns are "+
+			"cross-wired, each answering the other's question", sealed[second], "the second answer")
 	}
 }

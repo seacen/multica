@@ -187,14 +187,6 @@ func (p *progressRig) refreshes(t *testing.T) []string {
 	return out
 }
 
-// pushText reads the words out of an aibot_send_msg body — the "as a new
-// message" path, which ships as markdown (sendMsgTextBody).
-func pushText(body map[string]any) string {
-	md, _ := body["markdown"].(map[string]any)
-	text, _ := md["content"].(string)
-	return text
-}
-
 // tick moves the clock past the refresh interval, so the next step is worth a
 // frame of its own rather than being folded into the last one.
 func (p *progressRig) tick() {

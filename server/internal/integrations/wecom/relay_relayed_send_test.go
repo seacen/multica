@@ -20,7 +20,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -28,7 +27,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/util"
-	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 // ---------------------------------------------------------------------------
@@ -55,6 +53,15 @@ type deadlineFlakyConn struct {
 	attempts int
 	// failOn reports whether the n-th (1-based) write deadline is refused.
 	failOn func(n int) bool
+
+	// refuseFromSend and swallowAckFromSend act on aibot_send_msg frames,
+	// counted 1-based, so a test can refuse or lose the verdict on the SECOND
+	// piece of a split answer after the first one landed. Unlike failOn these
+	// are failures the peer stated or swallowed, not ones raised before the
+	// write — which is what makes the send partial rather than unsent.
+	refuseFromSend     int
+	swallowAckFromSend int
+	sends              int
 }
 
 func (c *deadlineFlakyConn) newSender() *wsSender {
@@ -89,13 +96,21 @@ func (c *deadlineFlakyConn) WriteMessage(_ int, data []byte) error {
 	}
 	_ = json.Unmarshal(env.Body, &body)
 	c.mu.Lock()
-	if env.Cmd == cmdSendMsg && body.MsgType == "markdown" {
-		c.texts = append(c.texts, body.Markdown.Content)
+	code, msg, swallow := 0, "", false
+	if env.Cmd == cmdSendMsg {
+		c.sends++
+		if c.refuseFromSend > 0 && c.sends >= c.refuseFromSend {
+			code, msg = 45002, "content exceed max length"
+		}
+		swallow = c.swallowAckFromSend > 0 && c.sends >= c.swallowAckFromSend
+		if code == 0 && body.MsgType == "markdown" {
+			c.texts = append(c.texts, body.Markdown.Content)
+		}
 	}
 	s := c.sender
 	c.mu.Unlock()
-	if s != nil {
-		s.routeResponse(frameEnvelope{Headers: frameHeaders{ReqID: env.Headers.ReqID}})
+	if s != nil && !swallow {
+		s.routeResponse(frameEnvelope{Headers: frameHeaders{ReqID: env.Headers.ReqID}, ErrCode: code, ErrMsg: msg})
 	}
 	return nil
 }
@@ -148,6 +163,14 @@ func newRelaySendRig(t *testing.T, failOn func(n int) bool) *relaySendRig {
 // claim gate takes part in.
 func newRelaySendRigWithDedupe(t *testing.T, failOn func(n int) bool, dedupe DedupeStore) *relaySendRig {
 	t.Helper()
+	return newRelaySendRigWithConfig(t, failOn, dedupe, relayRetryConfig)
+}
+
+// newRelaySendRigWithConfig is the rig with the chain sized by the test, for
+// the ones that have to watch a whole re-offer chain run against something
+// slower than a millisecond.
+func newRelaySendRigWithConfig(t *testing.T, failOn func(n int) bool, dedupe DedupeStore, cfg RelayConfig) *relaySendRig {
+	t.Helper()
 	reg := newSendersRegistry()
 	instID := mustTestUUID(t)
 	conn := &deadlineFlakyConn{failOn: failOn}
@@ -159,7 +182,7 @@ func newRelaySendRigWithDedupe(t *testing.T, failOn func(n int) bool, dedupe Ded
 
 	// No dedupe store: that is the single-replica claim gate, and it leaves the
 	// retry chain — the thing under test — exactly as it is in production.
-	router := NewRelayOutbound(&fanoutRelay{}, dedupe, relayRetryConfig, testLogger())
+	router := NewRelayOutbound(&fanoutRelay{}, dedupe, cfg, testLogger())
 	router.SetMetrics(mx)
 	router.Attach(o)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -405,104 +428,71 @@ func TestRelayedReply_ASettleThatNeverExecutedIsRetried(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// 4. the reader's language survives the relay
-// ---------------------------------------------------------------------------
+// ---- a relayed answer belongs in the bubble, not under it ----
 
-// deliverRelayed is the SECOND caller of attachmentTarget, and the locale is a
-// field the caller fills while it still holds a context to read a profile with
-// (outbound_media.go). Leaving it zero is not "unset": copyFor falls through to
-// the deployment's own language, so the same person reads the same failure in
-// Chinese or English depending on which replica held the socket.
+// The replica that takes a relayed reply is by definition the one holding the
+// socket, and a bubble is writable only on the replica that painted it — which
+// is that same replica. So the round is HERE, and the frame carries the task id
+// that names it.
 //
-// Driven through deliverRelayed rather than by building the target by hand —
-// the wiring IS the defect, and a hand-built target would test the pack.
-//
-// REVERSE VERIFICATION: delete the Locale line from deliverRelayed's
-// attachmentTarget and the english subtest reports the Chinese notice. Build
-// and vet stay silent: the field is simply left at its zero value.
-func TestRelayedAttachmentFailureNoticeReadsTheDestinationsLanguage(t *testing.T) {
+// It used to push the words as an ordinary message without ever looking, so on
+// any multi-replica deployment the answer arrived underneath a bubble that then
+// span until the platform's window ran out. The frame carrying the id is only
+// half of it; something has to read it.
+func TestARelayedAnswerSealsTheBubbleItBelongsTo(t *testing.T) {
 	t.Parallel()
-	for _, tc := range localeCases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			q := oneAttachmentQueries(t, db.Attachment{
-				ID: mustTestUUID(t), Filename: "big.bin", Url: "https://cdn.example/obj/bin",
-			})
-			// A 1:1 with the asker, so their own profile answers.
-			q.userLanguage = tc.language
-			q.userBindingID = localeTestUserID
+	rig := newBubbleRig(t)
+	rig.ran(t, "REQ-RELAY", "task-1")
 
-			o, instID, conn := newOutboundWithMedia(t, q, &fakeObjectStore{key: "obj/bin", data: []byte("DATA")})
-			conn.refuse[cmdUploadMediaInit] = 40058 // the server will not take the file
-
-			o.deliverRelayed(context.Background(), relayFrame{
-				Kind:           relayKindReply,
-				InstallationID: util.UUIDToString(instID),
-				ChatID:         "T-asker",
-				ChatType:       chatTypeSingleInt,
-				Content:        "See the attached dump.",
-				MessageID:      testMessageID,
-				WorkspaceID:    testWorkspaceID,
-				SessionID:      testSessionID,
-				TaskID:         testTaskID,
-				CarriesFiles:   true,
-			})
-
-			got := markdownSends(t, conn)
-			want := copyPacks[tc.locale].MediaSendFailed
-			if len(got) == 0 || got[len(got)-1] != want {
-				t.Fatalf("sends = %q, want the %s failure notice %q last — the relayed path "+
-					"has to resolve the reader's language the same way the local one does",
-					got, tc.locale, want)
-			}
-		})
+	res := rig.out.deliverRelayed(context.Background(), relayFrame{
+		Kind:           relayKindReply,
+		InstallationID: util.UUIDToString(rig.instID),
+		ChatID:         "CHAT_1",
+		ChatType:       chatTypeGroupInt,
+		Content:        "the routed answer",
+		TaskID:         taskUUID(t, "task-1"),
+		SessionID:      bubbleSession,
+	})
+	if res.outcome != outcomeDone {
+		t.Fatalf("outcome = %v, want outcomeDone", res.outcome)
+	}
+	if pushes := rig.conn.pushes(t); len(pushes) != 0 {
+		t.Fatalf("the routed answer arrived as %d plain message(s) under a bubble that is still "+
+			"turning: %v", len(pushes), pushes)
+	}
+	sealed := false
+	for _, f := range rig.conn.streamFrames(t) {
+		if f["finish"] == true && f["content"] == "the routed answer" {
+			sealed = true
+		}
+	}
+	if !sealed {
+		t.Fatal("the routed answer never sealed the bubble its question opened")
 	}
 }
 
-// ---------------------------------------------------------------------------
-// 2. a re-offer must not repeat what the user already read
-// ---------------------------------------------------------------------------
-
-// An answer past the 20480-byte cap leaves as several aibot_send_msg frames
-// (splitForWire). When a later piece fails, the earlier ones are already in the
-// chat — so the SEND is not provably unsent, whatever the failing frame alone
-// would say, and releasing the claim to try the whole thing again prints the
-// first piece a second time.
-//
-// The frame is stopped by cancelling the dispatcher and draining, which
-// performs anything parked waiting out a backoff immediately. So this asserts
-// on the drain rather than on a sleep: a re-offer that exists WILL run here.
-//
-// (The tail that never went out is a separate, known gap — a half-delivered
-// long answer. This test is only about not printing the head twice.)
-//
-// REVERSE VERIFICATION: drop the errPartiallySent wrap from sendTextCtx (or its
-// case from provablyNotSent) and the chat receives the first piece twice, which
-// this reports. `go build` and `go vet` stay silent both ways.
-func TestRelayedReply_ALongAnswerIsNotResentFromTheTop(t *testing.T) {
+// An inbox push is not an answer to a round and must never close one — the
+// same distinction the reply counters make, at the one new call site.
+func TestARelayedInboxPushNeverSealsABubble(t *testing.T) {
 	t.Parallel()
-	long := strings.Repeat("a", sendMsgContentLimit+4096)
-	pieces := splitForWire(long)
-	if len(pieces) < 2 {
-		t.Fatalf("splitForWire produced %d piece(s); this test needs a multi-piece answer", len(pieces))
+	rig := newBubbleRig(t)
+	rig.ran(t, "REQ-RELAY-2", "task-1")
+
+	rig.out.deliverRelayed(context.Background(), relayFrame{
+		Kind:           relayKindInbox,
+		InstallationID: util.UUIDToString(rig.instID),
+		ChatID:         "CHAT_1",
+		ChatType:       chatTypeGroupInt,
+		Content:        "an inbox notice",
+		TaskID:         taskUUID(t, "task-1"),
+		SessionID:      bubbleSession,
+	})
+	for _, f := range rig.conn.streamFrames(t) {
+		if f["finish"] == true {
+			t.Fatalf("an inbox push closed a round's bubble: %v", f)
+		}
 	}
-	// The first piece is accepted, the second refused: exactly the case where
-	// "this send put nothing on the wire" is false.
-	rig := newRelaySendRig(t, func(n int) bool { return n == 2 })
-
-	rig.route(t, long)
-	waitFor(t, "the second piece to be refused", func() bool { return rig.conn.writeAttempts() >= 2 })
-	rig.stop()
-
-	got := rig.conn.sent()
-	if len(got) != 1 || got[0] != pieces[0] {
-		t.Fatalf("the chat received %d message(s), want exactly the first piece and no repeat "+
-			"of it — a re-offer after a later piece failed prints what the user already read",
-			len(got))
+	if got := pushedTexts(t, rig.conn); len(got) != 1 || got[0] != "an inbox notice" {
+		t.Fatalf("the inbox push read %q, want it delivered as an ordinary message", got)
 	}
 }
-
-// The whitespace-only relayed reply is asserted in outbound_whitespace_test.go,
-// which is where #8347 put it upstream. The copy that used to live here was
-// the same test before that extraction.

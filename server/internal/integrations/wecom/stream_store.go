@@ -15,10 +15,10 @@ package wecom
 // that can still be written to. An ending that finds a writable bubble writes
 // into it; one that does not goes out through the plain aibot_send_msg path
 // that outbound.go already has, addressed by the task's own delivery row. A
-// bubble that cannot be written to — never painted, past its window, disowned
-// by the server, lost to a restart — is simply not used. Nothing here records
-// what was said, what is owed, or who was told; nothing owes anyone anything
-// once the bubble is gone.
+// bubble that cannot be written to — never painted, past its window, lost to a
+// restart, or refused by the server when the closing frame goes out — is
+// simply not used. Nothing here records what was said, what is owed, or who
+// was told; nothing owes anyone anything once the bubble is gone.
 //
 // A session holds a LIST of open bubbles, not one. Messages the engine's
 // debouncer collects into one agent run share a bubble; a message it gives a
@@ -63,13 +63,6 @@ package wecom
 // roundTaker, which resolves the clone through it, and retryUnbind, which puts
 // the round back in line for the clone's own task:queued so the clone never
 // takes a bubble some other question opened.
-//
-// A ROTATION CHANGES THE STREAM, NEVER THE ROUND. The guard hands a long run a
-// fresh stream id (rotate) and nothing else about the entry moves: not its
-// sequence number, not the task bound to it, not its place in the list. So a
-// rotated round is still bound, which keeps bindNext from handing it to a
-// later question's run, and its answer still finds it by task id and is
-// written to whichever stream it holds now.
 //
 // The catch is req_id. Every frame of one stream has to echo the req_id of the
 // aibot_msg_callback that started the turn, and that value is only ever seen
@@ -127,9 +120,12 @@ import (
 // same probe sealed a first stream with finish=true at two minutes and opened
 // a second on the same req_id with a fresh stream id: the second was still
 // being accepted at eight minutes old, well past the first one's own
-// ten-minute mark, and died at its own. That is what makes rotating onto a
-// fresh stream a real way to outlive the window — see rotate, and fireGuard in
-// typing_indicator.go, which is where it is done.
+// ten-minute mark, and died at its own.
+//
+// So the clock is not something a bubble can be kept alive against: a run
+// longer than the window loses its bubble and its answer goes out as an
+// ordinary message. Carrying a round over onto a fresh stream is a separate
+// layer on top of this one.
 //
 // The six minutes this used to say came from a different mechanism, not from a
 // source that disagreed with the ten. Tencent's OpenClaw plugin carries six for
@@ -168,8 +164,8 @@ type openVerdict int
 
 const (
 	// roundOpened — nothing was collecting, so this message starts a round.
-	// The caller paints the opening frame and arms the guard; from here on the
-	// round owns the handle it registered.
+	// The caller paints the opening frame; from here on the round owns the
+	// handle it registered.
 	roundOpened openVerdict = iota
 	// roundJoined — a round is already on screen and still waiting for its
 	// run, so the debounce window that will answer this message is the one
@@ -186,12 +182,12 @@ type streamHandle struct {
 	// ReqID is the aibot_msg_callback's req_id. WeCom refuses a stream frame
 	// carrying any other value, including a req_id from an event callback
 	// (errcode 846605). Each round's bubble runs on the req_id of the message
-	// that opened it — including every stream the round is rotated onto.
+	// that opened it.
 	ReqID string
 
 	// StreamID is ours to choose. Reusing it updates the message; a new one
 	// opens another — which is exactly how a session comes to hold several
-	// bubbles at once, and how a round outlives one stream's window.
+	// bubbles at once.
 	StreamID string
 
 	// InstallationID finds the live socket. ChatID and ChatType address the
@@ -201,18 +197,11 @@ type streamHandle struct {
 	ChatID         string
 	ChatType       int
 
-	// QueuedBehind records that this round was opened while another round was
-	// still open — it spent its life waiting in line. An empty answer for such
-	// a round means "handled together with the previous reply", which is worth
-	// saying differently from a first round's plain silence. Set by the store
-	// at open; callers registering a handle leave it false.
-	QueuedBehind bool
-
 	// Locale is the language this round's closing words are written in,
 	// resolved from the asker when the bubble was opened (typing_indicator.go).
 	// It travels on the handle because every closer runs later, from an event
-	// that names a task and nobody else — and one of them runs on a timer,
-	// minutes after the goroutine that knew who asked is gone.
+	// that names a task and nobody else — minutes after the goroutine that
+	// knew who asked is gone.
 	Locale Locale
 
 	// Level is how much of the run this bubble may show while it is still
@@ -272,9 +261,8 @@ var errNothingToSay = errors.New("wecom: nothing to say for this round")
 type roundTurn struct {
 	// Handle is the round's open bubble. HasBubble says whether there is one:
 	// a round with no painted frame, or one past the protocol's window,
-	// reports false and its words go out as an ordinary message. A handle the
-	// server has disowned is still handed back, with Unusable set, because
-	// its addressing is still the chat that asked.
+	// reports false and its words go out as an ordinary message — the handle
+	// still names the chat that asked.
 	Handle    streamHandle
 	HasBubble bool
 }
@@ -289,11 +277,9 @@ type roundKey struct {
 func byTask(taskID string) roundKey { return roundKey{taskID: taskID} }
 
 // roundSeq is the store's own name for a round, handed out in painting order.
-// It is an internal handle, not a platform id: the only things outside this
-// file that ever hold one are the caller of open, which gives it back to drop
-// when the server refuses the opening frame, and the expiry guard, which is
-// armed for one round and must still act on that same round after a rotation
-// has replaced everything else about it.
+// It is an internal handle, not a platform id: the only thing outside this
+// file that ever holds one is the caller of open, which gives it back to drop
+// when the server refuses the opening frame.
 type roundSeq uint64
 
 // roundEntry is one round's place in a session, from the moment anything is
@@ -309,8 +295,7 @@ type roundSeq uint64
 // on screen to land and falls back to a plain message.
 type roundEntry struct {
 	// seq is this round's place in its session's painting order, and the
-	// entry's identity for as long as it exists. Nothing revises it — not a
-	// binding, not a release, not a rotation.
+	// entry's identity while nothing else names it.
 	seq roundSeq
 
 	// handle is the open bubble; painted reports whether there is one.
@@ -335,6 +320,19 @@ type roundEntry struct {
 	//     question with a run of its own coming), and OnSettled must not close
 	//     it (its replacement is already on the way).
 	everBound bool
+
+	// retryOf is the id of the attempt a released round is waiting to be
+	// replaced by — the parent whose clone will answer this round's question.
+	// Set by retryUnbind, cleared the moment a run is bound.
+	//
+	// It exists because NOTHING ELSE CAN TELL THE CLONE APART from a new
+	// question's run at task:queued: both are a new task row with a new id on
+	// the same session, and the adapter may not read the database on the bus.
+	// The two orderings are symmetric — the clone may arrive before or after a
+	// new question's run — so no arrival-order rule resolves them, and the
+	// round has to carry the name of what it is waiting for until an ending
+	// can resolve the lineage.
+	retryOf string
 
 	// guard rotates the bubble onto a fresh stream before the protocol's
 	// window runs out on the current one.
@@ -381,13 +379,26 @@ const maxFinishedRounds = 10
 
 // pendingRun is a run queued for a session that had no round waiting for one:
 // the ingest goroutine that will paint its bubble has not got there yet. It is
-// held until a bubble appears, and swept with everything else once the
-// protocol's window has passed — a run still pending that long has no bubble
-// coming and must not take one that a much later question opened.
+// held until a bubble appears, or until pendingMaxAge says none is coming.
 type pendingRun struct {
 	taskID string
 	at     time.Time
 }
+
+// pendingMaxAge is how long a queued run may wait for the bubble it was meant
+// to bind to.
+//
+// The clock is the ingest goroutine's, not the protocol's. That goroutine
+// resolves a sender, writes one opening frame and returns — bounded by the
+// router's own reply timeout and one ack wait, a few seconds — so a run still
+// pending after that is one whose bubble is never coming: the paint was
+// refused, the envelope was unreadable, the round was dropped. What it can
+// still do is pair with the NEXT question's bubble, which belongs to somebody
+// else and whose answer would then find no round of its own.
+//
+// streamMaxAge was the wrong bound for it: ten minutes is how long the SERVER
+// keeps a stream writable, which says nothing about how long an ingest takes.
+const pendingMaxAge = 30 * time.Second
 
 // streamStore maps chat_session_id to that session's rounds, oldest first.
 type streamStore struct {
@@ -466,15 +477,42 @@ func (s *streamStore) collectingLocked(key string) *roundEntry {
 	return nil
 }
 
-// unboundLocked finds the oldest round with no run bound to it — the one a
-// newly queued run belongs to. Caller holds s.mu.
+// unboundLocked finds the oldest round with no run bound to it, INCLUDING one
+// released by retryUnbind. It is bindNext's second choice, taken only when no
+// never-bound round is waiting — see the note there for why the order is what
+// keeps two turns from being cross-wired.
+// Caller holds s.mu.
 func (s *streamStore) unboundLocked(key string) *roundEntry {
 	for _, r := range s.sessions[key] {
-		if r.taskID == "" {
+		if r.taskID == "" && r.retryOf == "" {
 			return r
 		}
 	}
 	return nil
+}
+
+// awaitingRetryLocked answers two separate questions, and the returns are
+// deliberately not interchangeable:
+//
+//	at   — the index of the round waiting for THIS root, or -1. Only >= 0 is a
+//	       match; callers index on this and nothing else.
+//	held — whether the session holds any round waiting for a retry at all.
+//	       This is the cheap in-memory check that decides whether an ending
+//	       pays for the lineage read.
+//
+// Caller holds s.mu.
+func (s *streamStore) awaitingRetryLocked(key, root string) (at int, held bool) {
+	at = -1
+	for i, r := range s.sessions[key] {
+		if r.retryOf == "" {
+			continue
+		}
+		held = true
+		if root != "" && r.retryOf == root {
+			at = i
+		}
+	}
+	return at, held
 }
 
 // boundLocked finds the round a task id is bound to, or nil. Caller holds s.mu.
@@ -555,7 +593,13 @@ func (s *streamStore) dropPendingLocked(key, taskID string) {
 // holds s.mu.
 func (s *streamStore) takePendingLocked(key string) string {
 	queue := s.pending[key]
+	// Drop what has waited past its own clock before taking: an abandoned run
+	// at the head would otherwise hand itself to a bubble opened much later.
+	for len(queue) > 0 && s.now().Sub(queue[0].at) > pendingMaxAge {
+		queue = queue[1:]
+	}
 	if len(queue) == 0 {
+		delete(s.pending, key)
 		return ""
 	}
 	taskID := queue[0].taskID
@@ -581,9 +625,9 @@ func (e *roundEntry) bindLocked(taskID string) {
 // round of its own, immediately, because a wait with nothing on screen reads
 // as a message that was lost.
 //
-// The returned sequence number is the caller's handle on the round for the two
-// cases where it has to name it again: an opening frame the server refuses
-// outright (drop), and the expiry guard it arms for this round (arm).
+// The returned sequence number is the caller's handle on the round for the one
+// case where it has to take it back: an opening frame the server refuses
+// outright (drop).
 func (s *streamStore) open(sessionID pgtype.UUID, h streamHandle) (roundSeq, openVerdict) {
 	key := util.UUIDToString(sessionID)
 
@@ -600,7 +644,6 @@ func (s *streamStore) open(sessionID pgtype.UUID, h streamHandle) (roundSeq, ope
 
 	s.seq++
 	e := &roundEntry{seq: s.seq, handle: h, painted: true, createdAt: h.CreatedAt}
-	e.handle.QueuedBehind = queuedBehind(s.sessions[key])
 	s.insertLocked(key, e)
 	// A run queued before anything was on screen has been waiting for exactly
 	// this. Pairing them here rather than leaving the run for the NEXT bubble
@@ -610,12 +653,6 @@ func (s *streamStore) open(sessionID pgtype.UUID, h streamHandle) (roundSeq, ope
 	}
 	return e.seq, roundOpened
 }
-
-// queuedBehind reports whether a round opening now would be waiting on one
-// already on file. Its own empty answer then means "the reply ahead of it
-// covered this", which is worth saying differently from plain silence. Decided
-// once, when the round opens, and never revised.
-func queuedBehind(rounds []*roundEntry) bool { return len(rounds) > 0 }
 
 // bindNext records that a run was queued for this session and hands it the
 // round it belongs to: the oldest one still waiting for a run. From here on
@@ -643,7 +680,29 @@ func (s *streamStore) bindNext(sessionID pgtype.UUID, taskID string) {
 	if s.boundLocked(key, taskID) != nil {
 		return // already on file; a republished queued event changes nothing
 	}
-	if e := s.unboundLocked(key); e != nil {
+	// A NEVER-BOUND ROUND FIRST, A RELEASED ONE ONLY IF NONE IS WAITING. The
+	// two lookups have to agree about a released round or two turns end up
+	// cross-wired: collectingLocked already refuses one (a new message must
+	// not join a round whose replacement run is on the way), so a new
+	// question opens a round of its own — and if this bind then handed that
+	// question's run the RELEASED round, each turn would seal the other's
+	// bubble. Driven in the real backoff order, that is two people's answers
+	// swapped, silently.
+	//
+	// Preferring the never-bound round makes the two agree. What it costs is
+	// the narrow case where the clone's task:queued arrives while a newer
+	// question's round is painted but its own run has not been queued yet:
+	// the clone takes the newer round and the released one is left without a
+	// run. That round then spins until streamMaxAge, its answer arrives as a
+	// plain message, and recordOpened makes it countable — a degraded turn,
+	// not a wrong one. Between a stranded bubble and an answer delivered to
+	// the wrong question, only one of the two is recoverable by asking again.
+	e := s.collectingLocked(key)
+	if e == nil {
+		e = s.unboundLocked(key)
+	}
+	if e != nil {
+		e.retryOf = ""
 		e.bindLocked(taskID)
 		return
 	}
@@ -673,9 +732,7 @@ func (s *streamStore) bindNext(sessionID pgtype.UUID, taskID string) {
 // still unbound and takes it then.
 //
 // The bubble is deliberately untouched: the user is watching a spinner for a
-// question whose answer is still coming. So is the guard — a run being retried
-// is still a run, and the round keeps the rotation that keeps its bubble
-// writable.
+// question whose answer is still coming.
 func (s *streamStore) retryUnbind(sessionID pgtype.UUID, taskID string) bool {
 	if taskID == "" {
 		return false
@@ -688,9 +745,56 @@ func (s *streamStore) retryUnbind(sessionID pgtype.UUID, taskID string) bool {
 	if e == nil {
 		return false
 	}
-	e.taskID = ""
+	// The clone is usually already queued — service publishes its task:queued
+	// before the parent's task:failed — so the ordinary case hands the round
+	// straight over and nothing is ever left waiting.
 	if clone := s.takePendingLocked(key); clone != "" {
+		e.taskID = ""
 		e.bindLocked(clone)
+		return true
+	}
+	// NO CLONE YET. The round goes back to waiting, but NOT into the pool the
+	// next task:queued draws from: a clone's queued event is byte-identical to
+	// a new question's, so the pool would hand this round to whichever arrived
+	// first, and driven in the real order that is two turns cross-wired, each
+	// sealing the other's bubble.
+	//
+	// It records the name of what it is waiting for instead. A clone inherits
+	// its parent's chat_input_task_id, and EnqueueChatTask stamps
+	// chat_input_task_id = id on the turn it creates, so this id IS the root
+	// the clone resolves to — which makes the clone's ENDING able to name this
+	// round with an authoritative id where its queued event could not.
+	e.taskID = ""
+	e.retryOf = taskID
+	return true
+}
+
+// releaseRound hands a bubble back when the run bound to it turns out not to be
+// one this adapter will ever close — a question typed in Multica that took the
+// room's round off task:queued.
+//
+// Unlike retryUnbind there is no replacement coming, so the round genuinely
+// goes back to waiting: the room's own run, which found the round taken and
+// went to the pending queue, is bound here if it is waiting, and otherwise the
+// next task:queued for this session takes it.
+//
+// everBound stays set. The round is between runs rather than collecting, so a
+// new message must not join it — see roundEntry.everBound.
+func (s *streamStore) releaseRound(sessionID pgtype.UUID, taskID string) bool {
+	if taskID == "" {
+		return false
+	}
+	key := util.UUIDToString(sessionID)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e := s.boundLocked(key, taskID)
+	if e == nil {
+		return false
+	}
+	e.taskID = ""
+	if next := s.takePendingLocked(key); next != "" {
+		e.bindLocked(next)
 	}
 	return true
 }
@@ -830,6 +934,32 @@ func (s *streamStore) take(ctx context.Context, sessionID pgtype.UUID, k roundKe
 	// Whatever else happens, this run is over: it must not be left waiting for
 	// a bubble it would only strand.
 	s.dropPendingLocked(key, k.taskID)
+	_, awaitingRetry := s.awaitingRetryLocked(key, "")
+	s.mu.Unlock()
+
+	// A ROUND WAITING FOR A NAMED ATTEMPT IS RESOLVED BY LINEAGE, NOT BY
+	// WHATEVER task:queued GUESSED. The clone's queued event cannot name the
+	// round it belongs to, so bindNext may have bound this run to a newer
+	// question's round; its chat_input_task_id can name it, and that is
+	// authoritative. Read first rather than on a miss, because on this path the
+	// first lookup can succeed with the WRONG round.
+	//
+	// The read is paid only while a retry is outstanding — awaitingRetry is an
+	// in-memory check over one session's rounds — so an ordinary ending still
+	// costs what it always did.
+	if awaitingRetry && k.taskID != "" && resolve != nil {
+		if root := resolve(ctx, k.taskID); root != "" {
+			s.mu.Lock()
+			if i, _ := s.awaitingRetryLocked(key, root); i >= 0 {
+				turn := s.takeAtLocked(key, i)
+				s.mu.Unlock()
+				return turn, true
+			}
+			s.mu.Unlock()
+		}
+	}
+
+	s.mu.Lock()
 	if i := s.indexLocked(key, k); i >= 0 {
 		turn := s.takeAtLocked(key, i)
 		s.mu.Unlock()
@@ -978,25 +1108,6 @@ func (s *streamStore) rotate(sessionID pgtype.UUID, seq roundSeq, streamID strin
 	return old, next, true
 }
 
-// has reports whether a session holds a round bound to this run. A round is
-// opened by a message this adapter ingested and bound to this run by the
-// session's own task:queued, so an entry here is local proof the question was
-// asked in the room — the one case the failure notice's origin gate can decide
-// without a database (failureBelongsOnWecom).
-func (s *streamStore) has(sessionID pgtype.UUID, taskID string) bool {
-	if taskID == "" {
-		return false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, r := range s.sessions[util.UUIDToString(sessionID)] {
-		if r.taskID == taskID {
-			return true
-		}
-	}
-	return false
-}
-
 // holding reports whether this store has anything on file anywhere — a round,
 // painted or not, or a run still waiting for its bubble. It is the "nothing
 // here to close" test at the head of the two ending subscribers.
@@ -1044,8 +1155,8 @@ func (s *streamStore) drop(sessionID pgtype.UUID, seq roundSeq) {
 	}
 }
 
-// depth reports how many bubbles are open across all sessions. Diagnostics,
-// tests, and the cheap rejection at the head of the progress subscribers.
+// depth reports how many bubbles are open across all sessions. Diagnostics
+// and tests.
 func (s *streamStore) depth() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1066,19 +1177,15 @@ func (s *streamStore) expiredLocked(createdAt time.Time) bool {
 
 // sweepLocked evicts rounds the server would no longer accept, runs that have
 // been waiting for a bubble longer than one could still be coming, and the
-// finished rings of sessions that have been quiet for a whole window. The
-// guard timer normally rotates a round long before this fires, and an ending
-// normally takes it; the sweep is what keeps a round whose run produced no
-// ending at all — and a run whose ingest goroutine never arrived — from
-// accumulating forever. Caller holds s.mu.
+// finished rings of sessions that have been quiet for a whole window. An
+// ending normally takes a round long before this fires; the sweep is what keeps
+// a round whose run produced no ending at all — and a run whose ingest
+// goroutine never arrived — from accumulating forever. Caller holds s.mu.
 func (s *streamStore) sweepLocked() {
 	for key, rounds := range s.sessions {
 		live := rounds[:0]
 		for _, r := range rounds {
 			if s.expiredLocked(r.createdAt) {
-				if r.guard != nil {
-					r.guard.Stop()
-				}
 				continue
 			}
 			live = append(live, r)
@@ -1112,8 +1219,7 @@ func (s *streamStore) sweepLocked() {
 
 // seal writes a bubble's closing frame and is the one place the retry policy
 // for closing frames lives. Every closer goes through it: the answer, the
-// failure and cancellation notices, the settled flush, and the hand-over a
-// rotation writes on the stream it is leaving.
+// failure and cancellation notices, and the settled flush.
 //
 // The policy, measured against the live bot (STRATEGY §6.5):
 //
@@ -1142,11 +1248,28 @@ func (s *streamStore) sweepLocked() {
 func (s *streamStore) seal(ctx context.Context, senders *sendersRegistry, h streamHandle, text string) error {
 	var err error
 	for attempt := 0; ; attempt++ {
-		err = senders.stream(ctx, h, text, true)
+		// The first attempt is an ordinary frame and waits its turn like one.
+		// Every attempt after it is the SAME frame written again, which the
+		// gate lets through: blocking it would leave the first one unanswered
+		// and send the answer a second time by the plain route.
+		if attempt == 0 {
+			err = senders.stream(ctx, h, text, true)
+		} else {
+			err = senders.streamRewrite(ctx, h, text, true)
+		}
 		if !errors.Is(err, errStreamAckTimeout) || attempt >= streamCloseRetries {
 			break
 		}
 		if s.expiredLocked(h.CreatedAt) {
+			break
+		}
+		// A RETRY THAT CANNOT FINISH IS WORSE THAN NO RETRY. It spends the
+		// caller's remaining budget waiting, then hands back ctx.Err() instead
+		// of whatever the server actually said — and the fallback that needed
+		// that budget has none left. streamCloseRetries is therefore an upper
+		// bound and the deadline is the authority: one more attempt costs the
+		// pause plus a full ack wait, and it is only started if that fits.
+		if d, ok := ctx.Deadline(); ok && time.Until(d) < s.closeRetryDelay+ackTimeout {
 			break
 		}
 		if s.closeRetryDelay > 0 {

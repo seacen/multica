@@ -27,7 +27,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/events"
-	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
@@ -77,14 +76,6 @@ func (f *fakeObjectStore) readCount() int {
 // delivery instead of racing it.
 func newOutboundWithMedia(t *testing.T, q outboundQueries, objects mediaObjectStore) (*Outbound, pgtype.UUID, *mediaConn) {
 	t.Helper()
-	return newOutboundWithMediaAndStreams(t, q, objects, nil)
-}
-
-// newOutboundWithMediaAndStreams is the same rig plus the round store the
-// typing indicator writes its bubble to, for the one case where the bubble and
-// the files meet.
-func newOutboundWithMediaAndStreams(t *testing.T, q outboundQueries, objects mediaObjectStore, streams *streamStore) (*Outbound, pgtype.UUID, *mediaConn) {
-	t.Helper()
 	reg := newSendersRegistry()
 	instID := mustTestUUID(t)
 	conn := newMediaConn()
@@ -93,7 +84,7 @@ func newOutboundWithMediaAndStreams(t *testing.T, q outboundQueries, objects med
 	if objects != nil {
 		opts = append(opts, WithAttachments(objects))
 	}
-	o := NewOutbound(q, reg, streams, slog.Default(), opts...)
+	o := NewOutbound(q, reg, nil, slog.Default(), opts...)
 	o.spawn = func(f func()) { f() }
 	return o, instID, conn
 }
@@ -214,42 +205,17 @@ func TestProcessEvent_SendsTheAnswerAndThenTheFile(t *testing.T) {
 
 	// Order matters: the words are what the user is waiting for, and the file
 	// is allowed to be slow. A file ahead of its explanation reads as noise.
-	if got := frameOrder(t, conn); len(got) == 0 || got[0] != "text" {
-		t.Fatalf("frames in write order = %v, want the answer first — a file sent ahead of its explanation reads as noise", got)
+	frames := conn.cmdFrames(cmdSendMsg)
+	if len(frames) < 2 {
+		t.Fatalf("send frames = %d, want the answer and the file", len(frames))
 	}
-	if !slices.Contains(frameOrder(t, conn), "upload") {
-		t.Fatalf("frames in write order = %v, want the upload behind the answer", frameOrder(t, conn))
+	var first map[string]any
+	if err := json.Unmarshal(frames[0].Body, &first); err != nil {
+		t.Fatalf("decode first frame: %v", err)
 	}
-}
-
-// frameOrder labels every frame this socket carried, in write order: "text"
-// for a markdown message, "upload" for a chunk of a file on its way, "media"
-// for the finished file arriving in the chat. It is what turns "the answer
-// went out first" into something a test can read, now that both halves ride
-// the same wire.
-func frameOrder(t *testing.T, conn *mediaConn) []string {
-	t.Helper()
-	conn.mu.Lock()
-	frames := append([]frameEnvelope(nil), conn.frames...)
-	conn.mu.Unlock()
-	var out []string
-	for _, f := range frames {
-		switch f.Cmd {
-		case cmdUploadMediaInit, cmdUploadMediaChunk, cmdUploadMediaFinish:
-			out = append(out, "upload")
-		case cmdSendMsg:
-			var body map[string]any
-			if err := json.Unmarshal(f.Body, &body); err != nil {
-				t.Fatalf("decode send frame: %v", err)
-			}
-			if body["msgtype"] == "markdown" {
-				out = append(out, "text")
-			} else {
-				out = append(out, "media")
-			}
-		}
+	if first["msgtype"] != "markdown" {
+		t.Errorf("first send was %v, want the answer's text ahead of the file", first["msgtype"])
 	}
-	return out
 }
 
 // A file is a second way an answer reaches the room, so the origin gate has to
@@ -318,72 +284,6 @@ func TestProcessEvent_EmptyCompletionStillDeliversABoundFile(t *testing.T) {
 	// A png inside the image ceiling travels as an image, not a file card.
 	if media[0]["msgtype"] != string(mediaTypeImage) {
 		t.Errorf("msgtype = %v, want image", media[0]["msgtype"])
-	}
-}
-
-// TestEmptyCompletionWithFilesDoesNotClaimNothingIsComing is the seam between
-// the two halves. #6604 sends the files an agent produced; #6606 seals the
-// bubble the question opened. Land one on top of the other and a turn whose
-// agent said nothing but produced a file seals its bubble with "nothing to
-// reply this round" and then sends the file underneath it — a bubble that
-// contradicts the very next message, with both halves working exactly as
-// written.
-func TestEmptyCompletionWithFilesDoesNotClaimNothingIsComing(t *testing.T) {
-	t.Parallel()
-	q := oneAttachmentQueries(t, db.Attachment{
-		ID:          mustTestUUID(t),
-		Filename:    "report.pdf",
-		Url:         "https://cdn.example/obj/rep",
-		ContentType: "application/pdf",
-		SizeBytes:   4,
-	})
-	streams := newStreamStore()
-	o, instID, conn := newOutboundWithMediaAndStreams(t, q,
-		&fakeObjectStore{key: "obj/rep", data: []byte("DATA")}, streams)
-	q.sessionBinding.InstallationID = instID
-	q.installation.ID = instID
-
-	sessionID, err := util.ParseUUID(testSessionID)
-	if err != nil {
-		t.Fatalf("parse session uuid: %v", err)
-	}
-	// A round with a bubble on screen, bound to the task this event answers.
-	streams.open(sessionID, streamHandle{
-		ReqID: "REQ-1", StreamID: "S-1",
-		InstallationID: instID, ChatID: "CHAT_1", ChatType: chatTypeGroupInt,
-		// Stated rather than left zero: the closing words are read out of the
-		// handle's pack, and the assertion below names a pack of its own.
-		Locale: DefaultLocale,
-	})
-	streams.bindNext(sessionID, testTaskID)
-
-	if err := o.processEvent(context.Background(), chatDoneEvent("")); err != nil {
-		t.Fatalf("processEvent: %v", err)
-	}
-
-	var sealed string
-	for _, f := range conn.cmdFrames(cmdRespondMsg) {
-		var body map[string]any
-		if err := json.Unmarshal(f.Body, &body); err != nil {
-			t.Fatalf("decode stream frame: %v", err)
-		}
-		stream, _ := body["stream"].(map[string]any)
-		if stream != nil && stream["finish"] == true {
-			sealed, _ = stream["content"].(string)
-		}
-	}
-	if want := copyFor(DefaultLocale).StreamNoReplyWithFiles; sealed != want {
-		t.Errorf("the bubble was sealed with %q, want %q — the files arrive right under it", sealed, want)
-	}
-	// And the file itself still went out: copy that promises files and then
-	// sends none is the same contradiction the other way round.
-	if n := len(mediaSends(t, conn)); n != 1 {
-		t.Errorf("media sends = %d, want 1 — the file the bubble promised never arrived", n)
-	}
-	// No plain text message: the bubble already carries every word this turn
-	// has, and repeating it underneath would be the second copy of it.
-	if got := markdownSends(t, conn); len(got) != 0 {
-		t.Errorf("text sends = %v, want none — the sealed bubble said it already", got)
 	}
 }
 
@@ -483,15 +383,6 @@ func TestSendAttachments_ARefusedFileIsReportedAsDefinitelyFailed(t *testing.T) 
 	}
 }
 
-// Two cases that used to sit here are gone with their harness. #8318 removed
-// mediaConn.dropAcks and the tests that needed it, each of which stood still
-// for a whole ackTimeout. What they asserted - an unconfirmed push is hedged
-// rather than called a failure, and is never repeated - is the mapping the
-// table below pins without waiting on one.
-
-// The classifier itself, stated as a table so the mapping is legible in one
-// place. It is the only thing standing between an errcode and what a person
-// reads.
 func TestSendOutcome_TellsARefusalFromAMissingAnswer(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -785,7 +676,7 @@ func TestDeliverAttachments_AdmissionBoundsTheLookupStage(t *testing.T) {
 		go func() { defer running.Done(); f() }()
 	}
 
-	target := attachmentTarget{InstallationID: instID, ChatID: "CHAT_1", ChatType: chatTypeSingleInt, Locale: DefaultLocale}
+	target := attachmentTarget{InstallationID: instID, ChatID: "CHAT_1", ChatType: chatTypeSingleInt}
 	const surplus = 16
 	submitted := maxAdmittedAttachmentDeliveries + surplus
 	for i := 0; i < submitted; i++ {
@@ -901,7 +792,7 @@ func TestDeliverAttachments_IgnoresATurnItCannotAddress(t *testing.T) {
 	q := oneAttachmentQueries(t, db.Attachment{ID: mustTestUUID(t), Filename: "a.txt", Url: "u"})
 	o, instID, conn := newOutboundWithMedia(t, q, &fakeObjectStore{key: "k", data: []byte("x")})
 
-	target := attachmentTarget{InstallationID: instID, ChatID: "CHAT_1", ChatType: chatTypeSingleInt, Locale: DefaultLocale}
+	target := attachmentTarget{InstallationID: instID, ChatID: "CHAT_1", ChatType: chatTypeSingleInt}
 	// No message id on the payload — nothing was bound to this turn.
 	o.deliverAttachments(events.Event{WorkspaceID: testWorkspaceID, Payload: protocol.ChatDonePayload{}}, target, false)
 	// No workspace id.
@@ -1132,7 +1023,7 @@ func TestSlotWaitTimeout_SettlesEveryKnownFile(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	o.sendAttachments(ctx, mustParseTaskUUID(t, testMessageID), mustParseTaskUUID(t, testWorkspaceID),
-		attachmentTarget{InstallationID: instID, ChatID: "CHAT_1", ChatType: chatTypeSingleInt, SessionID: testSessionID, Locale: DefaultLocale}, true)
+		attachmentTarget{InstallationID: instID, ChatID: "CHAT_1", ChatType: chatTypeSingleInt, SessionID: testSessionID}, true)
 
 	if got := mx.get("attachment_dropped:transport_error"); got != 3 {
 		t.Errorf("attachment_dropped:transport_error = %d, want 3 — every known file settles", got)
@@ -1161,7 +1052,7 @@ func TestNoLiveSender_SettlesEveryKnownFile(t *testing.T) {
 	o.spawn = func(f func()) { f() }
 
 	o.sendAttachments(context.Background(), mustParseTaskUUID(t, testMessageID), mustParseTaskUUID(t, testWorkspaceID),
-		attachmentTarget{InstallationID: instID, ChatID: "CHAT_1", ChatType: chatTypeSingleInt, SessionID: testSessionID, Locale: DefaultLocale}, true)
+		attachmentTarget{InstallationID: instID, ChatID: "CHAT_1", ChatType: chatTypeSingleInt, SessionID: testSessionID}, true)
 
 	if got := mx.get("attachment_dropped:no_live_connection"); got != 3 {
 		t.Errorf("attachment_dropped:no_live_connection = %d, want 3", got)

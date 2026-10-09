@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -110,6 +111,9 @@ func TestOmpExecuteDefaultsToOmpBinary(t *testing.T) {
 		t.Fatalf("New(omp): %v", err)
 	}
 	sessionPath := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(sessionPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	session, err := backend.Execute(ctx, "test prompt", ExecOptions{
@@ -201,7 +205,11 @@ func TestOmpExecuteCompletesFromEventStream(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{Timeout: 5 * time.Second})
+	sessionPath := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(sessionPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{Timeout: 5 * time.Second, ResumeSessionID: sessionPath})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -388,7 +396,7 @@ func TestOmpAndPiCanCoexist(t *testing.T) {
 }
 
 // TestDiscoverOmpModelsNonZeroExit verifies that discoverOmpModels returns
-// an empty catalog when the omp binary exits non-zero (e.g. an old omp that
+// a discovery error when the omp binary exits non-zero (e.g. an old omp that
 // doesn't support `models --json` and prints usage to stderr). This is the
 // fake-executable integration test the review asked for.
 func TestDiscoverOmpModelsNonZeroExit(t *testing.T) {
@@ -406,8 +414,8 @@ func TestDiscoverOmpModelsNonZeroExit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	models, err := discoverOmpModels(ctx, Command{Path: fakePath})
-	if err != nil {
-		t.Fatalf("discoverOmpModels: %v", err)
+	if err == nil {
+		t.Fatal("expected model discovery failure with a reason")
 	}
 	if len(models) != 0 {
 		t.Fatalf("expected 0 models for non-zero-exit omp, got %d", len(models))
@@ -415,13 +423,13 @@ func TestDiscoverOmpModelsNonZeroExit(t *testing.T) {
 }
 
 // TestDiscoverOmpModelsMissingBinary verifies that a missing omp binary
-// degrades to an empty catalog, not an error.
+// reports a discovery error.
 func TestDiscoverOmpModelsMissingBinary(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	models, err := discoverOmpModels(ctx, Command{Path: "/nonexistent/omp-binary"})
-	if err != nil {
-		t.Fatalf("discoverOmpModels: %v", err)
+	if err == nil {
+		t.Fatal("expected model discovery failure with a reason")
 	}
 	if len(models) != 0 {
 		t.Fatalf("expected 0 models for missing binary, got %d", len(models))

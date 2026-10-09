@@ -321,11 +321,11 @@ func (s *AutopilotService) DispatchAutopilotForWebhookDelivery(
 // moved downstream; otherwise enqueue exactly the same assignee path used by
 // the original dispatch.
 func (s *AutopilotService) ensureWebhookCreateIssueTask(ctx context.Context, autopilot db.Autopilot, run db.AutopilotRun) error {
-	tasks, err := s.Queries.ListTasksByIssue(ctx, run.IssueID)
+	hasTasks, err := s.Queries.HasTaskForIssue(ctx, run.IssueID)
 	if err != nil {
 		return fmt.Errorf("dispatch for webhook delivery: inspect issue tasks: %w", err)
 	}
-	if len(tasks) > 0 {
+	if hasTasks {
 		return nil
 	}
 	issue, err := s.Queries.GetIssue(ctx, run.IssueID)
@@ -1920,10 +1920,11 @@ func (s *AutopilotService) autopilotAdmitInvoke(ctx context.Context, ap db.Autop
 	return s.canMemberInvokeAgent(ctx, agent, principal, ap.WorkspaceID)
 }
 
-// canMemberInvokeAgent is memberMayInvokeAgent for autopilot admission, which
-// picks the member (autopilotAdmitInvoke). Fail-closed on any lookup error; no
-// admin bypass.
+// canMemberInvokeAgent checks whether a specific member may invoke the agent
+// under the invocation-permission model (MUL-3963). It mirrors
+// handler.canInvokeAgent with a member effective user — used for a manual
+// autopilot "run now" where the clicker, not the creator, is the admission
+// principal. Fail-closed on any lookup error; no admin bypass.
 func (s *AutopilotService) canMemberInvokeAgent(ctx context.Context, agent db.Agent, memberUserID pgtype.UUID, workspaceID pgtype.UUID) bool {
-	allowed, err := memberMayInvokeAgent(ctx, s.Queries, agent, memberUserID, workspaceID)
-	return err == nil && allowed
+	return CanMemberInvokeAgent(ctx, s.Queries, agent, memberUserID, workspaceID)
 }

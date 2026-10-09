@@ -11,10 +11,13 @@ package wecom
 // The wire is documented at https://developer.work.weixin.qq.com/document/path/101463 .
 
 import (
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -665,11 +668,7 @@ func (m InboundMedia) inline(ref channel.MediaRef) channel.MediaRef {
 // group message on the wire — WeCom only forwards to the bot when it was
 // addressed, so any received group message counts as addressed.
 //
-// c is the destination's copy pack, needed again here to put the quote block
-// back on a body normalizeWeComControlLayout rebuilt from the sender's own
-// runs — see the ForceFresh path below.
-//
-// text is the agent-readable body the caller already resolved via routableText.
+// text is the agent-readable body the caller already resolved via ownText.
 // It is passed in rather than recomputed because the caller has to know
 // whether the message is routable at all before it gets here. The command
 // source is a different string and is derived here from mc — see
@@ -733,28 +732,6 @@ func channelMessageFromCallback(botID, botDisplayName string, mc aibotMsgCallbac
 		} else {
 			text = quoted + "\n\n" + text
 		}
-	} else if bare, ok := engine.ParseControlCommand(command); ok &&
-		bare.Kind == engine.ControlCommandNewChat && bare.Body == "" && mc.Quote.render() != "" {
-		// A bare /new behind a quote. normalizeWeComControlLayout declined this
-		// message on purpose — a directive with nothing after it and no file of
-		// the sender's own is the shared pending sentinel rather than a turn —
-		// so the quote block routableText rendered is still sitting above the
-		// directive, and Router is the one that has to consume it.
-		//
-		// Router consumes a body it recognises AS the directive, and for /new
-		// the test it uses is Text == CommandText (router.go, the
-		// ControlCommandNewChat branch). The quote block breaks that equality,
-		// so the literal "/new" survived into the body of the chat that command
-		// had just created — the first line the new session ever held, and part
-		// of the context every later turn in that room reads.
-		//
-		// So hand the directive over undecorated and let Router empty it. The
-		// quote goes with it: nothing was asked, so there is no question for it
-		// to be the subject of. That is what a bare /clear behind a quote
-		// already ends up as — its Router branch rewrites Text unconditionally
-		// and never needed the adapter's help, which is why only /new is
-		// handled here.
-		text = command
 	}
 
 	// A bare /clear that still carries content — media, a quote, or both — is a
@@ -821,10 +798,7 @@ func channelMessageFromCallback(botID, botDisplayName string, mc aibotMsgCallbac
 		// bare directive behind a quote reads as an empty message to Router,
 		// which persists nothing and answers nobody.
 		HasSelectedContext: quoted != "",
-		// Set only when the adapter already took the directive out of Text
-		// above; see the comment there. FreshSession only — /new is left to
-		// the router, which does not overwrite a recomposed Text for it.
-		ForceFresh: controlNormalized && control.Kind == engine.ControlCommandFreshSession,
+		ForceFresh:         controlNormalized && control.Kind == engine.ControlCommandFreshSession,
 		// A pure /issue command in WeCom should NOT trigger the
 		// agent — the engine already creates the issue and the
 		// OutboundReplier already sends "✅ 已创建 #N". Letting the agent
@@ -1036,9 +1010,6 @@ func subscribeBody(botID, secret string) map[string]any {
 	return map[string]any{"bot_id": botID, "secret": secret}
 }
 
-// msgTypeMarkdown is the only aibot msgtype the adapter writes.
-const msgTypeMarkdown = "markdown"
-
 // sendMsgTextBody builds an aibot_send_msg body carrying plain-text
 // content. aibot_send_msg's supported msgtypes are markdown and
 // template_card only — text is NOT accepted on this cmd (contrast
@@ -1056,91 +1027,9 @@ func sendMsgTextBody(chatID string, chatType int, content string) (map[string]an
 	return map[string]any{
 		"chatid":    chatID,
 		"chat_type": chatType,
-		"msgtype":   msgTypeMarkdown,
+		"msgtype":   "markdown",
 		"markdown":  map[string]string{"content": content},
 	}, nil
-}
-
-// sendMsgContentLimit is the cap on one aibot_send_msg markdown body: the same
-// 20480 utf8 bytes the stream frame gets
-// (https://developer.work.weixin.qq.com/document/path/101138). A body past it
-// is refused WHOLE — the server does not clip it — and the refusal arrives as
-// errcode 45002 on the ack, so before splitForWire a long answer simply never
-// appeared in the chat.
-const sendMsgContentLimit = streamContentLimit
-
-// splitForWire cuts a reply into pieces the platform will accept, and returns
-// the input untouched when it already fits — which is nearly always, so the
-// common path allocates nothing.
-//
-// Splitting rather than truncating is the point. A long answer is a code
-// review, a pasted log, a document draft: the tail is not filler, and neither
-// a reply the server refuses whole nor one that stops at an ellipsis with no
-// way to read the rest is an answer. The cut prefers a line boundary, then a
-// rune boundary, so a piece never ends mid-character and rarely ends mid-line.
-//
-// Each piece carries a marker so the reader knows the answer continues. This
-// is the one place the adapter adds words to an agent's own text, which is why
-// the marker is a bare counter rather than a sentence: it belongs to no
-// language, so it needs no translation and cannot contradict an answer written
-// in one.
-func splitForWire(content string) []string {
-	if len(content) <= sendMsgContentLimit {
-		return []string{content}
-	}
-
-	var pieces []string
-	remaining := content
-	for len(remaining) > 0 {
-		// Reserve room for the widest marker this piece could end up with.
-		// The total is not known until the split is done, so the placeholder
-		// stands in for it: "…" is three bytes, which covers a total up to
-		// three digits — far past any answer that reaches this function.
-		marker := fmt.Sprintf("\n\n(%d/…)", len(pieces)+1)
-		budget := sendMsgContentLimit - len(marker)
-		if len(remaining) <= sendMsgContentLimit {
-			pieces = append(pieces, remaining)
-			break
-		}
-		cut := wireCutPoint(remaining, budget)
-		pieces = append(pieces, remaining[:cut])
-		remaining = strings.TrimLeft(remaining[cut:], "\n")
-	}
-
-	// The count is only knowable once the split is done, so the markers go on
-	// afterwards. The last piece gets none: there is nothing after it to
-	// promise, and the reader can see that for themselves.
-	total := len(pieces)
-	for i := range pieces {
-		if i == total-1 {
-			continue
-		}
-		pieces[i] += fmt.Sprintf("\n\n(%d/%d)", i+1, total)
-	}
-	return pieces
-}
-
-// wireCutPoint picks where to end a piece: the last line break inside the
-// budget when there is one worth using, otherwise the last rune boundary.
-func wireCutPoint(s string, budget int) int {
-	if budget >= len(s) {
-		return len(s)
-	}
-	// A line break in the last quarter of the budget is worth taking; one
-	// near the start would waste most of a frame.
-	if nl := strings.LastIndexByte(s[:budget], '\n'); nl > budget*3/4 {
-		return nl
-	}
-	cut := budget
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	if cut == 0 {
-		// A single rune wider than the budget cannot happen at this size, but
-		// returning 0 would loop forever, so fall back to the raw cut.
-		return budget
-	}
-	return cut
 }
 
 // aibotChatTypeFromChannel maps the engine's ChatType enum to the int the
@@ -1350,4 +1239,124 @@ func hasVisibleChar(s string) bool {
 		}
 	}
 	return false
+}
+
+// newStreamID mints the developer-chosen id that names one streaming message.
+// Reusing an id replaces that message's body; a fresh one opens another
+// bubble, which is why this must never collide across concurrent turns.
+func newStreamID() string {
+	var buf [12]byte
+	if _, err := cryptorand.Read(buf[:]); err != nil {
+		return fmt.Sprintf("wecom-stream-%d", time.Now().UnixNano())
+	}
+	return "s" + hex.EncodeToString(buf[:])
+}
+
+// sendMsgContentLimit is the cap on one aibot_send_msg markdown body: the same
+// 20480 utf8 bytes the stream frame gets
+// (https://developer.work.weixin.qq.com/document/path/101138). A body past it
+// is refused WHOLE — the server does not clip it — and the refusal arrives as
+// errcode 45002 on the ack, so before splitForWire a long answer simply never
+// appeared in the chat.
+const sendMsgContentLimit = 20480
+
+// splitForWire cuts a reply into pieces the platform will accept, and returns
+// the input untouched when it already fits — which is nearly always, so the
+// common path allocates nothing.
+//
+// Splitting rather than truncating is the point. A long answer is a code
+// review, a pasted log, a document draft: the tail is not filler, and neither
+// a reply the server refuses whole nor one that stops at an ellipsis with no
+// way to read the rest is an answer. The cut prefers a line boundary, then a
+// rune boundary, so a piece never ends mid-character and rarely ends mid-line.
+//
+// Each piece carries a marker so the reader knows the answer continues. This
+// is the one place the adapter adds words to an agent's own text, which is why
+// the marker is a bare counter rather than a sentence: it belongs to no
+// language, so it needs no translation and cannot contradict an answer written
+// in one.
+func splitForWire(content string) []string {
+	if len(content) <= sendMsgContentLimit {
+		return []string{content}
+	}
+
+	var pieces []string
+	remaining := content
+	for len(remaining) > 0 {
+		// Reserve room for the widest marker this piece could end up with.
+		// The total is not known until the split is done, so the placeholder
+		// stands in for it: "…" is three bytes, which covers a total up to
+		// three digits — far past any answer that reaches this function.
+		marker := fmt.Sprintf("\n\n(%d/…)", len(pieces)+1)
+		budget := sendMsgContentLimit - len(marker)
+		if len(remaining) <= sendMsgContentLimit {
+			pieces = append(pieces, remaining)
+			break
+		}
+		cut := wireCutPoint(remaining, budget)
+		// Nothing is dropped at the seam. The cut is an index into remaining
+		// and both sides of it are kept: a line break the cut point chose ends
+		// the piece it belongs to, so concatenating the pieces with their
+		// markers stripped gives the answer back byte for byte. An earlier
+		// version trimmed leading newlines here, which silently ate a
+		// paragraph break out of every log and code block long enough to
+		// split.
+		pieces = append(pieces, remaining[:cut])
+		remaining = remaining[cut:]
+	}
+
+	// A piece with nothing visible in it is not sent. A long answer that ends
+	// in a run of blank lines puts that run in a piece of its own — the last
+	// piece carries no marker, so nothing else makes it visible — and that
+	// piece reaches the chat as an empty bubble, which is the thing
+	// hasVisibleChar exists at the call sites to prevent. Dropping it costs
+	// the reader nothing: what is dropped is whitespace that would have
+	// occupied a whole message on its own.
+	//
+	// Filtered before the markers go on, so the numbering counts the pieces
+	// the person actually receives.
+	kept := pieces[:0]
+	for _, p := range pieces {
+		if hasVisibleChar(p) {
+			kept = append(kept, p)
+		}
+	}
+	pieces = kept
+
+	// The count is only knowable once the split is done, so the markers go on
+	// afterwards. The last piece gets none: there is nothing after it to
+	// promise, and the reader can see that for themselves.
+	total := len(pieces)
+	for i := range pieces {
+		if i == total-1 {
+			continue
+		}
+		pieces[i] += fmt.Sprintf("\n\n(%d/%d)", i+1, total)
+	}
+	return pieces
+}
+
+// wireCutPoint picks where to end a piece: the last line break inside the
+// budget when there is one worth using, otherwise the last rune boundary.
+func wireCutPoint(s string, budget int) int {
+	if budget >= len(s) {
+		return len(s)
+	}
+	// A line break in the last quarter of the budget is worth taking; one
+	// near the start would waste most of a frame. The cut goes AFTER it, so
+	// the break stays at the end of the piece it terminated rather than
+	// falling into the gap between two frames.
+	if nl := strings.LastIndexByte(s[:budget], '\n'); nl > budget*3/4 {
+		return nl + 1
+	}
+	cut := budget
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	if cut == 0 {
+		// A single rune wider than the budget cannot happen at this size, but
+		// returning 0 would loop forever, so fall back to the raw cut.
+		return budget
+	}
+	return cut
 }

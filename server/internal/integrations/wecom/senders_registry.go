@@ -48,9 +48,8 @@ func newSendersRegistry() *sendersRegistry {
 //
 // The registry is where this belongs rather than in each caller's
 // constructor: it is the one object every outbound write already goes
-// through, and it is already held by the two things that need to report —
-// the outbound subscriber and the media resolver — neither of which has any
-// other reason to know that metrics exist.
+// through, and it is already held by the thing that needs to report — the
+// outbound subscriber — which has no other reason to know that metrics exist.
 func (r *sendersRegistry) WithMetrics(m Metrics) *sendersRegistry {
 	r.metrics = orNopMetrics(m)
 	return r
@@ -151,14 +150,25 @@ func (r *sendersRegistry) stream(ctx context.Context, h streamHandle, content st
 	return sender.respondStream(ctx, h.ReqID, h.StreamID, content, finish)
 }
 
+// streamRewrite is stream for a frame already written once — seal's retry.
+// See respondStreamRewrite for why an identical frame may pass the gate an
+// ordinary one may not.
+func (r *sendersRegistry) streamRewrite(ctx context.Context, h streamHandle, content string, finish bool) error {
+	sender := r.get(h.InstallationID)
+	if sender == nil {
+		return errNoLiveConnection
+	}
+	return sender.respondStreamRewrite(ctx, h.ReqID, h.StreamID, content, finish)
+}
+
 // recordEnding counts how a bubble ended — BOTH halves, recorded on this one
 // line — from the final error of its closing frame.
 //
 // Every closer comes through here, via streamStore.seal: the answer, the
-// failure and cancellation notices the typing indicator writes, the settled
-// flush, the hand-over a rotation writes. A closing frame the server took is a
-// bubble that ended in words; one it refused sends the caller to a plain
-// message instead, which is a fall-back at every call site without exception.
+// failure and cancellation notices the typing indicator writes, and the
+// settled flush. A closing frame the server took is a bubble that ended in
+// words; one it refused sends the caller to a plain message instead, which is
+// a fall-back at every call site without exception.
 //
 // The pair is recorded together because the pair is the signal — the ratio is
 // what says whether the bubble still works at all — and a counter fed from one
@@ -172,6 +182,14 @@ func (r *sendersRegistry) stream(ctx context.Context, h streamHandle, content st
 // Counted once per ending rather than once per attempt: seal may write the
 // same closing frame several times when an ack is lost, and a bubble that
 // took the frame on the second try ended in words all the same.
+// recordOpened counts one bubble that is now on screen and owed an ending.
+// Separate from recordEnding because the two are written from opposite sides:
+// an ending is known here, inside the seal; an opening is only known to the
+// caller that decided to keep the handle.
+func (r *sendersRegistry) recordOpened() {
+	r.mx().RecordStreamOpened()
+}
+
 func (r *sendersRegistry) recordEnding(err error) {
 	if err == nil {
 		r.mx().RecordStreamFinished()

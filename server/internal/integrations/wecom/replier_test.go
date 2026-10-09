@@ -55,6 +55,14 @@ type recordingConn struct {
 	sender     *wsSender
 	refuseCode int
 	refuseMsg  string
+
+	// refuseFromSend and swallowAckFromSend act on aibot_send_msg frames
+	// only, counted 1-based, and are how a test refuses or loses the verdict
+	// on the SECOND piece of a split answer while the first one lands. Zero
+	// leaves both off.
+	refuseFromSend     int
+	swallowAckFromSend int
+	sends              int
 }
 
 // autoAck wires the double to answer the sender's writes. Call it after
@@ -73,8 +81,16 @@ func (c *recordingConn) WriteMessage(_ int, data []byte) error {
 	c.frames = append(c.frames, env)
 	s := c.sender
 	code, msg := c.refuseCode, c.refuseMsg
+	swallow := false
+	if env.Cmd == cmdSendMsg {
+		c.sends++
+		if c.refuseFromSend > 0 && c.sends >= c.refuseFromSend {
+			code, msg = 45002, "content exceed max length"
+		}
+		swallow = c.swallowAckFromSend > 0 && c.sends >= c.swallowAckFromSend
+	}
 	c.mu.Unlock()
-	if s != nil {
+	if s != nil && !swallow {
 		s.routeResponse(frameEnvelope{
 			Headers: frameHeaders{ReqID: env.Headers.ReqID},
 			ErrCode: code,
@@ -82,6 +98,20 @@ func (c *recordingConn) WriteMessage(_ int, data []byte) error {
 		})
 	}
 	return nil
+}
+
+// sendFrames is every aibot_send_msg body the socket was handed, refused ones
+// included — what reached the wire, not what the person can read.
+func (c *recordingConn) sendFrames() []frameEnvelope {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []frameEnvelope
+	for _, f := range c.frames {
+		if f.Cmd == cmdSendMsg {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 func (c *recordingConn) ReadMessage() (int, []byte, error) { return 0, nil, nil }
 func (c *recordingConn) SetReadDeadline(time.Time) error   { return nil }
@@ -159,23 +189,12 @@ func TestPost_AddressesRoomChatID(t *testing.T) {
 }
 
 func TestReply_CommandOutcomes_PostGuidance(t *testing.T) {
-	// Read out of the pack rather than pinned to a literal: these arrived from
-	// upstream as package constants and were folded into copyPack on the way
-	// in, so the assertion has to follow the copy to where it lives now or it
-	// stops being about what the user reads.
-	//
-	// FreshPending and ChatStarted are both here because #7468 split /fresh
-	// into two commands that answer differently — /clear keeps the
-	// conversation and drops its context, /new opens another one — and the
-	// two lines are one field apart in the pack.
-	deflt := copyFor(DefaultLocale)
 	for _, tc := range []struct {
 		outcome engine.Outcome
 		want    string
 	}{
-		{engine.OutcomeFreshPending, deflt.FreshPending},
-		{engine.OutcomeChatStarted, deflt.ChatStarted},
-		{engine.OutcomeIssueUsage, deflt.IssueUsage},
+		{engine.OutcomeFreshPending, copyFor(DefaultLocale).FreshPending},
+		{engine.OutcomeIssueUsage, copyFor(DefaultLocale).IssueUsage},
 	} {
 		t.Run(string(tc.outcome), func(t *testing.T) {
 			r, inst, conn := newReplierWithConn(t)
@@ -293,39 +312,6 @@ func TestSendBindingPrompt_P2PSendsOnlyPrivately(t *testing.T) {
 	body := conn.sendBody(t, 0)
 	if body["chatid"] != "USER_A" || body["chat_type"] != float64(chatTypeSingleInt) {
 		t.Errorf("p2p token frame = %v, want USER_A at chat_type 1", body)
-	}
-}
-
-// TestInvokeDenied_GroupTellsOnlyTheSender: a member refused by the agent's
-// invoke permission in a group is told in their own 1:1, and the room gets
-// nothing — a line there would show everyone who was refused and that the
-// agent is someone's private one. The sender is bound, so the private line
-// reads in their profile language, not the room's.
-func TestInvokeDenied_GroupTellsOnlyTheSender(t *testing.T) {
-	t.Parallel()
-	const groupID = "GROUP_CHAT_ID"
-	reg := newSendersRegistry()
-	inst := engine.ResolvedInstallation{ID: mustTestUUID(t)}
-	conn := &recordingConn{}
-	reg.set(inst.ID, conn.autoAck(newWSSender(conn, nil)))
-	asker := languagesFor("en")
-	r := NewOutboundReplier(OutboundReplierConfig{Senders: reg, Languages: asker, AppURL: "https://multica.example"})
-
-	msg := channel.InboundMessage{Source: channel.Source{ChatID: groupID, ChatType: channel.ChatTypeGroup, SenderID: asker.senderID}}
-	r.Reply(context.Background(), inst, msg, engine.Result{Outcome: engine.OutcomeInvokeDenied, Sender: asker.senderID})
-
-	conn.mu.Lock()
-	n := len(conn.frames)
-	conn.mu.Unlock()
-	if n != 1 {
-		t.Fatalf("frames sent = %d, want exactly one (the private notice) and nothing in the room", n)
-	}
-	body := conn.sendBody(t, 0)
-	if body["chatid"] != asker.senderID || body["chat_type"] != float64(chatTypeSingleInt) {
-		t.Fatalf("notice addressed to %v at chat_type %v, want the sender %q at chat_type 1", body["chatid"], body["chat_type"], asker.senderID)
-	}
-	if got, want := sentMarkdown(t, conn, 0), copyPacks[LocaleEn].InvokeDenied; got != want {
-		t.Fatalf("private notice = %q, want the sender's own language %q", got, want)
 	}
 }
 

@@ -216,20 +216,27 @@ func (f *fakeReplier) calls() []Result {
 }
 
 type fakeTyping struct {
-	mu      sync.Mutex
-	count   int
-	settled int
+	settledScope TypingSettlement
+	sequence     []string
+	messageID    pgtype.UUID
+	mu           sync.Mutex
+	count        int
+	settled      int
 }
 
-func (f *fakeTyping) OnIngested(_ context.Context, _ ResolvedInstallation, _ channel.InboundMessage, _ pgtype.UUID) {
+func (f *fakeTyping) OnIngested(_ context.Context, _ ResolvedInstallation, _ channel.InboundMessage, _ pgtype.UUID, chatMessageID pgtype.UUID) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.count++
+	f.messageID = chatMessageID
+	f.sequence = append(f.sequence, "ingested")
 }
-func (f *fakeTyping) OnSettled(_ context.Context, _ pgtype.UUID) {
+func (f *fakeTyping) OnSettled(_ context.Context, _ pgtype.UUID, scope TypingSettlement) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.settled++
+	f.settledScope = scope
+	f.sequence = append(f.sequence, "settled")
 }
 func (f *fakeTyping) calls() int        { f.mu.Lock(); defer f.mu.Unlock(); return f.count }
 func (f *fakeTyping) settledCalls() int { f.mu.Lock(); defer f.mu.Unlock(); return f.settled }
@@ -321,6 +328,8 @@ func (f *fakeIssues) PublishAttachmentsChanged(context.Context, db.Issue, pgtype
 }
 
 type fakeTasks struct {
+	denyInvoke          bool
+	invokeErr           error
 	mu                  sync.Mutex
 	called              bool
 	callCount           int
@@ -336,21 +345,6 @@ type fakeTasks struct {
 	err                 error
 	prepared            bool
 	prepareErr          error
-	// deniedInvoker is the one user CanMemberInvokeAgent refuses; everyone
-	// else may invoke. invokeChecks records who was asked about.
-	deniedInvoker pgtype.UUID
-	invokeChecks  []pgtype.UUID
-	invokeErr     error
-}
-
-func (f *fakeTasks) CanMemberInvokeAgent(_ context.Context, _, userID pgtype.UUID) (bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.invokeChecks = append(f.invokeChecks, userID)
-	if f.invokeErr != nil {
-		return false, f.invokeErr
-	}
-	return !f.deniedInvoker.Valid || userID != f.deniedInvoker, nil
 }
 
 func (f *fakeTasks) PromoteChannelChatTasksIfMediaReady(_ context.Context, _ pgtype.UUID) error {
@@ -365,6 +359,16 @@ func (f *fakeTasks) PromoteDeferredChannelIssueTask(_ context.Context, taskID pg
 	defer f.mu.Unlock()
 	f.issueTaskPromotions = append(f.issueTaskPromotions, taskID)
 	return nil
+}
+
+// MemberMayInvokeAgent answers the invoke gate. Defaults to allowing, which is
+// what every test written before the gate existed assumes; a test that drives
+// the refusal sets denyInvoke or invokeErr.
+func (f *fakeTasks) MemberMayInvokeAgent(context.Context, pgtype.UUID, pgtype.UUID) (bool, error) {
+	if f.invokeErr != nil {
+		return false, f.invokeErr
+	}
+	return !f.denyInvoke, nil
 }
 
 func (f *fakeTasks) EnqueueChannelChatTask(_ context.Context, _ db.ChatSession, initiator pgtype.UUID, forceFresh bool, contextRevision int64, bindingID pgtype.UUID, routeRevision int64) (db.AgentTaskQueue, error) {
@@ -396,11 +400,6 @@ func (f *fakeTasks) wasPrepared() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.prepared
-}
-func (f *fakeTasks) invokeCheckArgs() []pgtype.UUID {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]pgtype.UUID(nil), f.invokeChecks...)
 }
 func (f *fakeTasks) wasCalled() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.called }
 func (f *fakeTasks) freshArg() bool  { f.mu.Lock(); defer f.mu.Unlock(); return f.forceFresh }
@@ -625,6 +624,62 @@ func TestRouter_GroupNotAddressed_Drops(t *testing.T) {
 	}
 }
 
+// A refused sender is refused BEFORE anything is stored. That ordering is the
+// whole point: the web chat applies this verdict before it opens a session, and
+// a channel that applied it later would still have written the member's message
+// into somebody else's agent's context.
+func TestRouter_SenderWhoMayNotInvoke_IsRefusedBeforeAnythingIsStored(t *testing.T) {
+	h := newHarness(t)
+	h.tasks.denyInvoke = true
+
+	if err := h.router.Handle(context.Background(), p2pMessage(t)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r, _ := h.audit.last(); r != DropReasonInvokeDenied {
+		t.Fatalf("audit = %q, want invocation_not_allowed", r)
+	}
+	if h.dedup.marks() != 1 {
+		t.Fatalf("a refusal is final for this message, so it marks: got %d", h.dedup.marks())
+	}
+	if h.media.calls() != 0 {
+		t.Fatal("a refused turn must not resolve media — that is work done for a run that will not happen")
+	}
+	h.binder.mu.Lock()
+	ensures := h.binder.ensureCalls
+	h.binder.mu.Unlock()
+	if ensures != 0 {
+		t.Fatalf("ensured %d sessions for a refused sender; the refusal has to land before the Chat exists", ensures)
+	}
+	if !waitFor(time.Second, func() bool {
+		for _, r := range h.replier.calls() {
+			if r.Outcome == OutcomeInvokeDenied {
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatal("the sender was never told; silence reads as a broken bot")
+	}
+}
+
+// A lookup that did not answer is not a denial. It releases, so the platform's
+// redelivery is still this message's chance — marking here would turn one
+// database blip into permanent silence for a member who may run the agent.
+func TestRouter_InvokeCheckError_Releases(t *testing.T) {
+	h := newHarness(t)
+	h.tasks.invokeErr = errors.New("database is down")
+
+	if err := h.router.Handle(context.Background(), p2pMessage(t)); err == nil {
+		t.Fatal("a failed permission lookup must surface as an error")
+	}
+	if h.dedup.marks() != 0 {
+		t.Fatalf("marked %d times; an unanswered lookup must not consume the claim", h.dedup.marks())
+	}
+	if h.dedup.releases() != 1 {
+		t.Fatalf("releases = %d, want 1", h.dedup.releases())
+	}
+}
+
 func TestRouter_UnboundSender_NeedsBinding(t *testing.T) {
 	h := newHarness(t)
 	h.ident.err = ErrSenderUnbound
@@ -663,60 +718,6 @@ func TestRouter_NonMember_Drops(t *testing.T) {
 	}
 	if h.media.calls() != 0 {
 		t.Fatal("non-member sender must not resolve media")
-	}
-}
-
-// A group route belongs to the installer, but the turn belongs to the sender,
-// so the sender is who the invoke gate judges. The harness installer may invoke
-// and the sender may not: judging the installer would let this through.
-func TestRouter_SenderWhoMayNotInvoke_IsRefusedBeforeAnythingIsStored(t *testing.T) {
-	h := newHarness(t)
-	sender := h.ident.id.UserID
-	h.tasks.deniedInvoker = sender
-	msg := p2pMessage(t)
-	msg.Source.ChatType = channel.ChatTypeGroup
-	msg.AddressedToBot = true
-	if err := h.router.Handle(context.Background(), msg); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got := h.tasks.invokeCheckArgs(); len(got) != 1 || got[0] != sender {
-		t.Fatalf("invoke gate judged %v, want only the sender %v", got, sender)
-	}
-	if r, _ := h.audit.last(); r != DropReasonInvokeDenied {
-		t.Fatalf("expected invocation_not_allowed audit, got %q", r)
-	}
-	if h.binder.ensureCalls != 0 || h.binder.startCalls != 0 || h.binder.appendedParams().Message.MessageID != "" {
-		t.Fatal("a refused sender's message must not reach the session store")
-	}
-	if h.tasks.wasCalled() || h.tasks.wasPrepared() {
-		t.Fatal("a refused sender must not enqueue a run")
-	}
-	if h.dedup.marks() != 1 {
-		t.Fatalf("invoke refusal must finalize Mark, got %d", h.dedup.marks())
-	}
-	if !waitFor(time.Second, func() bool {
-		for _, r := range h.replier.calls() {
-			if r.Outcome == OutcomeInvokeDenied && r.Sender == "ou_user_a" {
-				return true
-			}
-		}
-		return false
-	}) {
-		t.Fatal("expected an InvokeDenied reply targeting the sender")
-	}
-}
-
-func TestRouter_InvokeCheckError_Releases(t *testing.T) {
-	h := newHarness(t)
-	h.tasks.invokeErr = errors.New("db down")
-	if err := h.router.Handle(context.Background(), p2pMessage(t)); err == nil {
-		t.Fatal("invoke-permission infra error must surface to the caller")
-	}
-	if h.dedup.releases() != 1 {
-		t.Fatalf("invoke-permission error must Release the claim (1), got %d", h.dedup.releases())
-	}
-	if h.binder.ensureCalls != 0 {
-		t.Fatal("a sender whose permission could not be checked must not reach the session store")
 	}
 }
 
@@ -788,6 +789,12 @@ func TestRouter_Ingested_InTxMark_FinalizeNone(t *testing.T) {
 	}
 	if !waitFor(time.Second, func() bool { return h.typing.calls() == 1 }) {
 		t.Fatalf("ingest must show the typing indicator")
+	}
+	h.typing.mu.Lock()
+	messageID := h.typing.messageID
+	h.typing.mu.Unlock()
+	if messageID != h.binder.appendResult.MessageID {
+		t.Fatalf("typing lost persisted input identity: %v", messageID)
 	}
 	// Media resolution runs on its own goroutine (r.mediaWg), and the binding
 	// happens only after it returns, so both of these are downstream of work
@@ -1009,8 +1016,8 @@ func TestRouter_ContextGenerationsUseIndependentBatchWindows(t *testing.T) {
 	sessionID := h.binder.ensureID
 	initiator := h.ident.id.UserID
 
-	h.router.scheduleRunWithFresh(h.router.sets[channel.TypeFeishu], h.inst.inst, msg, sessionID, initiator, pgtype.UUID{}, 1, false, 1)
-	h.router.scheduleRunWithFresh(h.router.sets[channel.TypeFeishu], h.inst.inst, msg, sessionID, initiator, pgtype.UUID{}, 1, false, 2)
+	h.router.scheduleRunWithFresh(h.router.sets[channel.TypeFeishu], h.inst.inst, msg, sessionID, initiator, pgtype.UUID{}, 1, false, 1, pgtype.UUID{})
+	h.router.scheduleRunWithFresh(h.router.sets[channel.TypeFeishu], h.inst.inst, msg, sessionID, initiator, pgtype.UUID{}, 1, false, 2, pgtype.UUID{})
 	if got := h.router.batcher.pendingCount(); got != 2 {
 		t.Fatalf("pending generation windows = %d, want 2", got)
 	}
@@ -1092,7 +1099,8 @@ func TestRouter_RecoveryDoesNotDelayLiveOlderGeneration(t *testing.T) {
 	h.router.batcher = newTestBatcher(timers)
 	msg := p2pMessage(t)
 	h.router.scheduleRunWithFresh(h.router.sets[channel.TypeFeishu], h.inst.inst, msg,
-		h.binder.ensureID, h.ident.id.UserID, pgtype.UUID{}, 1, false, 1)
+		h.binder.ensureID, h.ident.id.UserID, pgtype.UUID{}, 1, false, 1, pgtype.UUID{},
+	)
 
 	h.binder.appendResult.ContextRevision = 2
 	h.binder.appendResult.PendingContexts = []PendingContext{
@@ -1583,11 +1591,23 @@ func TestRouter_FlushOffline_RepliesAgentOffline(t *testing.T) {
 	}) {
 		t.Fatalf("agent-no-runtime must emit an AgentOffline reply")
 	}
-	// The reaction was added on ingest but no task will run, so the bus-driven
-	// clear never fires — the flush must clear the typing indicator itself.
+	// Inline failed enqueue precedes the detached ingestion hook. Its persisted
+	// settlement boundary must suppress that later Add without a task event.
 	if !waitFor(time.Second, func() bool { return h.typing.settledCalls() == 1 }) {
 		t.Fatalf("offline flush must clear the typing indicator, got %d OnSettled calls", h.typing.settledCalls())
 	}
+	if !waitFor(time.Second, func() bool { return h.typing.calls() == 1 }) {
+		t.Fatal("detached ingestion hook did not run")
+	}
+	h.typing.mu.Lock()
+	defer h.typing.mu.Unlock()
+	if h.typing.settledScope.ThroughMessageID != h.binder.appendResult.MessageID || h.typing.settledScope.WorkspaceID != h.inst.inst.WorkspaceID || h.typing.settledScope.InstallationID != h.inst.inst.ID {
+		t.Fatalf("failed flush lost its durable input boundary: %+v", h.typing.settledScope)
+	}
+	if len(h.typing.sequence) != 2 || h.typing.sequence[0] != "settled" || h.typing.sequence[1] != "ingested" {
+		t.Fatalf("unexpected inline flush/async Add ordering: %+v", h.typing.sequence)
+	}
+
 }
 
 func TestRouter_FlushArchived_ClearsTyping(t *testing.T) {

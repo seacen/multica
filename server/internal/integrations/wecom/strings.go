@@ -119,59 +119,24 @@ type copyPack struct {
 	AgentOffline  string
 	AgentArchived string
 
-	// InvokeDenied answers a bound member the agent's invoke permission
-	// refuses — the verdict the web chat gives the same person. It always goes
-	// to that member alone (replier.go), so it can say plainly what happened.
-	InvokeDenied string
-
-	// UnsupportedMsgType answers a message kind the adapter cannot read at
-	// all — sent from the read loop, which never reaches the Replier. It does
-	// not name text, because photos, files, videos and 图文混排 route: a person
-	// who has just watched the bot answer a screenshot and is then told it
-	// only handles text reads that as the bot being broken.
-	UnsupportedMsgType string
-
 	// FreshPending confirms /clear: the next chat message stays in the
 	// conversation it is already in and runs without the context before it.
 	// ChatStarted confirms /new, which is the other half of that split — a
 	// new conversation the next message enters. Two commands, two answers:
 	// telling a /clear user their conversation was replaced sends them
 	// looking for a thread that never moved. IssueUsage answers a bare
-	// /issue with the shape it wanted. All three arrived from upstream after
-	// this pack existed, so they are stated here rather than as package
-	// constants — the lint asserts it, and a Chinese literal in replier.go is
-	// a line no other locale can read.
+	// /issue with the shape it wanted. All three are stated here rather than as
+	// package constants — the lint asserts it, and a Chinese literal in
+	// replier.go is a line no other locale can read.
 	FreshPending string
 	ChatStarted  string
 	IssueUsage   string
 
-	// MediaTooLarge / MediaUnreadable tell the sender that an attachment did
-	// not make it. Two reasons rather than one because the fix differs: a
-	// file over the limit needs splitting or a link, whereas an expired or
-	// undecryptable download just needs sending again.
-	MediaTooLarge   string
-	MediaUnreadable string
-
-	// MediaSendFailed / MediaSendUnknown / MediaLookupFailed go the other way:
-	// the agent produced a file and it did not plainly reach the chat. The
-	// answer is already on screen and may well point at the file, so silence
-	// would leave the user waiting for something that is not coming. One line
-	// covers the whole turn however many files were affected — the reason (too
-	// big, storage down, WeCom refused it) is a log line, not something the
-	// reader can act on.
-	//
-	// Three of them because there are three things that can be true, and
-	// telling them apart is the point (see deliveryState in outbound_media.go).
-	// MediaSendFailed is the definite one: nothing arrived and nothing can
-	// have. MediaSendUnknown is for a send whose verdict never came back — its
-	// wording has to survive both endings, so it must not say "failed" to
-	// someone looking at the file, and it says why nothing is resent, since a
-	// duplicate cannot be taken back. MediaLookupFailed is earlier still: we
-	// could not read what was attached to this reply, so we do not know whether
-	// there was a file at all.
-	MediaSendFailed   string
-	MediaSendUnknown  string
-	MediaLookupFailed string
+	// InvokeDenied answers a member who may not run this agent (a private
+	// agent belongs to its owner alone). It always goes to that member alone —
+	// in place in a 1:1, in their own 1:1 for a group trigger (replier.go) — so
+	// their profile picks the language even when the trigger was a room.
+	InvokeDenied string
 
 	// BindingPromptPrefix / BindingPromptSuffix wrap the bind URL.
 	// BindingPending replaces the whole thing when the mint was throttled and
@@ -207,46 +172,73 @@ type copyPack struct {
 	// and the bubble spins on forever (see hasVisibleChar in ws_frame.go).
 	//
 	// StreamNoReply — the agent finished with nothing to say.
-	// StreamMerged — a QUEUED round's run finished with nothing of its own to
-	//   say; the reply ahead of it already covered this message. A first
-	//   round's empty finish keeps StreamNoReply, which has no earlier answer
-	//   to point at.
+	// StreamNoReplyWithFiles — the agent finished with no words but produced
+	//   files, which arrive as separate messages right after this one.
+	//   Distinct from StreamNoReply because that copy says nothing is coming,
+	//   and then something arrives: a bubble that contradicts the next message
+	//   reads as a bug even though both halves are working.
 	// StreamNotStarted — no run was triggered at all (agent offline or
 	//   archived, or the enqueue failed); the replier's own notice follows as
 	//   a separate message with the detail.
-	// StreamFailed — the run failed.
+	// StreamFailed — the run failed, and the platform published no reason of
+	//   its own. A failure that DID carry one says that instead (failureText
+	//   in typing_indicator.go).
 	// StreamCancelled — the user stopped the run, so no answer is coming.
 	//   Separate copy from StreamFailed on purpose: inviting a retry of
 	//   something somebody just stopped on purpose reads as the bot not having
 	//   noticed.
-	// StreamContinued — the run outlived one stream's window, so the bubble
-	//   is sealed with this and the run carries on in a fresh bubble right
-	//   underneath it (the rotation in typing_indicator.go's fireGuard). A
-	//   statement of fact, not a promise: nothing is owed on the strength of
-	//   it, the next bubble is already on screen.
-	// StreamNoReplyWithFiles — the agent finished with no words but produced
-	// files, which arrive as separate messages right after this one. Distinct
-	// from StreamNoReply because that copy says nothing is coming, and then
-	// something arrives: a bubble that contradicts the next message reads as a
-	// bug even though both halves are working.
-	//
-	// There is no failure line here that names the agent or carries the
-	// platform's reason. TaskFailedNotice / TaskFailedAgentFallback /
-	// TaskFailedReason were the DB outbound queue's own notice, rendered from
-	// a stored payload by whichever replica drained the row; the queue was
-	// withdrawn and outbox_sender.go went with it, so the fields had no
-	// renderer left and are gone too. StreamFailed is what a failed run says
-	// now, from sayTheRunFailed, and it names neither. Reinstating "failed
-	// because X, handled by Y" is a product decision with a promise behind it
-	// — something has to know the reason at send time — so it comes back with
-	// its sender, not as three strings waiting for one.
 	StreamNoReply          string
 	StreamNoReplyWithFiles string
-	StreamMerged           string
 	StreamNotStarted       string
 	StreamFailed           string
 	StreamCancelled        string
-	StreamContinued        string
+
+	// InboxDetailLink is the anchor text on the inbox card's deep link;
+	// InboxTypeLabels names each notification kind, with InboxTypeFallback
+	// covering a kind this adapter has not been taught yet.
+	InboxDetailLink   string
+	InboxTypeLabels   map[string]string
+	InboxTypeFallback string
+	// MediaSendFailed / MediaSendUnknown / MediaLookupFailed go the other way:
+	// the agent produced a file and it did not plainly reach the chat. The
+	// answer is already on screen and may well point at the file, so silence
+	// would leave the user waiting for something that is not coming. One line
+	// covers the whole turn however many files were affected — the reason (too
+	// big, storage down, WeCom refused it) is a log line, not something the
+	// reader can act on.
+	//
+	// Three of them because there are three things that can be true, and
+	// telling them apart is the point (see deliveryState in outbound_media.go).
+	// MediaSendFailed is the definite one: nothing arrived and nothing can
+	// have. MediaSendUnknown is for a send whose verdict never came back — its
+	// wording has to survive both endings, so it must not say "failed" to
+	// someone looking at the file, and it says why nothing is resent, since a
+	// duplicate cannot be taken back. MediaLookupFailed is earlier still: we
+	// could not read what was attached to this reply, so we do not know whether
+	// there was a file at all.
+	MediaSendFailed   string
+	MediaSendUnknown  string
+	MediaLookupFailed string
+
+	// UnsupportedMsgType answers a message kind the adapter cannot read at
+	// all — sent from the read loop, which never reaches the Replier. It does
+	// not name text, because photos, files, videos and 图文混排 route: a person
+	// who has just watched the bot answer a screenshot and is then told it
+	// only handles text reads that as the bot being broken.
+	UnsupportedMsgType string
+
+	// MediaTooLarge / MediaUnreadable tell the sender that an attachment did
+	// not make it. Two reasons rather than one because the fix differs: a
+	// file over the limit needs splitting or a link, whereas an expired or
+	// undecryptable download just needs sending again.
+	MediaTooLarge   string
+	MediaUnreadable string
+
+	// StreamContinued — the run outlived one stream's window, so the bubble is
+	// sealed with this and the run carries on in a fresh bubble right
+	// underneath it. A statement of fact, not a promise: nothing is owed on the
+	// strength of it, the next bubble is already on screen.
+	StreamContinued string
 
 	// StreamStuck is the odd one out among the Stream* lines: it does not close
 	// a bubble, it explains one that can no longer be closed. The server has
@@ -263,13 +255,6 @@ type copyPack struct {
 	// Progress words each step the run takes. Kept in its own struct because
 	// there are twenty-odd of them and they are only ever read together.
 	Progress progressCopy
-
-	// InboxDetailLink is the anchor text on the inbox card's deep link;
-	// InboxTypeLabels names each notification kind, with InboxTypeFallback
-	// covering a kind this adapter has not been taught yet.
-	InboxDetailLink   string
-	InboxTypeLabels   map[string]string
-	InboxTypeFallback string
 }
 
 // progressCopy is what the bubble says while the run is still going: one whole
@@ -389,16 +374,13 @@ var copyPacks = map[Locale]copyPack{
 	LocaleZhHans: {
 		AgentOffline:         "⚠️ 智能体当前不在线，你的消息已收到，等它上线后会处理。",
 		AgentArchived:        "⚠️ 该智能体已归档，无法回复。请联系工作区管理员。",
-		InvokeDenied:         "⚠️ 你没有权限运行该智能体。如需使用，请联系它的所有者。",
-		UnsupportedMsgType:   "抱歉，我暂时无法处理这类消息。",
 		FreshPending:         "✅ 已准备从空上下文运行。你的下一条聊天消息仍会进入当前对话，但不会带上之前的上下文。",
 		ChatStarted:          "✅ 已新建 Multica 对话。你的下一条消息会进入该对话。",
 		IssueUsage:           "请填写任务标题，格式如下：\n\n`/issue <标题>`\n`[描述]`（可选）",
+		UnsupportedMsgType:   "抱歉，我暂时无法处理这类消息。",
 		MediaTooLarge:        "抱歉，附件太大了，我这边收不下。",
 		MediaUnreadable:      "抱歉，有附件没能收到，麻烦重新发一次。",
-		MediaSendFailed:      "⚠️ 有文件没能发出来，我这边保留着，需要的话我再试一次。",
-		MediaSendUnknown:     "⚠️ 有文件我没收到企业微信的送达回执，可能已经发到了、也可能没有。我不会自动重发，免得发重了；你那边没看到的话说一声，我再发一次。",
-		MediaLookupFailed:    "⚠️ 我这边没查到这条回答带没带文件，所以要是有，这次没发出来。需要的话我再试一次。",
+		InvokeDenied:         "⚠️ 你没有权限运行该智能体。如需使用，请联系它的所有者。",
 		BindingPromptPrefix:  "👋 请先绑定你的 Multica 账号，才能与我对话：\n",
 		BindingPromptSuffix:  "\n（链接 15 分钟内有效）",
 		BindingPending:       "👋 绑定链接刚才已经发给你了，就在上方，请直接点击完成绑定。",
@@ -410,9 +392,11 @@ var copyPacks = map[Locale]copyPack{
 
 		StreamNoReply:          "（这轮没有需要回复的内容）",
 		StreamNoReplyWithFiles: "（这轮没有文字回复，附件在下面）",
-		StreamMerged:           "✅ 这条已并入上一条回复一起处理了。",
 		StreamNotStarted:       "已收到，但这条暂时没能开始处理。",
 		StreamFailed:           "⚠️ 这次没跑通，请稍后再试一次。",
+		MediaSendFailed:        "⚠️ 有文件没能发出来，我这边保留着，需要的话我再试一次。",
+		MediaSendUnknown:       "⚠️ 有文件我没收到企业微信的送达回执，可能已经发到了、也可能没有。我不会自动重发，免得发重了；你那边没看到的话说一声，我再发一次。",
+		MediaLookupFailed:      "⚠️ 我这边没查到这条回答带没带文件，所以要是有，这次没发出来。需要的话我再试一次。",
 		StreamCancelled:        "⏹️ 这次处理已取消。",
 		StreamContinued:        "处理时间较长，接下一条",
 		StreamStuck:            "⚠️ 上面那条进度不会再更新了，这轮的结果我用新消息发你。",
@@ -454,7 +438,7 @@ var copyPacks = map[Locale]copyPack{
 			"comment_added":      "新评论",
 			"new_comment":        "新评论",
 			"reaction_added":     "表情反应",
-			"task_failed":        "任务失败",
+			"task_failed":        "task 失败",
 			"unassigned":         "取消指派",
 			"assignee_changed":   "指派人变更",
 			"priority_changed":   "优先级变更",
@@ -466,16 +450,13 @@ var copyPacks = map[Locale]copyPack{
 	LocaleEn: {
 		AgentOffline:         "⚠️ The agent is offline right now. Your message was received and will be handled once it's back.",
 		AgentArchived:        "⚠️ This agent has been archived and can't reply. Please contact your workspace admin.",
-		InvokeDenied:         "⚠️ You don't have access to run this agent. Ask its owner if you need it.",
-		FreshPending:         "✅ Fresh start ready. Your next chat message will run without previous context.",
+		FreshPending:         "✅ Fresh start ready. Your next message stays in this chat but runs without the earlier context.",
 		ChatStarted:          "✅ Started a new Multica chat. Your next message will enter it.",
-		IssueUsage:           "Give the task a title, like this:\n\n`/issue <title>`\n`[description]` (optional)",
+		IssueUsage:           "Please include an issue title. Use:\n\n`/issue <title>`\n`[description]` (optional)",
 		UnsupportedMsgType:   "Sorry, I can't read that kind of message.",
 		MediaTooLarge:        "Sorry, that attachment is too big for me to take.",
 		MediaUnreadable:      "Sorry, an attachment didn't come through — please send it again.",
-		MediaSendFailed:      "⚠️ I couldn't send one of the files. It is still here — say the word and I'll try again.",
-		MediaSendUnknown:     "⚠️ WeCom never confirmed one of the files, so it may or may not have arrived. I won't resend it automatically in case that shows it twice — tell me if it isn't there and I'll send it again.",
-		MediaLookupFailed:    "⚠️ I couldn't check whether this answer had a file with it, so if it did, it didn't go out. Say the word and I'll try again.",
+		InvokeDenied:         "⚠️ You don't have permission to run this agent. Ask its owner if you need to use it.",
 		BindingPromptPrefix:  "👋 Link your Multica account before we can talk:\n",
 		BindingPromptSuffix:  "\n(the link is good for 15 minutes)",
 		BindingPending:       "👋 I already sent you a link — it is just above, tap it to finish linking.",
@@ -487,9 +468,11 @@ var copyPacks = map[Locale]copyPack{
 
 		StreamNoReply:          "(nothing to reply with this round)",
 		StreamNoReplyWithFiles: "(no text this round — the files follow)",
-		StreamMerged:           "✅ Handled together with my previous reply.",
 		StreamNotStarted:       "Got it, but this one couldn't start processing.",
 		StreamFailed:           "⚠️ That run didn't go through. Please try again.",
+		MediaSendFailed:        "⚠️ I couldn't send one of the files. It is still here — say the word and I'll try again.",
+		MediaSendUnknown:       "⚠️ WeCom never confirmed one of the files, so it may or may not have arrived. I won't resend it automatically in case that shows it twice — tell me if it isn't there and I'll send it again.",
+		MediaLookupFailed:      "⚠️ I couldn't check whether this answer had a file with it, so if it did, it didn't go out. Say the word and I'll try again.",
 		StreamCancelled:        "⏹️ That run was cancelled.",
 		StreamContinued:        "Still working, continued below",
 		StreamStuck:            "⚠️ The status above won't update any further. I'll send this round's result as a new message.",
@@ -531,7 +514,7 @@ var copyPacks = map[Locale]copyPack{
 			"comment_added":      "New comment",
 			"new_comment":        "New comment",
 			"reaction_added":     "Reaction",
-			"task_failed":        "Task failed",
+			"task_failed":        "Run failed",
 			"unassigned":         "Unassigned",
 			"assignee_changed":   "Assignee changed",
 			"priority_changed":   "Priority changed",

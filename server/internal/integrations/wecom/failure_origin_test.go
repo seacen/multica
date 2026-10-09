@@ -12,13 +12,13 @@ package wecom
 // handleTaskFailed resolves the room off the delivery row and announces, in
 // front of everyone in it, that something they never saw has gone wrong.
 //
-// The first two tests are the pair that matters: the same event, the same
-// session, opposite verdicts, decided only by where the question came from.
-// The rest pin the branches where the origin cannot be established. This is an
-// authorization check on writing into somebody else's group chat, so those
-// refuse — a lookup that did not answer is not evidence the question came from
-// WeCom — and the case that made fail-open tempting is covered without them,
-// by the round state this process already holds.
+// A browser run with no bubble of its own has no route into the room at all:
+// it has no delivery row, so there is no chat to address. The route that
+// matters is a bubble it bound off task:queued, and that is what the tests
+// below drive. The rest pin the branches where the origin cannot be
+// established. This is an authorization check on writing into somebody else's
+// group chat, so those refuse — a lookup that did not answer is not evidence
+// the question came from WeCom.
 
 import (
 	"context"
@@ -28,10 +28,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/multica-ai/multica/server/internal/events"
-	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
 // logRecorder keeps what the manager logged. A refusal writes no frame and no
@@ -93,8 +90,6 @@ func newBoundRoomRig(t *testing.T) *bubbleRig {
 		Tasks:      rig.q,
 		Deliveries: rig.q,
 		Logger:     slog.New(rig.logs),
-		// No guard: these tests drive the endings themselves.
-		GuardAfter: -1,
 	})
 	rig.bus = events.New()
 	rig.typing.Register(rig.bus)
@@ -132,9 +127,8 @@ func (r *bubbleRig) askedInTheBrowser(t *testing.T, taskName string) {
 }
 
 // askedInTheRoom files the same row for a question typed in WeCom. The stamp
-// is stated here rather than left to the fake: this is the control the first
-// test is read against, and a control that only holds because of a default is
-// not one.
+// is stated here rather than left to the fake: a control that only holds
+// because of a default is not one.
 func (r *bubbleRig) askedInTheRoom(t *testing.T, taskName string) {
 	t.Helper()
 	r.q.fileTask(t, taskUUID(t, taskName))
@@ -156,62 +150,6 @@ func pushedTexts(t *testing.T, c *bubbleConn) []string {
 		out = append(out, s)
 	}
 	return out
-}
-
-// TestAWebUIRunsFailureIsNotAnnouncedInTheRoom is the fix.
-//
-// Nobody in the room asked anything. The installer asked in a browser and that
-// run failed, and the only thing tying it to WeCom is a binding row on the
-// session they share.
-func TestAWebUIRunsFailureIsNotAnnouncedInTheRoom(t *testing.T) {
-	t.Parallel()
-	rig := newBoundRoomRig(t)
-	rig.askedInTheBrowser(t, "task-1")
-
-	rig.failed(t, "task-1", false)
-
-	if got := pushedTexts(t, rig.conn); len(got) != 0 {
-		t.Fatalf("the room was told %q about a run nobody in it started — everyone in the chat "+
-			"just learned that a question they never saw had gone wrong", got)
-	}
-	if frames := rig.conn.streamFrames(t); len(frames) != 0 {
-		t.Fatalf("the room got %d stream frames for a browser run's failure, want none", len(frames))
-	}
-}
-
-// The control, and the direction that costs more to get wrong. The round was
-// asked in WeCom and this process holds no bubble for it — a restart mid-run
-// — so the notice is addressed by the task's delivery row, the way the answer
-// would be. It is the only "that run did not go through" WeCom ever produces.
-func TestAWecomRunsFailureStillReachesTheAskerWithoutABubble(t *testing.T) {
-	t.Parallel()
-	rig := newBoundRoomRig(t)
-	rig.askedInTheRoom(t, "task-1")
-
-	rig.failed(t, "task-1", false)
-
-	got := pushedTexts(t, rig.conn)
-	if len(got) != 1 || got[0] != streamCopyFailed {
-		t.Fatalf("the asker read %q, want exactly [%q] — the failure of their own question never arrived", got, streamCopyFailed)
-	}
-}
-
-// The same control with the bubble still open, so the notice goes into it
-// rather than under it. A gate that refuses a WeCom round leaves
-// this bubble spinning with no ending at all.
-func TestAWecomRunsFailureStillClosesTheBubbleItOpened(t *testing.T) {
-	t.Parallel()
-	rig := newBoundRoomRig(t)
-	rig.askedInTheRoom(t, "task-1")
-	rig.ran(t, "REQ-1", "task-1")
-
-	rig.failed(t, "task-1", false)
-
-	frames := rig.conn.streamFrames(t)
-	if len(frames) != 2 || frames[1]["finish"] != true || frames[1]["content"] != streamCopyFailed {
-		t.Fatalf("the bubble was left as %v, want it sealed with %q — the asker is watching a "+
-			"spinner for a run that is already dead", frames, streamCopyFailed)
-	}
 }
 
 // The gate must not seal a WeCom round's bubble with a web run's ending. It
@@ -251,43 +189,14 @@ func TestAWebUIRunsFailureLeavesTheRoomsOwnBubbleAlone(t *testing.T) {
 // The case that made fail-open tempting is covered further down, out of the
 // round state this process already holds.
 
-// A task:failed with no task id on it cannot be attributed at all. Both
-// publishers go through service.taskEvent, which sets TaskID on the envelope
-// and task_id in the payload from the row it is publishing about, so this is a
-// shape nothing in production produces — and a test-only shape is not worth a
-// standing permission to write into a customer's group chat.
-func TestAFailureWithNoTaskIDIsRefused(t *testing.T) {
-	t.Parallel()
-	rig := newBoundRoomRig(t)
-	rig.q.channelIngested = askedInTheWebUI() // would refuse, if it were ever asked
-
-	rig.bus.Publish(events.Event{
-		Type:          protocol.EventTaskFailed,
-		ChatSessionID: bubbleSession,
-		Payload:       map[string]any{"failure_reason": "provider_network"},
-	})
-
-	rig.refusedOrigin(t, "no task id")
-}
-
-// The task row is gone — cancelled and reaped while its failure was in flight.
-// Nothing left to read means nothing that says the question was asked here.
-func TestAVanishedTaskRowRefusesTheFailure(t *testing.T) {
-	t.Parallel()
-	rig := newBoundRoomRig(t)
-	rig.q.channelIngested = askedInTheWebUI() // no row to ask about, so this never applies
-
-	rig.failed(t, "task-1", false) // rig.q.tasks holds no row for it
-
-	rig.refusedOrigin(t, "cannot read the task row")
-}
-
 // The database did not answer. A lookup that failed is not a verdict, and a
 // gate that treated it as one would let an outage hand out the permission the
 // gate exists to withhold.
 func TestAnUnreadableOriginRefusesTheFailure(t *testing.T) {
 	t.Parallel()
 	rig := newBoundRoomRig(t)
+	// The gate's population: a run with no delivery row (no row, so the stamp is the only thing that could say).
+	rig.q.deliveryFiled = notFiled()
 	rig.askedInTheRoom(t, "task-1")
 	rig.q.originErr = errors.New("connection refused")
 
@@ -296,19 +205,31 @@ func TestAnUnreadableOriginRefusesTheFailure(t *testing.T) {
 	rig.refusedOrigin(t, "connection refused")
 }
 
-// ---- and where it can be established without a database ----
+// ---- and what an open round is, and is not, evidence of ----
 //
-// The case the refusals above look like they cost is the case with local
-// evidence, which is why the trade-off is not one. A round still open was
-// written only by the inbound path — a message this adapter ingested, named by
-// the flush that answered it — so it is proof of origin that no outage can
-// take away.
-
-// A round still open is evidence that costs no read at all: the bubble on
-// screen was opened by a message from the room.
-func TestAnOpenRoundIsProofEnoughOfOrigin(t *testing.T) {
+// A round still open used to skip the gate entirely: it was written by the
+// inbound path, so the bubble is the room's, and under the batch identity the
+// engine handed down the run bound to it was the room's too.
+//
+// Binding off task:queued separates those two facts. The BUBBLE is still
+// proof — OnIngested only ever runs for a WeCom turn. The RUN is not: a
+// question typed in Multica on the same session publishes an event with the
+// same chat_session_id and the same NULL issue_id, and can bind it. So the
+// ending has to be attributed from the database, and when the database cannot
+// answer, the honest outcome is silence.
+//
+// That is a real cost and it is the cheaper of the two. A withheld notice
+// leaves the asker without news of a run that failed. Announcing on a guess
+// puts a browser run's error text in front of everyone in a room that never
+// saw the question, in a chat with no unsend.
+//
+// REVERSE VERIFICATION: let the failure through when the origin read fails and
+// this reports the room sealed by a run it cannot attribute.
+func TestAnOutageWithholdsTheNoticeRatherThanGuessingTheOrigin(t *testing.T) {
 	t.Parallel()
 	rig := newBoundRoomRig(t)
+	// The gate's population: a run with no delivery row (no row, so the stamp is the only thing that could say).
+	rig.q.deliveryFiled = notFiled()
 	rig.ran(t, "REQ-1", "task-1")
 	rig.q.taskErr = errors.New("connection refused")
 	rig.q.originErr = errors.New("connection refused")
@@ -316,36 +237,21 @@ func TestAnOpenRoundIsProofEnoughOfOrigin(t *testing.T) {
 	rig.failed(t, "task-1", false)
 
 	frames := rig.conn.streamFrames(t)
-	if len(frames) != 2 || frames[1]["finish"] != true || frames[1]["content"] != streamCopyFailed {
-		t.Fatalf("the bubble was left as %v, want it sealed with %q — a database outage left the room's "+
-			"own question spinning on a run that is already dead", frames, streamCopyFailed)
+	if len(frames) != 1 {
+		t.Fatalf("the bubble was sealed on an origin nobody could establish: %v", frames)
 	}
-	if rig.q.taskGets != 0 {
-		t.Errorf("the gate read %d task row(s) for a run whose own bubble is open in this process", rig.q.taskGets)
+	if got := pushedTexts(t, rig.conn); len(got) != 0 {
+		t.Fatalf("the room was told %q about a run whose origin could not be read", got)
 	}
-}
-
-// The verdict is read off the batch OWNER, not off the task that failed. An
-// auto-retry clone's own id owns no messages, so asking about it would answer
-// "not from the channel" and silence the failure of every WeCom question long
-// enough to be retried.
-func TestTheOriginOfARetryCloneIsItsParentsBatch(t *testing.T) {
-	t.Parallel()
-	rig := newBoundRoomRig(t)
-	rig.askedInTheRoom(t, "task-1")
-	// FailTask's retry child: fresh id, inheriting the parent's input batch.
-	rig.q.fileRetryClone(t, taskUUID(t, "retry"), taskUUID(t, "task-1"))
-
-	rig.failed(t, "retry", false)
-
-	asked := rig.q.originAsked()
-	if len(asked) != 1 || asked[0] != taskUUID(t, "task-1") {
-		t.Fatalf("the origin was asked about %v, want [%s] — a retry's failure is judged on the "+
-			"question that started it, not on the clone's own empty batch",
-			asked, taskUUID(t, "task-1"))
+	reasons := rig.logs.refusals()
+	if len(reasons) != 1 || !strings.Contains(reasons[0], "connection refused") {
+		t.Fatalf("the gate logged %v, want one refusal naming the read that failed — a notice this process swallowed has to be visible to whoever runs it", reasons)
 	}
-	if got := pushedTexts(t, rig.conn); len(got) != 1 || got[0] != streamCopyFailed {
-		t.Fatalf("the asker read %q, want [%q]", got, streamCopyFailed)
+	// The round is left alone too: an unreachable database is not evidence the
+	// run belongs elsewhere, and releasing on it would hand the room's own
+	// bubble away before the answer still coming for it arrives.
+	if !rig.streams.has(bubbleSessionID(t), taskUUID(t, "task-1")) {
+		t.Fatal("the outage released the round: the answer still coming for it will find nothing to seal")
 	}
 }
 
@@ -372,8 +278,10 @@ func TestAnotherChannelsFailureNeverReachesTheTaskRow(t *testing.T) {
 	// A failed Slack run. The row is real and its input IS channel-ingested,
 	// so the origin gate would answer "deliver" if it were ever asked.
 	rig.askedInTheRoom(t, "task-1")
-	// What makes it Slack's: no WeCom binding for this session.
-	rig.q.sessionErr = pgx.ErrNoRows
+	// What makes it Slack's: the delivery row is real and names Slack. Modelling
+	// it as a MISSING row was the fixture's own error — that is the first-party
+	// shape, and it is the one population that must reach the gate.
+	rig.q.sessionChannelType = "slack"
 
 	rig.failed(t, "task-1", false)
 
@@ -402,59 +310,199 @@ func TestAnotherChannelsFailureNeverReachesTheTaskRow(t *testing.T) {
 // attempt for a run of somebody else's must leave nothing behind that the gate
 // would later read as proof.
 
-// TestAWebRunsUndeliveredAnswerDoesNotBuyItTheRoomsVoice is the fix.
+// ---------------------------------------------------------------------------
+// the gate has to survive a bubble that is already bound
+// ---------------------------------------------------------------------------
+
+// A question typed in Multica on a WeCom-bound session produces a task:queued
+// that is byte-identical to the room's own: CreateChatTask inserts issue_id as
+// NULL for EVERY chat task — WeCom, web, desktop, mobile — and taskEvent
+// stamps the same chat_session_id. So the browser's run can bind the room's
+// bubble, and from that moment the round being on this session's open list
+// says nothing about where the question was asked.
 //
-// The installer asks in their browser, against a session the room also uses.
-// The origin gate turns that answer away before anything WeCom-side is
-// touched: nothing taken, nothing filed, nothing said. Its later task:failed
-// then has to be decided by the row, and the row says no.
+// The failure path used to treat exactly that as proof: a round on the list
+// skipped the origin gate. With the batch identity the engine handed down that
+// was sound — the binding was WeCom's own. Off the bus it is not, and the
+// consequence is the worst one this adapter has: everybody in the room reads
+// the error text of a question none of them asked.
 //
-// The answer is still driven through processEvent rather than skipped, and the
-// socket is still taken down under it, because that is what makes this test
-// fail if the origin gate is ever moved back behind the take: the answer would
-// reach deliverAnswer and the dead socket would fail it, and the store would
-// have been asked to take a round for a run this adapter never ingested.
-func TestAWebRunsUndeliveredAnswerDoesNotBuyItTheRoomsVoice(t *testing.T) {
+// REVERSE VERIFICATION: restore the `if !m.streams.has(sessionID, taskID)`
+// wrapper around the gate and this fails with the room told about a browser
+// run's failure.
+func TestABrowserRunThatBoundTheRoomsBubbleIsStillNotAnnouncedInIt(t *testing.T) {
 	t.Parallel()
 	rig := newBoundRoomRig(t)
+	rig.ask(t, "REQ-ROOM")            // the room's own question paints a bubble
+	rig.askedInTheBrowser(t, "web-1") // …and the browser's run is what binds it
+	rig.queueTask(t, taskUUID(t, "web-1"), "")
 
-	// The room asked something earlier and read its answer.
-	rig.askedInTheRoom(t, "task-1")
-	rig.ran(t, "REQ-1", "task-1")
-	rig.answer(t, "42", "task-1")
-
-	// Now the installer asks the same session something in a browser. No
-	// bubble — and the socket is down when the answer goes out.
-	rig.askedInTheBrowser(t, "task-2")
-	rig.senders.clear(rig.instID, rig.conn.sender)
-	if err := rig.out.processEvent(context.Background(), events.Event{
-		ChatSessionID: bubbleSession,
-		TaskID:        taskUUID(t, "task-2"),
-		Payload:       protocol.ChatDonePayload{Content: "the salary band for that role is 42k"},
-	}); err != nil {
-		t.Fatalf("a browser question's answer is refused at the gate, so nothing is attempted "+
-			"and there is nothing to report: %v", err)
-	}
-	rig.senders.set(rig.instID, rig.conn.sender) // the socket comes back
-
-	// Everything read up to here belongs to the answer path. What the failure
-	// path asks on its own is the tail after this mark.
-	beforeFailure := len(rig.q.originAsked())
-
-	rig.failed(t, "task-2", false)
+	rig.failed(t, "web-1", false)
 
 	if got := pushedTexts(t, rig.conn); len(got) != 0 {
-		t.Fatalf("the room was told %q about a run nobody in it started — everyone in the chat "+
-			"just learned that a question they never saw had gone wrong", got)
+		t.Fatalf("the room was told %q about a run nobody in it started", got)
 	}
-	if asked := rig.q.originAsked()[beforeFailure:]; len(asked) != 1 || asked[0] != taskUUID(t, "task-2") {
-		t.Fatalf("the failure path read the channel_ingested stamp for %v, want exactly [%s] — "+
-			"a run with no round of this adapter's has to be decided by the row, "+
-			"and this one skipped the check on evidence it manufactured for itself",
-			asked, taskUUID(t, "task-2"))
+	closing := 0
+	for _, f := range rig.conn.streamFrames(t) {
+		if f["finish"] == true {
+			closing++
+		}
 	}
-	// Two frames: the room's own bubble, opened and sealed by its own answer.
-	if frames := rig.conn.streamFrames(t); len(frames) != 2 {
-		t.Fatalf("the room's stream frames are %v, want the 2 its own round wrote", frames)
+	if closing != 0 {
+		t.Fatalf("the room's bubble was sealed with a browser run's failure (%d closing frame(s))", closing)
+	}
+}
+
+// And the round has to come back. A gate that refuses without releasing what
+// it refused leaves the bubble bound to a run that will never close it: the
+// asker watches it turn until the platform ends it, and their own answer —
+// which arrives with no round left to take — degrades to a plain message.
+//
+// REVERSE VERIFICATION: return from the refusal without releasing and this
+// fails with the answer arriving as a push instead of in the bubble.
+func TestARefusedRunGivesTheBubbleBackToTheOneThatEarnedIt(t *testing.T) {
+	t.Parallel()
+	rig := newBoundRoomRig(t)
+	rig.out = NewOutbound(rig.q, rig.senders, rig.streams, nil)
+	rig.ask(t, "REQ-ROOM")
+	rig.askedInTheBrowser(t, "web-1")
+	rig.queueTask(t, taskUUID(t, "web-1"), "")
+	rig.failed(t, "web-1", false) // refused by the gate, and released
+
+	// Now the room's own run, which was queued behind it.
+	rig.askedInTheRoom(t, "task-1")
+	rig.queueTask(t, taskUUID(t, "task-1"), "")
+	rig.answer(t, "the agent reply", "task-1")
+
+	if pushes := rig.conn.pushes(t); len(pushes) != 0 {
+		t.Fatalf("the room's answer arrived as %d plain message(s) — its bubble was still held by the browser run: %v", len(pushes), pushes)
+	}
+	sealed := false
+	for _, f := range rig.conn.streamFrames(t) {
+		if f["finish"] == true && f["content"] == "the agent reply" {
+			sealed = true
+		}
+	}
+	if !sealed {
+		t.Fatal("the room's answer never sealed the bubble its own question opened")
+	}
+}
+
+// Cancellation had no origin gate at all. It mattered less when only WeCom's
+// own runs could hold a WeCom bubble; once a browser run can bind one, a
+// "这次处理已取消" seals the room's bubble for a cancellation nobody in the
+// room performed — and the question that bubble belonged to is still running.
+//
+// REVERSE VERIFICATION: drop the gate from handleTaskCancelled and this fails
+// with the room's bubble sealed by a browser run's cancellation.
+func TestABrowserRunsCancellationDoesNotSealTheRoomsBubble(t *testing.T) {
+	t.Parallel()
+	rig := newBoundRoomRig(t)
+	rig.ask(t, "REQ-ROOM")
+	rig.askedInTheBrowser(t, "web-1")
+	rig.queueTask(t, taskUUID(t, "web-1"), "")
+
+	rig.cancelled(t, "web-1")
+
+	for _, f := range rig.conn.streamFrames(t) {
+		if f["finish"] == true {
+			t.Fatalf("the room's bubble was sealed by a browser run's cancellation: %v", f)
+		}
+	}
+	if got := pushedTexts(t, rig.conn); len(got) != 0 {
+		t.Fatalf("the room was told %q about a cancellation nobody in it performed", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the notice has to survive a replica that holds no socket
+// ---------------------------------------------------------------------------
+
+// On main a failure notice produced on a replica with no socket for this
+// installation was handed to the one holding it, as an ordinary relayKindReply.
+// The bubble path took the notice off the answer's route and onto its own,
+// which speaks to the sender registry directly — so on any multi-replica
+// deployment the notice is simply not delivered, and the WS lease guarantees
+// that is the NORMAL case rather than an edge: exactly one replica holds the
+// socket, and the run can end on any of them.
+//
+// What the asker gets instead is nothing, under a bubble that turns until the
+// platform ends it.
+//
+// REVERSE VERIFICATION: take the relay back out of sayAsPlainMessage and this
+// fails with nothing routed and the notice lost.
+func TestAFailureOnAReplicaWithNoSocketIsRoutedToTheOneThatHasIt(t *testing.T) {
+	t.Parallel()
+	rig := newBoundRoomRig(t)
+	relay := &recordingRelay{}
+	rig.typing.WithRelay(relay)
+	rig.senders.clear(rig.instID, rig.conn.sender) // this replica holds no socket for it
+	rig.askedInTheRoom(t, "task-1")
+
+	rig.failed(t, "task-1", false)
+
+	if len(relay.frames) != 1 {
+		t.Fatalf("%d frames routed, want 1 — the asker was told nothing and no other replica was asked to tell them", len(relay.frames))
+	}
+	f := relay.frames[0]
+	if f.Kind != relayKindReply || f.Content != streamCopyFailed {
+		t.Fatalf("routed %+v, want the failure notice as an ordinary reply", f)
+	}
+	if f.TaskID != taskUUID(t, "task-1") {
+		t.Fatalf("routed frame names task %q, want %q — the holder cannot seal the right bubble without it", f.TaskID, taskUUID(t, "task-1"))
+	}
+}
+
+// recordingRelay is the router seam with nothing behind it: it records what
+// would have been handed to the replica holding the socket.
+type recordingRelay struct{ frames []relayFrame }
+
+func (r *recordingRelay) publish(f relayFrame, _ string) bool {
+	r.frames = append(r.frames, f)
+	return true
+}
+
+// ---- the answer path's gate has to hand the bubble back too ----
+
+// The failure path releases a round a first-party run took; the answer path
+// returns at its own gate (TaskInputIsChannelIngested) and used to leave the
+// round bound to a run that will never close it. Same rule, second call site:
+// whoever refuses to speak for a run has to give back what that run is holding.
+//
+// Without it the asker watches their bubble turn until the platform ends it,
+// and their own answer finds no round and degrades to a plain message.
+func TestAWebRunsCompletionAlsoGivesTheRoomsBubbleBack(t *testing.T) {
+	t.Parallel()
+	rig := newBoundRoomRig(t)
+	rig.out = NewOutbound(rig.q, rig.senders, rig.streams, nil)
+	rig.ask(t, "REQ-ROOM-2")
+	rig.askedInTheBrowser(t, "web-2")
+	rig.queueTask(t, taskUUID(t, "web-2"), "")
+
+	// The browser run COMPLETES — it does not fail — so the answer path's gate
+	// is the one that has to release.
+	rig.answer(t, "the browser's answer", "web-2")
+
+	if got := pushedTexts(t, rig.conn); len(got) != 0 {
+		t.Fatalf("the room was told %q about a run nobody there started", got)
+	}
+
+	// The room's own run, which was queued behind the browser's.
+	rig.askedInTheRoom(t, "task-r")
+	rig.queueTask(t, taskUUID(t, "task-r"), "")
+	rig.answer(t, "the agent reply", "task-r")
+
+	if pushes := rig.conn.pushes(t); len(pushes) != 0 {
+		t.Fatalf("the room's answer arrived as %d plain message(s) — its bubble was still held by "+
+			"the browser run: %v", len(pushes), pushes)
+	}
+	sealed := false
+	for _, f := range rig.conn.streamFrames(t) {
+		if f["finish"] == true && f["content"] == "the agent reply" {
+			sealed = true
+		}
+	}
+	if !sealed {
+		t.Fatal("the room's answer never sealed the bubble its own question opened")
 	}
 }

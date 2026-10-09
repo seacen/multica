@@ -97,6 +97,7 @@ var corsExposedHeaders = []string{
 	handler.HeaderCommentsTruncated,
 	handler.HeaderTimelineTruncated,
 	handler.HeaderActiveRunsTruncated,
+	handler.HeaderAgentTasksNextCursor,
 }
 
 func registerPluginActionRoutes(r chi.Router, h *handler.Handler) {
@@ -267,6 +268,11 @@ type RouterOptions struct {
 	// any test that happened to have the variable set. nil means unset, which
 	// is what tests and NewRouter get.
 	LLMMaxRetries *llm.RetryOverride
+	// LLMDisableThinking carries the parsed MULTICA_LLM_DISABLE_THINKING
+	// switch. It follows its LLMMaxRetries sibling in being injected rather
+	// than read here, for the same fail-the-boot-in-main-only reason: the raw
+	// value is validated by parseLLMDisableThinking before the router exists.
+	LLMDisableThinking bool
 }
 
 func buildChannelSupervisor(
@@ -449,6 +455,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		LLMBaseURL:               strings.TrimSpace(os.Getenv("MULTICA_LLM_BASE_URL")),
 		LLMDefaultModel:          strings.TrimSpace(os.Getenv("MULTICA_LLM_DEFAULT_MODEL")),
 		LLMMaxRetries:            opts.LLMMaxRetries,
+		LLMDisableThinking:       opts.LLMDisableThinking,
 		ServerVersion:            normalizeServerVersion(version),
 	}
 	h := handler.New(queries, pool, hub, bus, emailSvc, store, cfSigner, analyticsClient, signupConfig, daemonHub)
@@ -503,6 +510,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		}
 		if notifier, ok := opts.DaemonWakeup.(handler.DaemonPendingWorkNotifier); ok {
 			h.DaemonPendingWork = notifier
+		}
+		if notifier, ok := opts.DaemonWakeup.(handler.DaemonTaskSupplementNotifier); ok {
+			h.DaemonTaskSupplement = notifier
 		}
 		if notifier, ok := opts.DaemonWakeup.(handler.RuntimeGoneNotifier); ok {
 			h.DaemonRuntimeGone = notifier
@@ -618,10 +628,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				patcher.Register(bus)
 
 				// Typing indicator: shows a "processing" reaction on the user's
-				// message while the agent is working, then removes it before the
-				// reply is sent. Best-effort; failures are logged only.
+				// message while the agent is working. Terminal cleanup has its own
+				// budget, with a durable retry worker for failed or missed cleanup.
 				typingIndicator := lark.NewTypingIndicatorManager(larkClient, installSvc, cs, slog.Default())
 				patcher.SetTypingIndicatorManager(typingIndicator)
+				h.LarkTyping = typingIndicator
 
 				// Inbound pipeline seams: lark_inbound_audit logger and the
 				// shared channel-agnostic chat-session service. They back the
@@ -963,9 +974,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					wecomSenders = wecom.NewSendersRegistry()
 				}
 				// One registry, one metrics sink. Every outbound write goes
-				// through here, and so do the counters the outbound subscriber
-				// and the media resolver report — which is why neither of them
-				// takes a sink of its own.
+				// through here, and so do the counters that say how the
+				// bubble ended — which is why the outbound subscriber takes
+				// no sink of its own.
 				wecomSenders.WithMetrics(wecomMetricsOrNil(opts.WecomMetrics))
 
 				// Which language the bot writes its OWN copy in for readers
@@ -978,10 +989,13 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					"locale", wecom.SetDeploymentLocale(os.Getenv("MULTICA_WECOM_DEFAULT_LOCALE")))
 
 				wecomReplier := wecom.NewOutboundReplier(wecom.OutboundReplierConfig{
-					Binding:   wecomBinding,
-					Senders:   wecomSenders,
+					Binding: wecomBinding,
+					Senders: wecomSenders,
+					AppURL:  appURLFromEnv(),
+					// Without this the replier has no way to read a reader's
+					// profile language and every notice falls back to the
+					// deployment's, which is the whole of what this is for.
 					Languages: queries,
-					AppURL:    appURLFromEnv(),
 					Logger:    slog.Default(),
 				})
 
@@ -1158,13 +1172,18 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				if opts.WecomRelayOutbound != nil {
 					opts.WecomRelayOutbound.SetMetrics(wecomMetricsOrNil(opts.WecomMetrics))
 					wecomOutboundOpts = append(wecomOutboundOpts, wecom.WithRelay(opts.WecomRelayOutbound))
+					// The indicator routes too. A run's ending can be produced
+					// on any replica while exactly one holds the socket, so
+					// without this a failure notice is delivered only when the
+					// two happen to coincide.
+					wecomTyping.WithRelay(opts.WecomRelayOutbound)
 					slog.Info("wecom integration: cross-replica outbound routing enabled")
 				}
 				// wecomStreams is the same store the typing indicator paints
 				// into: the subscriber closes the bubble that indicator opened
 				// by writing the answer into it, so both sides must hold the
 				// one instance or the answer lands as a new message and the
-				// bubble spins to its nine-minute guard.
+				// bubble spins until the protocol's window runs out on it.
 				wecomOutbound := wecom.NewOutbound(queries, wecomSenders, wecomStreams, slog.Default(), wecomOutboundOpts...)
 				wecomOutbound.Register(bus)
 				// The dispatcher has been consuming since before this router
@@ -1256,14 +1275,31 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				Logger: slog.Default(),
 			})
 			telegramTyping := telegram.NewTypingNotifier(box.Open, "", nil, slog.Default())
-			channelRouter.Register(telegram.TypeTelegram, telegram.NewTelegramResolverSet(queries, pool, telegramReplier, telegramTyping))
+			// Media both ways needs object storage: inbound photos/files become
+			// chat attachments only when there is somewhere to put the bytes,
+			// and the agent is promised outbound file delivery only where the
+			// same storage exists to read them back from. One `if` decides both
+			// halves so the capability and the promise cannot drift (same rule
+			// as WeCom above).
+			var telegramMedia engine.MediaResolver
 			telegramOutbound := telegram.NewOutbound(queries, box.Open, "", nil, slog.Default())
+			if store != nil {
+				telegramMedia = telegram.NewMediaResolver(box.Open, store, engine.NewDBMediaIntentLedger(queries), "", nil, slog.Default())
+				telegramOutbound.EnableFileDelivery(store)
+				h.DeclareChannelFileDelivery(string(telegram.TypeTelegram))
+			}
+			channelRouter.Register(telegram.TypeTelegram, telegram.NewTelegramResolverSet(queries, pool, telegramReplier, telegramTyping, telegramMedia))
 			telegramOutbound.Register(bus)
 			h.TelegramOutbound = telegramOutbound
 
 			// Per-installation inbound: the Supervisor builds + supervises one
 			// long-polling loop per active Telegram installation.
-			telegram.RegisterTelegram(channelRegistry, telegram.ChannelDeps{Decrypt: box.Open, Logger: slog.Default()})
+			telegram.RegisterTelegram(channelRegistry, telegram.ChannelDeps{
+				Decrypt:           box.Open,
+				Logger:            slog.Default(),
+				RecentContextSize: telegram.DefaultRecentContextSize,
+				AcceptsMedia:      store != nil,
+			})
 
 			installSvc, ierr := telegram.NewInstallService(queries, pool, box, slog.Default())
 			if ierr != nil {
@@ -1628,6 +1664,8 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 
 		r.Get("/tasks/{taskId}/status", h.GetTaskStatus)
 		r.Post("/tasks/{taskId}/start", h.StartTask)
+		r.Post("/tasks/{taskId}/supplements/claim", h.ClaimTaskSupplement)
+		r.Post("/tasks/{taskId}/supplements/{commentId}/ack", h.AckTaskSupplement)
 		r.Post("/tasks/{taskId}/wait-local-directory", h.MarkTaskWaitingLocalDirectory)
 		r.Post("/tasks/{taskId}/progress", h.ReportTaskProgress)
 		r.Post("/tasks/{taskId}/complete", h.CompleteTask)
@@ -2033,6 +2071,16 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			// Assignee frequency
 			r.Get("/api/assignee-frequency", h.GetAssigneeFrequency)
 
+			// Local search index sync for Web/Desktop (MUL-7754). Human clients
+			// only: agents search through /api/issues/search.
+			r.Route("/api/search-index", func(r chi.Router) {
+				r.Use(handler.RequireHumanActor)
+				r.Use(h.RequireLocalSearchIndex)
+				r.Get("/manifest", h.GetSearchIndexManifest)
+				r.Get("/snapshot", h.GetSearchIndexSnapshot)
+				r.Post("/changes", h.ListSearchIndexChanges)
+			})
+
 			// Issues
 			r.Route("/api/issues", func(r chi.Router) {
 				r.Get("/limit-usage", h.GetIssueLimitUsage)
@@ -2065,8 +2113,22 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Post("/subscribe", h.SubscribeToIssue)
 					r.Post("/unsubscribe", h.UnsubscribeFromIssue)
 					r.Post("/unsubscribe/subtree", h.UnsubscribeFromIssueSubtree)
+					r.Get("/wakeups", h.ListIssueWakeups)
+					r.Post("/wakeups", h.CreateIssueWakeup)
+					r.Put("/wakeups/{wakeupID}", h.CreateIssueWakeup)
+					r.Post("/wakeups/{wakeupID}/disable", h.DisableIssueWakeup)
+					r.Post("/wakeups/{wakeupID}/enable", h.EnableIssueWakeup)
+					r.Patch("/wakeups/{wakeupID}/instruction", h.EditIssueWakeupInstruction)
+					r.Delete("/wakeups/{wakeupID}", h.DeleteIssueWakeup)
+					r.Post("/wakeups/{wakeupID}/trigger", h.TriggerIssueWakeup)
+					r.Post("/wakeups/{wakeupID}/checkin", h.CheckInIssueWakeup)
+					r.Get("/wakeups/{wakeupID}/runs", h.ListIssueWakeupRuns)
+					r.Get("/system-wakeups", h.ListIssueSystemWakeups)
+					r.Put("/system-wakeups/{rule}", h.UpdateIssueSystemWakeup)
 					r.Get("/active-task", h.GetActiveTaskForIssue)
 					r.Post("/tasks/{taskId}/cancel", h.CancelTask)
+					r.With(handler.RequireHumanActor).Post("/tasks/{taskId}/supplements", h.CreateTaskSupplement)
+					r.With(handler.RequireHumanActor).Post("/tasks/{taskId}/supplements/{commentId}/retry", h.RetryTaskSupplement)
 					r.Post("/rerun", h.RerunIssue)
 					r.Post("/quick-actions/{quickActionId}/run", h.RunQuickAction)
 					r.Post("/quick-actions/{quickActionId}/render", h.RenderQuickAction)
@@ -2076,6 +2138,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Delete("/reactions", h.RemoveIssueReaction)
 					r.Get("/attachments", h.ListAttachments)
 					r.Get("/children", h.ListChildIssues)
+					r.Get("/duplicates", h.ListIssueDuplicates)
 					r.Get("/labels", h.ListLabelsForIssue)
 					r.Post("/labels", h.AttachLabel)
 					r.Delete("/labels/{labelId}", h.DetachLabel)
@@ -2085,6 +2148,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Put("/properties/{propertyId}", h.SetIssueProperty)
 					r.Delete("/properties/{propertyId}", h.DeleteIssueProperty)
 					r.Get("/pull-requests", h.ListPullRequestsForIssue)
+					r.Post("/pull-requests", h.LinkIssuePullRequest)
+					r.Delete("/pull-requests/{prId}", h.UnlinkIssuePullRequest)
+					r.Put("/pr-auto-complete", h.SetIssuePRAutoComplete)
 				})
 			})
 
@@ -2392,6 +2458,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			// Workspace-wide agent task snapshot for presence derivation:
 			// every active task + each agent's most recent terminal task.
 			r.Get("/api/agent-task-snapshot", h.ListWorkspaceAgentTaskSnapshot)
+			r.Get("/api/issue-wakeup-summaries", h.ListWorkspaceWakeupSummaries)
+			r.Get("/api/issue-wakeups", h.ListWorkspaceWakeups)
+			r.Get("/api/issue-wakeup-paused", h.ListPausedWakeups)
+			r.Get("/api/system-wakeups", h.ListWorkspaceSystemWakeups)
+			r.Put("/api/system-wakeups/{rule}", h.UpdateWorkspaceSystemWakeup)
 
 			// Independent workspace-level list backing the issues-header
 			// "agents working" chip and its assignee-id Table filter.

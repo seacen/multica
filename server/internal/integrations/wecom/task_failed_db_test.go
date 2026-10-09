@@ -32,7 +32,7 @@ func TestTaskFailed_ReachesTheChatThroughTheRealQueryLayer(t *testing.T) {
 	bus := events.New()
 	NewTypingIndicator(TypingIndicatorConfig{
 		Senders: reg, Streams: NewStreamStore(),
-		Tasks: q, Deliveries: q, Languages: q, Identities: q,
+		Tasks: q, Deliveries: q, Languages: q,
 		Logger: slog.Default(),
 	}).Register(bus)
 

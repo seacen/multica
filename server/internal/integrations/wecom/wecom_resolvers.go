@@ -44,18 +44,13 @@ func wecomMsgFromRaw(msg channel.InboundMessage) (InboundMessage, error) {
 }
 
 // NewResolverSet assembles the wecom ResolverSet from the store, the shared
-// chat-session service, an outbound replier and the media resolver.
+// chat-session service, and an outbound replier. wecom has no typing-
+// indicator affordance, so Typing is left nil — the Router treats a nil
+// Typing as a no-op.
 //
-// The last two are optional: pass nil for replier to disable outbound binding
-// prompts, and nil for media when no object-storage backend is configured, in
-// which case inbound attachments degrade to their placeholder text.
-//
-// Typing is deliberately NOT a parameter, even though on this platform the
-// indicator is the whole streaming bubble. The set's shape belongs to the
-// engine, and the engine's own tests build a WeCom set without one; boot
-// assigns the field after the set is built (cmd/server/router.go), which is
-// also what keeps a nil manager out of the interface — a typed nil in
-// set.Typing is a value the Router would happily call.
+// The replier is optional: pass nil to disable outbound binding prompts.
+// Media is optional too: pass nil when no object-storage backend is
+// configured, and inbound attachments degrade to their placeholder text.
 func NewResolverSet(
 	store *Store,
 	session engineSessionBinder,
@@ -65,7 +60,7 @@ func NewResolverSet(
 	set := engine.ResolverSet{
 		Installation: &installationResolver{store: store},
 		Identity:     &identityResolver{store: store},
-		Dedup:        &deduper{store: store},
+		Dedup:        NewDeduper(store),
 		Session:      &sessionBinder{session: session},
 		Audit:        &auditor{store: store},
 		OriginType:   originWecomChat,
@@ -193,16 +188,15 @@ func (r *identityResolver) ResolveSender(ctx context.Context, inst engine.Resolv
 
 // ---- dedup ----
 
+// NewDeduper builds the claim store the Router and the adapter share. Both must
+// go through it: they claim the same (installation, message) key on the same
+// table, which is what keeps one message from being answered in both places.
+func NewDeduper(store *Store) engine.Deduper { return &deduper{store: store} }
+
 // deduper is the wecom Deduper. It uses the shared channel_inbound_message_dedup
 // sqlc queries — the same table Feishu / Slack use — so the two-phase
 // idempotency invariant is enforced uniformly across channels.
 type deduper struct{ store *Store }
-
-// NewDeduper exposes that same two-phase dedup to the adapter itself, for the
-// one reply it sends without the Router: the unsupported-kind receipt
-// (wecom_channel.go). Both go through this type, on one table and one key, so
-// a message answered by the adapter can never also be answered by the Router.
-func NewDeduper(store *Store) engine.Deduper { return &deduper{store: store} }
 
 func (d *deduper) Claim(ctx context.Context, installationID pgtype.UUID, messageID string) (pgtype.UUID, error) {
 	row, err := d.store.Queries.ClaimChannelInboundDedup(ctx, db.ClaimChannelInboundDedupParams{
@@ -261,10 +255,9 @@ func (r *sessionBinder) MarkPendingFresh(ctx context.Context, sessionID pgtype.U
 
 func (r *sessionBinder) AppendMessage(ctx context.Context, p engine.AppendParams) (engine.AppendResult, error) {
 	// The adapter's own command source wins, and Text is only the fallback.
-	// Overwriting it with Text — which this used to do — threw away the line
-	// the adapter had already worked out: in a group the /issue parser was
-	// handed "@Multica Bot /issue …" and saw prose, and under a 引用 it was
-	// handed somebody else's quoted text and missed the command below it.
+	// Overwriting it with Text — which this used to do — threw away the
+	// mention-stripped line the adapter had already worked out, so in a group
+	// the /issue parser was handed "@Multica Bot /issue …" and saw prose.
 	// Same two lines as lark/feishu_resolvers.go:206 and slack/resolvers.go:337.
 	commandText := p.Message.CommandText
 	if commandText == "" {

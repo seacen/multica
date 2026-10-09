@@ -40,13 +40,8 @@ const (
 	// brief names the merged `multica-platform` skill instead of the
 	// per-domain built-ins it replaced (MUL-6986).
 	//
-	// The brief is assembled by the daemon, so a backend upgrade does not
-	// rewrite it: a daemon released before that merge still tells the agent to
-	// "read the `multica-working-on-issues` skill", a name this server no
-	// longer ships. Without this gate the pointer dangles and the agent is left
-	// hunting for a skill that is not installed. When it is absent the server
-	// ships a redirect stub under the old name; when it is present it ships
-	// nothing extra, so the stub retires itself as daemons update.
+	// Retained as an advertised capability after the legacy redirect stub was
+	// retired (MUL-7052); the server no longer gates built-in skills on it.
 	DaemonCapabilityPlatformSkillV1 = "platform-skill-v1"
 
 	// DaemonCapabilityCheckoutKeepsWorkV1 advertises that the daemon's
@@ -61,6 +56,21 @@ const (
 	// work, so such a daemon keeps getting a fresh directory and the parent's
 	// stays untouched on disk.
 	DaemonCapabilityCheckoutKeepsWorkV1 = "checkout-keeps-work-v1"
+	// DaemonCapabilityJoinedWakeupsV1 advertises that the daemon renders the
+	// claim's wakeup_joined field into the prompt. Only such a claim takes
+	// along the inputs of wakeup rules that waited for this run; for any other
+	// daemon those rules keep their inputs and start a run of their own.
+	DaemonCapabilityJoinedWakeupsV1 = "joined-wakeups-v1"
+	// DaemonCapabilityTaskSupplementV1 advertises that this provider run can accept
+	// an additional text instruction without cancelling or starting a task.
+	// It is persisted when this exact task enters running; absence always means
+	// unsupported so mixed server/daemon versions fail closed.
+	DaemonCapabilityTaskSupplementV1 = "task-supplement-v1"
+
+	TaskSupplementFailureTurnNotStarted   = "turn_not_started"
+	TaskSupplementFailureProviderRejected = "provider_rejected"
+	TaskSupplementFailureTimeout          = "timeout"
+	TaskSupplementFailureTurnEnded        = "turn_ended"
 
 	// AppCapabilityChatDraftRestoreV1 is advertised (X-Client-Capabilities) by
 	// app clients that understand the durable draft-restore recovery path:
@@ -122,8 +132,9 @@ type TaskDispatchPayload struct {
 	Description string `json:"description"`
 }
 
-// TaskAvailablePayload is sent from server to daemon as a wakeup hint. The
-// daemon still claims work through the existing HTTP claim endpoint.
+// TaskAvailablePayload carries content-free task and supplement wakeup hints.
+// Supplement hints require an exact task ID; the daemon claims durable input
+// through the corresponding HTTP endpoint.
 type TaskAvailablePayload struct {
 	RuntimeID string `json:"runtime_id"`
 	TaskID    string `json:"task_id,omitempty"`

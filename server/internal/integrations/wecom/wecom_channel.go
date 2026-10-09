@@ -62,18 +62,18 @@ const writeDeadline = 10 * time.Second
 // handshakeTimeout bounds the initial TCP + WS handshake dial.
 const handshakeTimeout = 15 * time.Second
 
-// The one line sent back for a message this adapter cannot read at all is
-// copyPack.UnsupportedMsgType (strings.go). It used to say "我目前只能处理文字
-// 消息" — text only — which stopped being true the moment photos, files, videos
-// and 图文混排 started routing: a person who has just watched the bot answer a
-// screenshot, then gets told it only handles text, reads that as the bot being
-// broken rather than as this one kind not being supported.
-
 // wecomChannel is one installation's aibot smart-bot WebSocket connection.
 // The engine.Supervisor builds one per active installation via the
 // registered Factory and drives lease / reconnect lifecycle; Connect blocks
 // on the receive loop until ctx is cancelled or the link drops.
 type wecomChannel struct {
+	// dedup claims the inbound message id for the one reply this adapter sends
+	// before the Router sees the message: the unsupported-kind receipt. It goes
+	// out from dispatchFrame, ahead of c.handler, so the Router's own Claim
+	// never runs for it and nothing else can dedupe it. Nil leaves it
+	// unclaimed, which is main's behaviour.
+	dedup engine.Deduper
+
 	installationID pgtype.UUID
 	botID          string
 	secret         string
@@ -90,7 +90,6 @@ type wecomChannel struct {
 	// itself on entry and clear on exit. nil in tests that don't exercise
 	// the OutboundReplier path.
 	senders *sendersRegistry
-
 	// metrics is the health sink (metrics.go). Never read directly — go
 	// through mx(), which substitutes the no-op sink for a channel built
 	// without one.
@@ -100,16 +99,6 @@ type wecomChannel struct {
 	// copy is written in — currently the receipt for a message kind we cannot
 	// read. Nil means everyone reads the deployment default.
 	languages languageLookup
-
-	// dedup claims the inbound message id for the one reply this adapter
-	// sends on its own, without the engine: the unsupported-kind receipt.
-	// Every other inbound message is claimed by the Router (router.go), but
-	// an unreadable one returns before the handler is ever called, so the
-	// Router never sees it and nothing else can dedupe it.
-	//
-	// Nil leaves the receipt unclaimed, which is what the adapter did before
-	// this field existed. Production always wires it (cmd/server/router.go).
-	dedup engine.Deduper
 }
 
 var _ channel.Channel = (*wecomChannel)(nil)
@@ -232,29 +221,14 @@ func (c *wecomChannel) Connect(ctx context.Context) (err error) {
 	// (created at boot, not per-installation) can locate this connection by
 	// installation id and push aibot_send_msg over the same socket. Cleared
 	// on exit so a stale sender for a dead connection is never dispatched to.
-	//
-	// This registration is the ONLY writer of that registry: sendersRegistry
-	// is package-private and set() has no other production caller, so losing
-	// these three lines does not fail anything — it silently makes every
-	// outbound push resolve to nil. The bubble never opens, the answer never
-	// leaves, and the bot goes on receiving messages without ever replying.
-	// TestConnectRegistersTheSenderWhileTheConnectionIsLive is what stands
-	// between that and a green build.
 	if c.senders != nil && c.installationID.Valid {
 		c.senders.set(c.installationID, sender)
 		defer c.senders.clear(c.installationID, sender)
 	}
 
-	// Heartbeat — ping every 30s (pingInterval), the cadence WeCom's docs
-	// prescribe, via the shared writer mutex so it interleaves cleanly with
-	// other outbound frames.
-	//
-	// This used to say WeCom kills silent sockets past ~90s. There is no
-	// source for that: 90s is readDeadline, our OWN patience, sized to exceed
-	// pingInterval by a comfortable margin so a late pong does not trip it.
-	// No published WeCom idle timeout is on file, and nothing here needs one —
-	// the ping cadence comes from their documented figure, and the deadline is
-	// derived from the ping.
+	// Heartbeat — WeCom kills silent sockets past ~90s. We ping every 30s
+	// via the shared writer mutex so it interleaves cleanly with other
+	// outbound frames.
 	pingCtx, pingCancel := context.WithCancel(ctx)
 	pingDone := make(chan struct{})
 	go func() {
@@ -286,7 +260,6 @@ func (c *wecomChannel) Connect(ctx context.Context) (err error) {
 	// so. That only holds while somebody is still receiving, so the read
 	// loop's send also watches cbDone — see the send site below.
 	callbacks := make(chan frameEnvelope, callbackQueueDepth)
-
 	cbDone := make(chan struct{})
 	var cbErr error
 	go func() {
@@ -358,9 +331,6 @@ func (c *wecomChannel) Connect(ctx context.Context) (err error) {
 			log.Warn("wecom: bad frame envelope", "error", err, "size", len(payload))
 			continue
 		}
-		// Traced before the dispatch below, for the same reason the subscribe
-		// path traces before its req_id filter: a frame diverted before traceIn
-		// is a frame that never appears in the trace at all.
 		traceIn(log, env)
 		switch env.Cmd {
 		case cmdMsgCallback, cmdEventCallback:
@@ -533,12 +503,9 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 			log.Warn("wecom: bad aibot_msg_callback body", "error", err)
 			return nil
 		}
-		// The receipt below and the quote block routableText renders are both
-		// the destination's copy, so the pack is resolved once, up front.
-		pack := c.packFor(ctx, mc)
 		text, ok := mc.ownText()
 		// Traced with the RESOLVED body, not mc.Text.Content: that field is
-		// empty for every media, voice and 图文混排 callback, so tracing it
+		// empty for every voice, media and 图文混排 callback, so tracing it
 		// would print len=0 for exactly the messages an operator turned
 		// tracing on to look at.
 		traceInbound(log, mc, text)
@@ -546,19 +513,14 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 		if !ok {
 			// Nothing in this message can be read: a kind the adapter does
 			// not know (a location card), or a known kind that arrived
-			// without the one field that makes it usable — a voice note
-			// whose transcript came back empty on background noise or a
-			// half-second press, an image callback carrying no url. Silence
-			// reads as a broken bot, so answer the same chat with a one-line
-			// receipt and stop. Best-effort: a send failure degrades to the
-			// prior silent drop.
-			//
-			// The receipt is addressed to whoever sent the unreadable
-			// message, so in a 1:1 it reads their profile language; a group
-			// has no shared profile and reads the deployment's (language.go).
-			chatType := aibotChatTypeFromChannel(msg.Source.ChatType)
+			// without the one field that makes it usable — a voice note whose
+			// recognition came back empty, an image callback carrying no url.
+			// Silence reads as a broken bot, so answer the same chat with a
+			// one-line receipt and stop. Best-effort: a send failure degrades
+			// to the prior silent drop.
 			log.Debug("wecom: unsupported message kind, replying with a receipt", "msg_type", mc.MsgType, "msg_id", mc.MsgID)
-			c.sendUnsupportedReceipt(ctx, sender, msg.MessageID, msg.Source.ChatID, chatType, pack.UnsupportedMsgType, log)
+			c.sendUnsupportedReceipt(ctx, sender, mc.MsgID, msg.Source.ChatID,
+				aibotChatTypeFromChannel(msg.Source.ChatType), c.packFor(ctx, mc).UnsupportedMsgType, log)
 			return nil
 		}
 		if err := c.handler(ctx, msg); err != nil {
@@ -578,11 +540,6 @@ func (c *wecomChannel) dispatchFrame(ctx context.Context, env frameEnvelope, sen
 			// one — the last writer wins).
 			return errors.New("wecom: received disconnected_event (superseded)")
 		default:
-			// enter_chat, template_card_event and feedback_event all land
-			// here. None is acted on: the greeting this adapter used to send
-			// on enter_chat was withdrawn on product grounds (a per-user,
-			// per-day interstitial in front of a bot people already know how
-			// to use), and the other two we have no use for yet.
 			log.Debug("wecom: event", "type", ec.Event.EventType)
 			return nil
 		}
@@ -643,29 +600,20 @@ func (c *wecomChannel) pingLoop(ctx context.Context, sender *wsSender, log *slog
 	}
 }
 
-// Send is the generic Channel outbound seam, and it is NOT implemented: every
-// call returns ErrSendNotSupported, whatever it is handed.
+// Send is the outbound Channel entry the engine calls with a normalized
+// OutboundMessage. Iteration 1 always uses aibot_send_msg (WeCom's
+// "proactive push" cmd) rather than aibot_respond_msg — send_msg has no 5s
+// deadline and works regardless of whether the message ever ties back to a
+// specific inbound frame. The one caveat is chat_type: aibot_send_msg needs
+// to know whether the ChatID is a single-user id or a group id. We piggy-
+// back on the length heuristic used by internal-customer-service (chat ids
+// are ≥33 chars, userids are shorter), which is stable in practice.
 //
-// channel.OutboundMessage carries a chat id and no chat_type, while
-// aibot_send_msg has to know whether that id names a person or a group. The
-// stub here used to infer it from len(ChatID) > 32 — the only chat-type guess
-// in the package — and TestSend_NeverGuessesChatType now pins that it stays
-// gone: a long id must not route as a group send, a short one must not route
-// as a private send.
-//
-// Outbound for this adapter goes through OutboundReplier and Outbound
-// (EventChatDone + EventInboxNew), which read the chat type off the inbound
-// frame rather than guessing it. feishuChannel and slackChannel implement
-// their Send; this one has no honest implementation to give.
-//
-// Two protocol facts bound what any future implementation could do.
-// aibot_send_msg requires the user to have written to the bot in that
-// conversation first — an unsolicited push to a chat nobody has messaged is
-// refused. And the 5-second deadline this comment used to cite against
-// aibot_respond_msg is not a rule for it: 5 seconds applies to
-// aibot_respond_welcome_msg and aibot_respond_update_msg, while a reply to a
-// message callback is allowed for 24 hours
-// (https://developer.work.weixin.qq.com/document/path/101463).
+// The Channel is not the primary outbound path in the multica engine — the
+// EventChatDone subscriber and the OutboundReplier handle most sends — but
+// Channel.Send is still the contract that lets the engine deliver ad-hoc
+// replies, so we implement it here for parity with feishuChannel /
+// slackChannel.
 func (c *wecomChannel) Send(ctx context.Context, out channel.OutboundMessage) (channel.SendResult, error) {
 	// Not used. Outbound for wecom goes through OutboundReplier / Outbound
 	// (EventChatDone + EventInboxNew), which know the message's real
@@ -692,6 +640,13 @@ var ErrSendNotSupported = errors.New("wecom: Channel.Send is not supported; outb
 // channel.Config.Handler; the CredentialsResolver decrypts the stored
 // secret.
 type ChannelDeps struct {
+	// Dedup claims the unsupported-kind receipt so a redelivered callback does
+	// not answer twice. Build it with NewDeduper(store) — the same store the
+	// Router's own claim uses, so a message answered here can never also be
+	// answered there. Nil keeps main's behaviour: every redelivery repeats the
+	// receipt, and RegisterWecom says so at WARN.
+	Dedup engine.Deduper
+
 	Credentials CredentialsResolver
 	Logger      *slog.Logger
 
@@ -709,12 +664,6 @@ type ChannelDeps struct {
 	// Languages resolves a destination to its copy language (language.go).
 	// Nil puts every reader on the deployment default.
 	Languages languageLookup
-
-	// Dedup claims the inbound message id for the unsupported-kind receipt,
-	// the one reply the adapter sends without going through the Router. Pass
-	// NewDeduper(store). Nil leaves that receipt unclaimed and a WeCom
-	// redelivery repeats it.
-	Dedup engine.Deduper
 
 	// Dialer overrides the default gorilla dialer. Tests point it at an
 	// httptest server; production leaves this nil.
@@ -807,6 +756,18 @@ func (c *wecomChannel) sendUnsupportedReceipt(
 // adapter — no engine edit (same contract as lark.RegisterFeishu /
 // slack.RegisterSlack).
 func RegisterWecom(reg *channel.Registry, deps ChannelDeps) {
+	if deps.Dedup == nil {
+		// Not fatal — answering twice is what main does today — but it has no
+		// other symptom: nothing errors, and the duplicate only shows up in
+		// somebody's chat, one per redelivery, each spending a push from that
+		// conversation's quota.
+		logger := deps.Logger
+		if logger == nil {
+			logger = slog.Default()
+		}
+		logger.Warn("wecom: no deduper wired; a redelivered unreadable message will be answered again " +
+			"on every delivery (set ChannelDeps.Dedup to NewDeduper(store))")
+	}
 	reg.Register(TypeWecom, newWecomFactory(deps))
 }
 
@@ -833,8 +794,10 @@ func newWecomFactory(deps ChannelDeps) channel.Factory {
 		if err != nil {
 			return nil, fmt.Errorf("wecom: decrypt secret: %w", err)
 		}
-		ch := &wecomChannel{
+		return &wecomChannel{
 			installationID: cfg.ID,
+			dedup:          deps.Dedup,
+			languages:      deps.Languages,
 			botID:          creds.BotID,
 			secret:         creds.Secret,
 			botDisplayName: ic.BotDisplayName,
@@ -844,10 +807,7 @@ func newWecomFactory(deps ChannelDeps) channel.Factory {
 			logger:         logger,
 			senders:        deps.Senders,
 			metrics:        orNopMetrics(deps.Metrics),
-			languages:      deps.Languages,
-			dedup:          deps.Dedup,
-		}
-		return ch, nil
+		}, nil
 	}
 }
 
@@ -862,15 +822,4 @@ func newReqID() string {
 		return fmt.Sprintf("wecom-%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(buf[:])
-}
-
-// newStreamID mints the developer-chosen id that names one streaming message.
-// Reusing an id replaces that message's body; a fresh one opens another
-// bubble, which is why this must never collide across concurrent turns.
-func newStreamID() string {
-	var buf [12]byte
-	if _, err := cryptorand.Read(buf[:]); err != nil {
-		return fmt.Sprintf("wecom-stream-%d", time.Now().UnixNano())
-	}
-	return "s" + hex.EncodeToString(buf[:])
 }

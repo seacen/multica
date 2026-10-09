@@ -51,16 +51,10 @@ type mediaObjectStore interface {
 	GetReader(ctx context.Context, key string) (io.ReadCloser, error)
 }
 
-// What the user is told lives in the copy pack (strings.go), read in the
-// language of the conversation it lands in — resolved by the caller and carried
-// on attachmentTarget, because this path runs detached with no context left to
-// read a profile with.
-//
-// There are three of them because there are three things that can be true, and
-// telling them apart is the point (see deliveryState): copyPack.MediaSendFailed
-// for what definitely did not arrive, copyPack.MediaSendUnknown for a send
-// whose verdict never came, and copyPack.MediaLookupFailed for a turn whose
-// attachments could not be read at all.
+// What the user is told, and there are three of these because there are three
+// things that can be true — telling them apart is the point (see deliveryState).
+// Hardcoded Chinese, like every other user-facing string this adapter sends
+// (replier.go) — WeCom deployments are China-only.
 
 // attachmentBudget bounds one answer's whole attachment delivery — reading
 // every object, uploading it, and sending it. Generous because a 20 MiB file
@@ -129,10 +123,8 @@ type attachmentTarget struct {
 	// SessionID is carried only so a delivery that fails minutes later can
 	// still name the conversation it belonged to in the log and the counter.
 	SessionID string
-	// Locale is the language these notices are written in, resolved once by the
-	// caller while it still holds the request's context. Delivery runs on a
-	// goroutine of its own with a budget measured in minutes, long after that
-	// context is gone.
+	// Locale is the reader's, resolved on the request path — see the call
+	// site in outbound.go for why it cannot be read at the failure.
 	Locale Locale
 }
 
@@ -500,6 +492,13 @@ func sendOutcome(err error) deliveryState {
 	switch {
 	case err == nil:
 		return deliveryDelivered
+	case errors.Is(err, errNotAttempted):
+		// AHEAD of the context arm below, which this also matches: every
+		// not-attempted failure wraps the ctx.Err() that ended it. A push that
+		// never got the chat's turn, or whose context was already over when
+		// request was entered, was never built let alone written — so the file
+		// is definitely not there, and the person can be told so plainly.
+		return deliveryDefinitelyFailed
 	case errors.Is(err, errAckTimeout),
 		errors.Is(err, errWriteAttempted),
 		errors.Is(err, context.Canceled),
@@ -589,12 +588,6 @@ func outboundMediaName(filename, contentType string) string {
 	}
 	return name
 }
-
-// cleanMediaFilename and mediaExtension are shared with the inbound path
-// (media_download.go, media_ingest.go). Both directions ask the same two
-// questions of a filename — is it one path segment, and what extension does
-// this content type deserve — and the inbound copies answer them the same way,
-// so this file reads them rather than keeping a second pair that could drift.
 
 // chatDoneMessageID pulls the assistant message id out of a chat:done payload
 // (the typed payload, or its map form after a serialization round trip). It is

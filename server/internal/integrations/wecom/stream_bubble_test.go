@@ -7,6 +7,7 @@ package wecom
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -31,6 +32,11 @@ type bubbleConn struct {
 
 	refuseClosingCode int
 
+	// refuseOpeningCode makes the server state a verdict on the frame that
+	// paints the bubble. 846605 and 846608 are the two that mean this stream
+	// will never take a frame, so no bubble exists to close.
+	refuseOpeningCode int
+
 	// failClosingWrite makes the socket itself refuse a closing frame — the
 	// write returns this error, the way a half-closed connection reports a
 	// broken pipe. No ack is ever produced for it: nothing may have left the
@@ -46,19 +52,6 @@ type bubbleConn struct {
 	disownAfterFrames int
 	streamWrites      int
 
-	// refusePushesFrom is the 1-based aibot_send_msg this server starts
-	// refusing; every push from there on is answered 45009 and none of them
-	// reaches the chat. Zero accepts them all.
-	//
-	// It is how a long answer breaks in the MIDDLE. An answer past the body
-	// cap goes out as several messages, and a failure on the second leaves the
-	// first one already in the chat — WeCom has no unsend, so the person is
-	// looking at the opening of an answer whose remainder exists nowhere. That
-	// is a different outcome from both "it arrived" and "it did not", and the
-	// only double here that can produce it.
-	refusePushesFrom int
-	pushWrites       int
-
 	// loseClosingAcks is how many closing frames, counted from the first one
 	// written, are entered and never answered — the ack is swallowed the way
 	// a socket that dropped right after the write swallows it. The frames are
@@ -66,6 +59,13 @@ type bubbleConn struct {
 	// closing frame.
 	loseClosingAcks int
 	closingWrites   int
+
+	// failOpeningWrite makes the socket refuse the frame that paints the
+	// bubble, with an error raised once WriteMessage had been entered — so the
+	// placeholder may be on the asker's screen and nothing says whether it is.
+	// Distinct from refuseOpeningCode, which is the server STATING that this
+	// stream is dead and no bubble exists.
+	failOpeningWrite error
 
 	// onClosing runs after a closing frame has been recorded and before its
 	// verdict is routed. It is how a test says "the socket dropped right after
@@ -89,12 +89,6 @@ func (c *bubbleConn) WriteMessage(_ int, data []byte) error {
 			code = errcodeStreamExpired
 		}
 	}
-	if env.Cmd == cmdSendMsg {
-		c.pushWrites++
-		if c.refusePushesFrom > 0 && c.pushWrites >= c.refusePushesFrom {
-			code = 45009 // api freq out of limit
-		}
-	}
 	lost := false
 	var onClosing func()
 	if isClosingFrame(env) {
@@ -108,6 +102,14 @@ func (c *bubbleConn) WriteMessage(_ int, data []byte) error {
 		}
 		lost = c.closingWrites <= c.loseClosingAcks
 		onClosing = c.onClosing
+	} else if env.Cmd == cmdRespondMsg {
+		if c.failOpeningWrite != nil {
+			c.mu.Unlock()
+			return c.failOpeningWrite
+		}
+		if c.refuseOpeningCode != 0 {
+			code = c.refuseOpeningCode
+		}
 	}
 	c.mu.Unlock()
 	if onClosing != nil {
@@ -160,15 +162,7 @@ func (c *bubbleConn) streamFrames(t *testing.T) []map[string]any {
 	defer c.mu.Unlock()
 	var out []map[string]any
 	for _, f := range c.frames {
-		if f.Cmd != cmdRespondMsg {
-			continue
-		}
-		var body map[string]any
-		if err := json.Unmarshal(f.Body, &body); err != nil {
-			t.Fatalf("decode frame body: %v", err)
-		}
-		stream, _ := body["stream"].(map[string]any)
-		if stream != nil {
+		if stream, ok := streamOf(f); ok {
 			out = append(out, stream)
 		}
 	}
@@ -211,16 +205,12 @@ func (c *bubbleConn) pushes(t *testing.T) []map[string]any {
 	return out
 }
 
-// readablePushes is how many plain messages the server ACCEPTED — what the
-// person can actually read, which is not the same as what was written at the
-// socket once refusePushesFrom is in play.
-func (c *bubbleConn) readablePushes() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.refusePushesFrom <= 0 || c.pushWrites < c.refusePushesFrom {
-		return c.pushWrites
-	}
-	return c.refusePushesFrom - 1
+// pushText reads the words out of an aibot_send_msg body — the "as a new
+// message" path, which ships as markdown (sendMsgTextBody).
+func pushText(body map[string]any) string {
+	md, _ := body["markdown"].(map[string]any)
+	text, _ := md["content"].(string)
+	return text
 }
 
 // bubbleRig is one installation with a live socket, a store, the typing
@@ -294,6 +284,13 @@ func newBubbleRig(t *testing.T) *bubbleRig {
 		// production. Bindings stays nil: these tests are about the rounds this
 		// process holds, not the restart path.
 		Tasks: q,
+		// Deliveries is what the origin gate reads, and it is wired in
+		// production for every ending. It used to be left out here because a
+		// round already on the open list skipped the gate — which stopped
+		// being sound when binding moved to task:queued, since a browser run
+		// publishes the same event. A rig without it is a rig where the gate
+		// cannot run at all.
+		Deliveries: q,
 		// No guard: these tests drive the endings themselves.
 		GuardAfter: -1,
 	})
@@ -355,7 +352,7 @@ func (r *bubbleRig) askFrom(t *testing.T, reqID string, chatType channel.ChatTyp
 			Source: channel.Source{ChannelType: TypeWecom, ChatID: "CHAT_1", ChatType: chatType, SenderID: "USER_1"},
 			Raw:    raw,
 		},
-		bubbleSessionID(t))
+		bubbleSessionID(t), bubbleSessionID(t))
 }
 
 // reconnect swaps the installation's live socket the way the Supervisor does
@@ -418,7 +415,14 @@ func (r *bubbleRig) ran(t *testing.T, reqID, taskName string) {
 
 func (r *bubbleRig) answer(t *testing.T, content, taskName string) {
 	t.Helper()
-	if err := r.out.processEvent(context.Background(), events.Event{
+	r.answerWithContext(t, context.Background(), content, taskName)
+}
+
+// answerWithContext is answer on a caller's own deadline, for the tests that
+// care what the reply path does when the budget is already gone.
+func (r *bubbleRig) answerWithContext(t *testing.T, ctx context.Context, content, taskName string) {
+	t.Helper()
+	if err := r.out.processEvent(ctx, events.Event{
 		ChatSessionID: bubbleSession,
 		TaskID:        taskUUID(t, taskName),
 		Payload:       protocol.ChatDonePayload{Content: content},
@@ -462,6 +466,21 @@ func (r *bubbleRig) cancelled(t *testing.T, taskName string) {
 	})
 }
 
+// mustParseTestUUID turns a readable test name into a stable UUID, so a test
+// can say "task-1" and the store still sees the pgtype.UUID the seam carries.
+func mustParseTestUUID(t *testing.T, name string) pgtype.UUID {
+	t.Helper()
+	raw, ok := testTaskUUIDs[name]
+	if !ok {
+		t.Fatalf("unknown test task %q", name)
+	}
+	id, err := util.ParseUUID(raw)
+	if err != nil {
+		t.Fatalf("parse test task %q: %v", name, err)
+	}
+	return id
+}
+
 // streamIDOf reads the stream id a run's bubble is on right now, out of the
 // store — which changes when the guard rotates the round onto a fresh one.
 func (r *bubbleRig) streamIDOf(t *testing.T, taskName string) string {
@@ -489,33 +508,6 @@ func (r *bubbleRig) unboundStreamID(t *testing.T) string {
 	return e.handle.StreamID
 }
 
-// streamIDOfSeq reads a round's current stream id by the store's own name for
-// it, so a test can follow one round across a rotation without going through
-// the run bound to it — which is the very thing some of them are checking.
-func (r *bubbleRig) streamIDOfSeq(t *testing.T, seq roundSeq) string {
-	t.Helper()
-	r.streams.mu.Lock()
-	defer r.streams.mu.Unlock()
-	e := r.streams.seqLocked(bubbleSession, seq)
-	if e == nil || !e.painted {
-		t.Fatalf("round %d has no bubble on file", seq)
-	}
-	return e.handle.StreamID
-}
-
-// seqOf is the store's own name for the round a run is bound to — what the
-// guard was armed with, and the one name that survives a rotation.
-func (r *bubbleRig) seqOf(t *testing.T, taskName string) roundSeq {
-	t.Helper()
-	r.streams.mu.Lock()
-	defer r.streams.mu.Unlock()
-	e := r.streams.boundLocked(bubbleSession, taskUUID(t, taskName))
-	if e == nil {
-		t.Fatalf("%s has no round on file", taskName)
-	}
-	return e.seq
-}
-
 // rotated is the nine-minute guard firing on one round: it seals the bubble
 // with "处理时间较长，接下一条" and opens a fresh stream on the same req_id for
 // the run to carry on in. It runs the manager's own guard body, so a test gets
@@ -534,6 +526,19 @@ func (r *bubbleRig) rotated(t *testing.T, taskName string) (old, next string) {
 	return old, next
 }
 
+// seqOf is the store's own name for the round a run is bound to — what the
+// guard was armed with, and the one name that survives a rotation.
+func (r *bubbleRig) seqOf(t *testing.T, taskName string) roundSeq {
+	t.Helper()
+	r.streams.mu.Lock()
+	defer r.streams.mu.Unlock()
+	e := r.streams.boundLocked(bubbleSession, taskUUID(t, taskName))
+	if e == nil {
+		t.Fatalf("%s has no round on file", taskName)
+	}
+	return e.seq
+}
+
 // stepped records one sign of life for a run, the way a task:message reaching
 // recordStep does.
 func (r *bubbleRig) stepped(t *testing.T, taskName string) {
@@ -543,19 +548,18 @@ func (r *bubbleRig) stepped(t *testing.T, taskName string) {
 	}
 }
 
-// mustParseTestUUID turns a readable test name into a stable UUID, so a test
-// can say "task-1" and the store still sees the pgtype.UUID the seam carries.
-func mustParseTestUUID(t *testing.T, name string) pgtype.UUID {
+// streamIDOfSeq reads a round's current stream id by the store's own name for
+// it, so a test can follow one round across a rotation without going through
+// the run bound to it — which is the very thing some of them are checking.
+func (r *bubbleRig) streamIDOfSeq(t *testing.T, seq roundSeq) string {
 	t.Helper()
-	raw, ok := testTaskUUIDs[name]
-	if !ok {
-		t.Fatalf("unknown test task %q", name)
+	r.streams.mu.Lock()
+	defer r.streams.mu.Unlock()
+	e := r.streams.seqLocked(bubbleSession, seq)
+	if e == nil || !e.painted {
+		t.Fatalf("round %d has no bubble on file", seq)
 	}
-	id, err := util.ParseUUID(raw)
-	if err != nil {
-		t.Fatalf("parse test task %q: %v", name, err)
-	}
-	return id
+	return e.handle.StreamID
 }
 
 // testTaskUUIDs maps the readable ids these tests use to real UUIDs.
@@ -566,6 +570,12 @@ var testTaskUUIDs = map[string]string{
 	"retry":  "aaaaaaaa-0000-0000-0000-0000000000ff",
 	// An issue or autopilot run: the same events, no chat session at all.
 	"issue-run": "aaaaaaaa-0000-0000-0000-0000000000e1",
+	// A question typed in Multica on this same WeCom-bound session. Its
+	// task:queued is indistinguishable from the room's on the bus.
+	"web-1": "aaaaaaaa-0000-0000-0000-0000000000b1",
+	"web-2": "aaaaaaaa-0000-0000-0000-0000000000b2",
+	// The room's own run, queued behind a first-party one.
+	"task-r": "aaaaaaaa-0000-0000-0000-0000000000c1",
 }
 
 // taskUUID is the string form the event payloads carry.
@@ -574,29 +584,27 @@ func taskUUID(t *testing.T, name string) string {
 	return util.UUIDToString(mustParseTestUUID(t, name))
 }
 
-// WeCom has no typing indicator, no reaction and no read receipt. The opening
-// stream frame IS the receipt — a think tag renders as the client's own
-// animated dots — and without it a slow agent looks like a dead bot.
-func TestAQuestionPaintsALoadingBubbleImmediately(t *testing.T) {
-	t.Parallel()
-	rig := newBubbleRig(t)
-	rig.ask(t, "REQ-A")
-
-	frames := rig.conn.streamFrames(t)
-	if len(frames) != 1 {
-		t.Fatalf("an ingested message wrote %d stream frames, want 1 — the user sees nothing at all until the agent finishes", len(frames))
+// has reports whether a session holds a round bound to this run. Tests use it
+// to check that an ending kept or released the round it belongs to; no
+// production path reads it.
+func (s *streamStore) has(sessionID pgtype.UUID, taskID string) bool {
+	if taskID == "" {
+		return false
 	}
-	if frames[0]["finish"] != false {
-		t.Error("the opening frame sealed the bubble; nothing can fill it in later")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.sessions[util.UUIDToString(sessionID)] {
+		if r.taskID == taskID {
+			return true
+		}
 	}
-	if frames[0]["content"] != streamThinkingPlaceholder {
-		t.Errorf("opening frame content = %q, want the think tag %q that renders as the loading dots",
-			frames[0]["content"], streamThinkingPlaceholder)
-	}
+	return false
 }
 
-// The answer replaces the bubble the question opened, in place — same stream
-// id, finish=true — rather than arriving underneath it as a new message.
+// WeCom has no typing indicator, so the opening frame IS the receipt: an
+// unsealed think tag the client renders as its own animated dots. The answer
+// then replaces that bubble in place — same stream id, finish=true — rather
+// than arriving underneath it as a new message.
 func TestTheAnswerReplacesTheBubbleInPlace(t *testing.T) {
 	t.Parallel()
 	rig := newBubbleRig(t)
@@ -606,6 +614,10 @@ func TestTheAnswerReplacesTheBubbleInPlace(t *testing.T) {
 	frames := rig.conn.streamFrames(t)
 	if len(frames) != 2 {
 		t.Fatalf("got %d stream frames, want 2 (open + seal)", len(frames))
+	}
+	if frames[0]["finish"] != false || frames[0]["content"] != streamThinkingPlaceholder {
+		t.Fatalf("opening frame = %v, want an unsealed %q — without it a slow agent looks like a dead bot",
+			frames[0], streamThinkingPlaceholder)
 	}
 	if frames[1]["id"] != frames[0]["id"] {
 		t.Fatalf("the answer opened a SECOND bubble (%v) instead of replacing the first (%v); the loading one spins forever",
@@ -671,60 +683,6 @@ func TestTheAnswerClosesTheBubbleOverTheNextConnection(t *testing.T) {
 	}
 }
 
-// A blank closing frame is DISCARDED by WeCom, and the bubble it was meant to
-// seal spins for good. An empty completion is a legitimate outcome — the agent
-// had nothing to add — so the copy stands in for the silence.
-func TestAnEmptyAnswerStillClosesTheBubbleWithWords(t *testing.T) {
-	t.Parallel()
-	rig := newBubbleRig(t)
-	rig.ran(t, "REQ-C", "task-1")
-	rig.answer(t, "   \n ", "task-1")
-
-	frames := rig.conn.streamFrames(t)
-	if len(frames) != 2 {
-		t.Fatalf("got %d stream frames, want 2 — an empty answer left the bubble open", len(frames))
-	}
-	if frames[1]["finish"] != true {
-		t.Fatal("an empty answer did not seal the bubble; it spins forever")
-	}
-	content, _ := frames[1]["content"].(string)
-	if !hasVisibleChar(content) {
-		t.Fatalf("the closing frame carries nothing visible (%q); WeCom discards it and the bubble spins forever", content)
-	}
-	if content != copyFor(DefaultLocale).StreamNoReply {
-		t.Errorf("closing copy = %q, want %q", content, copyFor(DefaultLocale).StreamNoReply)
-	}
-}
-
-// A message that arrives once the round ahead of it has its run is a round of
-// its own, queued behind the run in flight — and it gets its own bubble
-// immediately, because a wait with nothing on screen reads as a message that
-// was lost.
-//
-// The two messages arrive at the SAME instant on this store's clock. Only the
-// run queued between them separates them, which is the point: the gap between
-// two messages is not this side's to measure, and a store that measured it
-// would fold these two into one round and leave the second question with no
-// receipt.
-func TestAQueuedQuestionGetsItsOwnBubble(t *testing.T) {
-	t.Parallel()
-	rig := newBubbleRig(t)
-	rig.ask(t, "REQ-D1")
-	rig.queued(t, "task-1")
-	rig.ask(t, "REQ-D2")
-
-	frames := rig.conn.streamFrames(t)
-	if len(frames) != 2 {
-		t.Fatalf("two questions with a run queued between them wrote %d bubbles, want 2 — the second looks lost", len(frames))
-	}
-	if frames[0]["id"] == frames[1]["id"] {
-		t.Fatal("the second question reused the first bubble; one of the two answers has nowhere to land")
-	}
-	if rig.streams.depth() != 2 {
-		t.Fatalf("store holds %d open rounds, want 2", rig.streams.depth())
-	}
-}
-
 // Two messages still inside one debounce window share one bubble. A second
 // bubble here is one nobody would ever close: the run produces one answer, it
 // seals one bubble, and the other spins until the guard promises a separate
@@ -749,47 +707,6 @@ func TestMessagesInsideTheDebounceWindowShareOneBubble(t *testing.T) {
 	}
 }
 
-// A queued round whose run finished with nothing of its own to say has a
-// better explanation than plain silence: the reply ahead of it already covered
-// the message.
-func TestAQueuedRoundWithNothingToSaySaysItWasMerged(t *testing.T) {
-	t.Parallel()
-	rig := newBubbleRig(t)
-	rig.ran(t, "REQ-F1", "task-1")
-	rig.ran(t, "REQ-F2", "task-2")
-
-	rig.answer(t, "the first reply", "task-1") // seals the head
-	rig.answer(t, "", "task-2")                // seals the queued one
-
-	frames := rig.conn.streamFrames(t)
-	if len(frames) != 4 {
-		t.Fatalf("got %d stream frames, want 4 (two opens, two seals)", len(frames))
-	}
-	if frames[3]["content"] != copyFor(DefaultLocale).StreamMerged {
-		t.Errorf("a queued round's empty answer closed with %q, want %q",
-			frames[3]["content"], copyFor(DefaultLocale).StreamMerged)
-	}
-}
-
-// When the server refuses the closing frame the bubble cannot be sealed, but
-// the ANSWER still has to reach the user — as an ordinary message.
-func TestARefusedClosingFrameStillDeliversTheAnswer(t *testing.T) {
-	t.Parallel()
-	rig := newBubbleRig(t)
-	rig.conn.refuseClosingCode = errcodeStreamExpired
-	rig.ran(t, "REQ-G", "task-1")
-	rig.answer(t, "the agent reply", "task-1")
-
-	pushes := rig.conn.pushes(t)
-	if len(pushes) != 1 {
-		t.Fatalf("a refused closing frame produced %d plain messages, want 1 — the answer went nowhere", len(pushes))
-	}
-	md, _ := pushes[0]["markdown"].(map[string]any)
-	if md == nil || md["content"] != "the agent reply" {
-		t.Fatalf("the fallback message did not carry the answer: %v", pushes[0])
-	}
-}
-
 // A run that fails publishes no chat:done, so the failure subscriber is the
 // only thing that ever stops that spinner.
 func TestAFailedRunClosesTheBubble(t *testing.T) {
@@ -806,8 +723,274 @@ func TestAFailedRunClosesTheBubble(t *testing.T) {
 	if frames[1]["finish"] != true {
 		t.Fatal("the failure did not seal the bubble")
 	}
-	if frames[1]["content"] != copyFor(DefaultLocale).StreamFailed {
-		t.Errorf("failure copy = %q, want %q", frames[1]["content"], copyFor(DefaultLocale).StreamFailed)
+	if frames[1]["content"] != streamCopyFailed {
+		t.Errorf("failure copy = %q, want %q", frames[1]["content"], streamCopyFailed)
+	}
+}
+
+// ---- the protocol window this constant stands for ----
+
+// TestALongRunStillAnswersInItsBubbleInsideTheMeasuredWindow is what pins
+// streamMaxAge to what was measured rather than to what was guessed.
+//
+// Eight minutes is the interesting number: inside the ten the server actually
+// allows, outside the six this adapter used to assume. Every other test here
+// either drives the clock in relative steps or moves time by streamMaxAge
+// itself — so all of them follow the constant wherever it goes and none of
+// them notices it being wrong. Set the window back to six and
+// this run's answer stops landing in the bubble the asker has been watching for
+// eight minutes and arrives underneath it as a separate message instead, with
+// the spinner above it never sealed.
+func TestALongRunStillAnswersInItsBubbleInsideTheMeasuredWindow(t *testing.T) {
+	t.Parallel()
+	rig := newBubbleRig(t)
+	rig.ran(t, "REQ-LONG", "task-1")
+
+	// A run that takes eight minutes. Long, and well within what WeCom took on
+	// 2026-08-09: it accepted a frame at 600.0s and refused one at 630.0s.
+	rig.now = rig.now.Add(8 * time.Minute)
+	rig.answer(t, "the answer to a long question", "task-1")
+
+	if pushes := rig.conn.pushes(t); len(pushes) != 0 {
+		t.Fatalf("an eight-minute run's answer went out as %d plain message(s) — the window is "+
+			"set shorter than the server's, so the handle was thrown away while it was still "+
+			"usable and the asker's bubble is spinning above the answer", len(pushes))
+	}
+	frames := rig.conn.streamFrames(t)
+	if len(frames) != 2 {
+		t.Fatalf("got %d stream frames, want 2 (open + seal)", len(frames))
+	}
+	if frames[1]["id"] != frames[0]["id"] || frames[1]["finish"] != true ||
+		frames[1]["content"] != "the answer to a long question" {
+		t.Fatalf("the answer did not seal the bubble its question opened: %v", frames[1])
+	}
+}
+
+// TestARunPastTheWindowAnswersAsExactlyOnePlainMessage is the other side of
+// that constant: what the user gets when a run outlives it.
+//
+// Ten minutes is the whole budget a bubble has. Nothing written into it buys
+// more — the server counts from the opening frame (streamMaxAge) — so a run
+// that takes longer has no bubble left to answer in, and the answer arrives as
+// an ordinary message underneath the spinner the asker has been watching.
+// Degraded, and deliberately so: the words are all there, in one message.
+//
+// ONE message is the property worth pinning, and it is not automatic. The
+// stream is expired, not merely old, so a closer that wrote the closing frame
+// anyway would have it refused (846608) and then fall back — and the refused
+// frame is not invisible: WeCom renders what it took before it refused, and
+// there is no unsend. The store gives the handle up before writing instead,
+// which is what makes the count one.
+//
+// REVERSE VERIFICATION: make expiredLocked always report false and this goes
+// red with two messages — the closing frame the server refuses, and the plain
+// one behind it.
+func TestARunPastTheWindowAnswersAsExactlyOnePlainMessage(t *testing.T) {
+	t.Parallel()
+	rig := newBubbleRig(t)
+	// The server's own stance on a stream this old, so the test does not rest
+	// on our clock alone: every closing frame it is offered is refused with
+	// 846608. Nothing here should ever offer it one.
+	rig.conn.refuseClosingCode = errcodeStreamExpired
+	rig.ran(t, "REQ-PAST-WINDOW", "task-1")
+
+	// Eleven minutes: past the 600s the live tenant accepted on 2026-08-09 and
+	// past the 630s at which it refused.
+	const answer = "the first line of a long run's answer\nand the last line of it"
+	rig.now = rig.now.Add(streamMaxAge + time.Minute)
+	rig.answer(t, answer, "task-1")
+
+	if got := said(t, rig.conn); len(got) != 1 || got[0] != answer {
+		t.Fatalf("the asker read %d message(s) %q, want exactly one carrying the whole answer %q",
+			len(got), got, answer)
+	}
+	frames := rig.conn.streamFrames(t)
+	if len(frames) != 1 || frames[0]["finish"] != false {
+		t.Fatalf("got %d stream frames (%v), want only the opening one — a closing frame on a "+
+			"stream the server has already expired is a refusal charged against the whole bot's "+
+			"rate limit, and whatever it renders before refusing the asker cannot unsee",
+			len(frames), frames)
+	}
+}
+
+// said is everything the person in the chat ended up reading on a connection:
+// the text of every sealed bubble and every plain message, in write order.
+//
+// Both, deliberately. A closing frame and a push are the same thing to the
+// reader, and they are how the same words reach them depending on whether the
+// bubble survived — so a test watching only one of them would call a path
+// silent while its words were on the screen, or count one ending twice. The
+// opening frame is not in here: it carries no words, only the spinner.
+func said(t *testing.T, c *bubbleConn) []string {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := []string{}
+	for _, f := range c.frames {
+		var body map[string]any
+		if err := json.Unmarshal(f.Body, &body); err != nil {
+			t.Fatalf("decode frame body: %v", err)
+		}
+		switch f.Cmd {
+		case cmdRespondMsg:
+			stream, _ := body["stream"].(map[string]any)
+			if stream == nil || stream["finish"] != true {
+				continue
+			}
+			s, _ := stream["content"].(string)
+			out = append(out, s)
+		case cmdSendMsg:
+			md, _ := body["markdown"].(map[string]any)
+			if md == nil {
+				continue
+			}
+			s, _ := md["content"].(string)
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// A bubble is painted and the run never ends — the process that owns it goes
+// away, or the answer is produced on a replica that does not hold the socket
+// and arrives as its own message. Nothing seals the stream, so neither ending
+// counter moves, and from those two alone a stranded bubble and a quiet hour
+// are the same picture. stream_opened is what tells them apart.
+//
+// REVERSE VERIFICATION: move senders.recordOpened() inside the err == nil arm
+// of OnIngested, or delete it, and this fails with stream_opened = 0 — the
+// stranded bubble becomes invisible again, which is the whole point of it.
+func TestABubbleNobodyEndsIsCountedAsOpenedWithNoEnding(t *testing.T) {
+	t.Parallel()
+	rig := newBubbleRig(t)
+	mx := newCountingMetrics()
+	rig.senders.WithMetrics(mx)
+
+	rig.ran(t, "REQ-STRANDED", "task-1")
+	// No answer, no failure, no cancellation. This is what the relay gap and a
+	// restart mid-run both leave behind.
+
+	if got := mx.get("stream_opened"); got != 1 {
+		t.Fatalf("stream_opened = %d, want 1 — one bubble is on screen and owed an ending", got)
+	}
+	if got := mx.get("stream_finished"); got != 0 {
+		t.Errorf("stream_finished = %d, want 0", got)
+	}
+	if got := mx.get("stream_fell_back"); got != 0 {
+		t.Errorf("stream_fell_back = %d, want 0", got)
+	}
+	if opened, ended := mx.get("stream_opened"), mx.get("stream_finished")+mx.get("stream_fell_back"); opened-ended != 1 {
+		t.Fatalf("opened - ended = %d, want 1 — this difference is the number an operator reads", opened-ended)
+	}
+}
+
+// The same turn, ended properly: the difference goes back to zero. Without
+// this the test above would pass against a counter that only ever counts up.
+func TestAnAnsweredBubbleLeavesNothingOutstanding(t *testing.T) {
+	t.Parallel()
+	rig := newBubbleRig(t)
+	mx := newCountingMetrics()
+	rig.senders.WithMetrics(mx)
+
+	rig.ran(t, "REQ-ANSWERED", "task-1")
+	rig.answer(t, "the agent reply", "task-1")
+
+	if opened, ended := mx.get("stream_opened"), mx.get("stream_finished")+mx.get("stream_fell_back"); opened != 1 || opened-ended != 0 {
+		t.Fatalf("opened = %d, opened - ended = %d, want 1 and 0", opened, opened-ended)
+	}
+}
+
+// The server states a verdict on the opening frame itself: this req_id will
+// never carry a stream. No bubble was painted, so nothing is owed an ending
+// and nothing is counted — the counter has to follow the handle, not the
+// write. The answer still reaches the user, as the plain message main sends
+// today.
+//
+// REVERSE VERIFICATION: count the open before the frame is written and this
+// fails with stream_opened = 1, which would leave every refused opening frame
+// sitting permanently in opened-minus-ended and make the number unreadable.
+func TestARefusedOpeningFrameCountsNoBubble(t *testing.T) {
+	t.Parallel()
+	rig := newBubbleRig(t)
+	mx := newCountingMetrics()
+	rig.senders.WithMetrics(mx)
+	rig.conn.refuseOpeningCode = errcodeStreamBadReqID
+
+	rig.ran(t, "REQ-REFUSED", "task-1")
+	rig.answer(t, "the agent reply", "task-1")
+
+	if got := mx.get("stream_opened"); got != 0 {
+		t.Fatalf("stream_opened = %d, want 0 — the server said this stream will never exist", got)
+	}
+	pushes := rig.conn.pushes(t)
+	if len(pushes) != 1 || pushText(pushes[0]) != "the agent reply" {
+		t.Fatalf("the asker read %d plain message(s) %v, want exactly the answer", len(pushes), pushes)
+	}
+}
+
+// A write the socket may have taken is not a refusal, and the opening frame was
+// the one site in this package still reading it as one.
+//
+// errWriteAttempted means WriteMessage was entered: the peer may have taken the
+// bytes and painted the placeholder. Dropping the handle on that evidence
+// leaves a bubble on the asker's screen with nothing left that could ever close
+// it — the answer arrives as a plain message underneath a spinner that turns
+// until the platform's window runs out.
+//
+// provablyNotSent returns false for this error and unconfirmedReason files it
+// as write_attempted; this site now agrees with both.
+func TestAnOpeningFrameTheSocketMayHaveTakenKeepsItsHandle(t *testing.T) {
+	t.Parallel()
+	rig := newBubbleRig(t)
+	rig.conn.failOpeningWrite = errors.New("broken pipe")
+
+	rig.ask(t, "REQ-OPEN")
+
+	if got := rig.streams.depth(); got != 1 {
+		t.Fatalf("the store holds %d rounds after an opening frame the socket may have taken, "+
+			"want 1 — if the placeholder is on screen, the handle is the only thing that could "+
+			"ever close it", got)
+	}
+}
+
+// A run whose bubble the guard has rotated must not seize the NEXT question's
+// bubble as its own ending: that question's asker would read the previous
+// answer, and its own run would find no bubble left. Its answer belongs in
+// the stream the rotation opened for it.
+func TestARotatedRunDoesNotSealTheNextQuestionsBubble(t *testing.T) {
+	t.Parallel()
+	rig := newBubbleRig(t)
+
+	// The first round's run is known, and its bubble is rotated mid-run.
+	rig.ran(t, "REQ-J1", "task-1")
+	_, first := rig.rotated(t, "task-1")
+
+	// The next question opens a bubble of its own, and its own run.
+	rig.ran(t, "REQ-J2", "task-2")
+	second := rig.streamIDOf(t, "task-2")
+
+	rig.answer(t, "the first run's answer", "task-1")
+
+	frames := rig.conn.streamFrames(t)
+	sealed := frames[len(frames)-1]
+	if sealed["content"] != "the first run's answer" || sealed["finish"] != true {
+		t.Fatalf("the first run's answer did not seal a bubble: %v", sealed)
+	}
+	if sealed["id"] == second {
+		t.Fatal("the first run seized the second question's bubble; that question's asker reads the wrong answer and its own run has nowhere to land")
+	}
+	if sealed["id"] != first {
+		t.Fatalf("the first run's answer sealed stream %v, want the one its rotation opened (%s)", sealed["id"], first)
+	}
+	if rig.streams.depth() != 1 {
+		t.Fatalf("store holds %d open rounds, want 1 — the second question kept its bubble", rig.streams.depth())
+	}
+	// And the second round's own answer still lands where it belongs.
+	rig.answer(t, "the second run's answer", "task-2")
+	frames = rig.conn.streamFrames(t)
+	last := frames[len(frames)-1]
+	if last["id"] != second || last["content"] != "the second run's answer" || last["finish"] != true {
+		t.Fatalf("the second question's own answer did not seal its bubble: %v", last)
 	}
 }
 
@@ -871,85 +1054,6 @@ func TestTheGuardRotatesABubbleTheWindowIsAboutToStrand(t *testing.T) {
 	}
 }
 
-// A run whose bubble the guard has rotated must not seize the NEXT question's
-// bubble as its own ending: that question's asker would read the previous
-// answer, and its own run would find no bubble left. Its answer belongs in
-// the stream the rotation opened for it.
-func TestARotatedRunDoesNotSealTheNextQuestionsBubble(t *testing.T) {
-	t.Parallel()
-	rig := newBubbleRig(t)
-
-	// The first round's run is known, and its bubble is rotated mid-run.
-	rig.ran(t, "REQ-J1", "task-1")
-	_, first := rig.rotated(t, "task-1")
-
-	// The next question opens a bubble of its own, and its own run.
-	rig.ran(t, "REQ-J2", "task-2")
-	second := rig.streamIDOf(t, "task-2")
-
-	rig.answer(t, "the first run's answer", "task-1")
-
-	frames := rig.conn.streamFrames(t)
-	sealed := frames[len(frames)-1]
-	if sealed["content"] != "the first run's answer" || sealed["finish"] != true {
-		t.Fatalf("the first run's answer did not seal a bubble: %v", sealed)
-	}
-	if sealed["id"] == second {
-		t.Fatal("the first run seized the second question's bubble; that question's asker reads the wrong answer and its own run has nowhere to land")
-	}
-	if sealed["id"] != first {
-		t.Fatalf("the first run's answer sealed stream %v, want the one its rotation opened (%s)", sealed["id"], first)
-	}
-	if rig.streams.depth() != 1 {
-		t.Fatalf("store holds %d open rounds, want 1 — the second question kept its bubble", rig.streams.depth())
-	}
-	// And the second round's own answer still lands where it belongs.
-	rig.answer(t, "the second run's answer", "task-2")
-	frames = rig.conn.streamFrames(t)
-	last := frames[len(frames)-1]
-	if last["id"] != second || last["content"] != "the second run's answer" || last["finish"] != true {
-		t.Fatalf("the second question's own answer did not seal its bubble: %v", last)
-	}
-}
-
-// ---- the protocol window these two constants stand for ----
-
-// TestALongRunStillAnswersInItsBubbleInsideTheMeasuredWindow is what pins
-// streamMaxAge to what was measured rather than to what was guessed.
-//
-// Eight minutes is the interesting number: inside the ten the server actually
-// allows, outside the six this adapter used to assume. Every other test here
-// either disables the guard and drives the clock in relative steps, or moves
-// time by streamMaxAge itself — so all of them follow the constant wherever it
-// goes and none of them notices it being wrong. Set the window back to six and
-// this run's answer stops landing in the bubble the asker has been watching for
-// eight minutes and arrives underneath it as a separate message instead, with
-// the spinner above it never sealed.
-func TestALongRunStillAnswersInItsBubbleInsideTheMeasuredWindow(t *testing.T) {
-	t.Parallel()
-	rig := newBubbleRig(t)
-	rig.ran(t, "REQ-LONG", "task-1")
-
-	// A run that takes eight minutes. Long, and well within what WeCom took on
-	// 2026-08-09: it accepted a frame at 600.0s and refused one at 630.0s.
-	rig.now = rig.now.Add(8 * time.Minute)
-	rig.answer(t, "the answer to a long question", "task-1")
-
-	if pushes := rig.conn.pushes(t); len(pushes) != 0 {
-		t.Fatalf("an eight-minute run's answer went out as %d plain message(s) — the window is "+
-			"set shorter than the server's, so the handle was thrown away while it was still "+
-			"usable and the asker's bubble is spinning above the answer", len(pushes))
-	}
-	frames := rig.conn.streamFrames(t)
-	if len(frames) != 2 {
-		t.Fatalf("got %d stream frames, want 2 (open + seal)", len(frames))
-	}
-	if frames[1]["id"] != frames[0]["id"] || frames[1]["finish"] != true ||
-		frames[1]["content"] != "the answer to a long question" {
-		t.Fatalf("the answer did not seal the bubble its question opened: %v", frames[1])
-	}
-}
-
 // TestTheGuardRotatesTheBubbleWhileTheServerStillAcceptsFrames pins the other
 // constant, as the relationship that gives it its meaning.
 //
@@ -972,42 +1076,4 @@ func TestTheGuardRotatesTheBubbleWhileTheServerStillAcceptsFrames(t *testing.T) 
 			"and the hand-over is refused, leaving the asker the spinner the guard was there to "+
 			"replace", got, headroom)
 	}
-}
-
-// said is everything the person in the chat ended up reading on a connection:
-// the text of every sealed bubble and every plain message, in write order.
-//
-// Both, deliberately. A closing frame and a push are the same thing to the
-// reader, and they are how the same words reach them depending on whether the
-// bubble survived — so a test watching only one of them would call a path
-// silent while its words were on the screen, or count one ending twice. The
-// opening frame is not in here: it carries no words, only the spinner.
-func said(t *testing.T, c *bubbleConn) []string {
-	t.Helper()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	out := []string{}
-	for _, f := range c.frames {
-		var body map[string]any
-		if err := json.Unmarshal(f.Body, &body); err != nil {
-			t.Fatalf("decode frame body: %v", err)
-		}
-		switch f.Cmd {
-		case cmdRespondMsg:
-			stream, _ := body["stream"].(map[string]any)
-			if stream == nil || stream["finish"] != true {
-				continue
-			}
-			s, _ := stream["content"].(string)
-			out = append(out, s)
-		case cmdSendMsg:
-			md, _ := body["markdown"].(map[string]any)
-			if md == nil {
-				continue
-			}
-			s, _ := md["content"].(string)
-			out = append(out, s)
-		}
-	}
-	return out
 }

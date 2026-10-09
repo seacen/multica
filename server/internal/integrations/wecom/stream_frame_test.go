@@ -22,30 +22,6 @@ func TestClosingFrameWithNothingVisibleIsRefused(t *testing.T) {
 	}
 }
 
-// The same emptiness is fine on a frame that is not closing anything: the
-// opening frame's whole job is to paint a bubble with no words in it.
-func TestNonClosingFrameMayCarryNothingVisible(t *testing.T) {
-	t.Parallel()
-	if _, err := respondStreamBody("S1", streamThinkingPlaceholder, false); err != nil {
-		t.Fatalf("the opening frame was refused: %v", err)
-	}
-}
-
-func TestClosingFrameWithVisibleContentIsAccepted(t *testing.T) {
-	t.Parallel()
-	body, err := respondStreamBody("S1", "答案", true)
-	if err != nil {
-		t.Fatalf("respondStreamBody: %v", err)
-	}
-	stream, _ := body["stream"].(map[string]any)
-	if stream["finish"] != true {
-		t.Errorf("finish = %v, want true", stream["finish"])
-	}
-	if stream["id"] != "S1" {
-		t.Errorf("stream id = %v, want S1", stream["id"])
-	}
-}
-
 // defuseThinkTags used to walk the answer while reading strings.ToLower of it
 // at the same offsets. Case folding is not length-preserving — U+212A KELVIN
 // SIGN is three bytes and folds to a one-byte "k" — so the folded copy can be

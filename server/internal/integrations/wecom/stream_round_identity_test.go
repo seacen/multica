@@ -13,88 +13,16 @@ package wecom
 
 import (
 	"context"
+	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
 	"testing"
 	"time"
-
-	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
 )
 
 // ---- 1. the round boundary ----
 
-// TestTheBubbleCountFollowsTheRunsNotTheClock is the boundary case from both
-// sides at once, with the clock deliberately lying in each direction.
-//
-// A store that measured the debounce gap itself would fold the first pair into
-// one round (they arrive in the same instant) and split the second pair into
-// two (they arrive a full window apart) — the opposite of what actually
-// happened, and both mistakes are user-visible: a merged pair loses the second
-// question's receipt entirely, and a split pair leaves a bubble no run will
-// ever close. What separates them is a run: a message arriving when a round is
-// still waiting for one belongs to that same round.
-func TestTheBubbleCountFollowsTheRunsNotTheClock(t *testing.T) {
-	t.Parallel()
-	rig := newBubbleRig(t)
-
-	// A run was queued between these two, though nothing separates them on the
-	// clock — so the second is a round of its own.
-	rig.ask(t, "REQ-1")
-	rig.queued(t, "task-1")
-	rig.ask(t, "REQ-2")
-	if got := rig.streams.depth(); got != 2 {
-		t.Fatalf("two messages with a run queued between them opened %d bubble(s), want 2 — "+
-			"the second question's run has no bubble and its asker saw no receipt at all", got)
-	}
-	rig.queued(t, "task-2")
-
-	// Nothing was queued between these two, though a whole window separates
-	// them on the clock: one round, one bubble.
-	rig.now = rig.now.Add(engine.DefaultChatRunBatchWindow * 2)
-	rig.ask(t, "REQ-3")
-	rig.now = rig.now.Add(engine.DefaultChatRunBatchWindow * 2)
-	rig.ask(t, "REQ-4")
-	if got := rig.streams.depth(); got != 3 {
-		t.Fatalf("two messages still inside one debounce window opened %d bubbles in total, want 3 — "+
-			"one run cannot close two bubbles, and the spare spins until its window runs out", got)
-	}
-}
-
-// TestARunCreatedBeforeItsBubbleWasPaintedStillOwnsIt drives the ordering the
-// Router does not guarantee: OnIngested runs on a detached goroutine, and a
-// session's first message enqueues its task inside dispatch, so task:queued
-// routinely reaches the store first.
-//
-// The binding has to survive that. If a run with no round waiting were dropped,
-// this round would have no run on file, and the answer — which names only the
-// task — would find no bubble and land as a plain message underneath a spinner
-// nothing would ever close.
-func TestARunCreatedBeforeItsBubbleWasPaintedStillOwnsIt(t *testing.T) {
-	t.Parallel()
-	rig := newBubbleRig(t)
-
-	// The flush wins the race: the run exists before the bubble is painted.
-	rig.queued(t, "task-1")
-	rig.ask(t, "REQ-LATE")
-
-	if got := rig.streams.depth(); got != 1 {
-		t.Fatalf("store holds %d open bubbles, want 1", got)
-	}
-	rig.answer(t, "the agent reply", "task-1")
-
-	frames := rig.conn.streamFrames(t)
-	if len(frames) != 2 {
-		t.Fatalf("got %d stream frames, want 2 (open + seal)", len(frames))
-	}
-	if frames[1]["id"] != frames[0]["id"] || frames[1]["finish"] != true {
-		t.Fatalf("the answer did not seal the bubble its question opened: %v", frames[1])
-	}
-	if pushes := rig.conn.pushes(t); len(pushes) != 0 {
-		t.Fatalf("the answer went out as %d plain message(s) instead, leaving the bubble spinning", len(pushes))
-	}
-}
-
-// TestAnEndingNeverTakesABubbleItWasNotBoundTo is the other half of the same
-// promise. A run whose id was never bound to a round has no bubble here, and
-// taking one on position would seal somebody else's question with this answer.
+// TestAnEndingNeverTakesABubbleItWasNotBoundTo: a run whose id was never bound
+// to a round has no bubble here, and taking one on position would seal
+// somebody else's question with this answer.
 func TestAnEndingNeverTakesABubbleItWasNotBoundTo(t *testing.T) {
 	t.Parallel()
 	rig := newBubbleRig(t)
@@ -119,148 +47,7 @@ func TestAnEndingNeverTakesABubbleItWasNotBoundTo(t *testing.T) {
 	}
 }
 
-// ---- 2. an auto-retry's intermediate failure ----
-
-// TestAnIntermediateFailureBeingRetriedLeavesTheBubbleOpen.
-//
-// FailTask publishes task:failed for an attempt it has ALREADY replaced with a
-// retry child, flagged retry_pending so consumers stay quiet — taskFailedFields
-// even withholds the error text in that case. Closing the bubble on it tells
-// the user "这次没跑通" about an attempt whose replacement is already queued,
-// and the retry's answer then arrives underneath a bubble that has declared
-// failure: the user is told it failed AND gets an answer, in that order.
-func TestAnIntermediateFailureBeingRetriedLeavesTheBubbleOpen(t *testing.T) {
-	t.Parallel()
-	rig := newBubbleRig(t)
-	rig.ran(t, "REQ-R", "task-1")
-
-	rig.failed(t, "task-1", true)
-
-	frames := rig.conn.streamFrames(t)
-	if len(frames) != 1 {
-		t.Fatalf("an attempt the platform is already retrying wrote %d stream frames, want 1 (the opening one) — "+
-			"the bubble was closed as a failure and the retry's answer will land underneath it: content = %q",
-			len(frames), frames[len(frames)-1]["content"])
-	}
-	if pushes := rig.conn.pushes(t); len(pushes) != 0 {
-		t.Fatalf("a retry-pending attempt sent %d plain message(s); the user is told it failed before it has", len(pushes))
-	}
-	if rig.streams.depth() != 1 {
-		t.Fatalf("store holds %d open rounds, want 1 — the retry has nowhere to answer", rig.streams.depth())
-	}
-}
-
-// TestTheRetryAnswerLandsInTheBubbleTheFirstAttemptOpened finishes that story.
-//
-// The retry child is a NEW task row with a new id, so its chat:done names an id
-// no round was ever bound to. What it does inherit is chat_input_task_id — the
-// turn that owns the input batch, which is exactly the id the flush bound this
-// round under. Reading that column is what routes the answer home; falling
-// back to "whichever bubble is at the head" would be a guess that happens to
-// work only while a session has one round open.
-func TestTheRetryAnswerLandsInTheBubbleTheFirstAttemptOpened(t *testing.T) {
-	t.Parallel()
-	rig := newBubbleRig(t)
-	rig.ran(t, "REQ-R1", "task-1")
-	// A second question is waiting behind it with a bubble of its own, so a
-	// positional fallback would have two candidates and could pick either.
-	rig.ran(t, "REQ-R2", "task-2")
-
-	// FailTask's retry child: fresh id, inheriting the parent's input batch.
-	// Its task:queued goes out BEFORE the parent's task:failed — see
-	// TestARetryCloneTakesTheRoundItIsReplacingNotTheNextQuestions.
-	rig.q.fileRetryClone(t, taskUUID(t, "retry"), taskUUID(t, "task-1"))
-	rig.queueTask(t, taskUUID(t, "retry"), "")
-	rig.failed(t, "task-1", true)
-
-	rig.answer(t, "the retry's answer", "retry")
-
-	frames := rig.conn.streamFrames(t)
-	if len(frames) != 3 {
-		t.Fatalf("got %d stream frames, want 3 (two opens, then the retry sealing the first) — "+
-			"the retry's answer did not reach the bubble its question opened", len(frames))
-	}
-	if frames[2]["id"] != frames[0]["id"] {
-		t.Fatalf("the retry sealed bubble %v, want the first question's %v — the wrong asker read this answer",
-			frames[2]["id"], frames[0]["id"])
-	}
-	if frames[2]["content"] != "the retry's answer" || frames[2]["finish"] != true {
-		t.Fatalf("the retry did not seal the bubble with its answer: %v", frames[2])
-	}
-	if rig.streams.depth() != 1 {
-		t.Fatalf("store holds %d open rounds, want 1 — the waiting question kept its own bubble", rig.streams.depth())
-	}
-}
-
-// TestTheRetryLookupIsNotPaidForOnEveryAnswer keeps the extra read honest: it
-// happens only when the id on the event matches no round in a session that
-// still has one open.
-//
-// Two readers want the task row on this path now. The origin gate reads it for
-// every answer it lets through, and that read is not optional — it is what
-// keeps a web question's answer out of the room. So the gate's one read is the
-// floor, and what this test measures is whether the round matcher adds a
-// second on top of it.
-func TestTheRetryLookupIsNotPaidForOnEveryAnswer(t *testing.T) {
-	t.Parallel()
-	rig := newBubbleRig(t)
-	rig.ran(t, "REQ-C1", "task-1")
-
-	before := rig.q.taskGets
-	rig.answer(t, "the agent reply", "task-1")
-	if got := rig.q.taskGets - before; got != 1 {
-		t.Fatalf("an answer that matched its own round read %d task rows, want 1 (the origin gate's) — "+
-			"the retry lookup was paid for on an answer that already named its own round", got)
-	}
-	// Nothing open now, so an unmatched ending must not reach the matcher
-	// either. It never gets that far: task-3 was never filed, so the gate
-	// refuses it on the read it was always going to make.
-	before = rig.q.taskGets
-	rig.answer(t, "a late stray", "task-3")
-	if got := rig.q.taskGets - before; got != 1 {
-		t.Fatalf("an ending for a session with no open round read %d task rows, want 1 "+
-			"(the origin gate's, which finds no row and stops there)", got)
-	}
-}
-
-// ---- 3. cancellation ----
-
-// TestACancelledRunClosesItsBubble.
-//
-// Cancellation publishes task:cancelled and nothing else: no chat:done, no
-// task:failed. Subscribing only to failure leaves the bubble spinning until
-// the server's window runs out on it — for a run the user stopped themselves.
-func TestACancelledRunClosesItsBubble(t *testing.T) {
-	t.Parallel()
-	rig := newBubbleRig(t)
-	rig.ran(t, "REQ-X", "task-1")
-
-	rig.cancelled(t, "task-1")
-
-	frames := rig.conn.streamFrames(t)
-	if len(frames) != 2 {
-		t.Fatalf("a cancelled run wrote %d stream frames, want 2 — the bubble spins until its window runs out", len(frames))
-	}
-	if frames[1]["finish"] != true {
-		t.Fatal("the cancellation did not seal the bubble")
-	}
-	content, _ := frames[1]["content"].(string)
-	if !hasVisibleChar(content) {
-		t.Fatalf("the closing frame carries nothing visible (%q); WeCom discards it and the bubble spins forever", content)
-	}
-	// Asserted against the FAILURE copy, not just against its own constant: a
-	// cancellation closed with "请稍后再试一次" invites a retry of something the
-	// user just stopped on purpose.
-	if content == streamCopyFailed {
-		t.Errorf("a cancelled run was closed with the failure copy %q", content)
-	}
-	if content != streamCopyCancelled {
-		t.Errorf("cancellation copy = %q, want %q", content, streamCopyCancelled)
-	}
-	if rig.streams.depth() != 0 {
-		t.Fatalf("store holds %d open rounds after the cancel, want 0", rig.streams.depth())
-	}
-}
+// ---- 2. cancellation ----
 
 // TestCancellingEveryQueuedTurnClosesEachOwnBubble covers the bulk paths:
 // CancelQueuedChatTasks for a session's waiting follow-ups, and the
@@ -401,7 +188,7 @@ func TestAFlushThatStartedNoRunClosesTheBubbleWithNoRun(t *testing.T) {
 	rig.ran(t, "REQ-S1", "task-1") // running, bound
 	rig.ask(t, "REQ-S2")           // the flush that found no runtime
 
-	rig.typing.OnSettled(context.Background(), sessionID)
+	rig.typing.OnSettled(context.Background(), sessionID, engine.TypingSettlement{})
 
 	frames := rig.conn.streamFrames(t)
 	if len(frames) != 3 {
@@ -427,7 +214,7 @@ func TestASettledFlushLeavesARoundWaitingForItsRetry(t *testing.T) {
 	rig.ran(t, "REQ-RETRY-SETTLE", "task-1")
 	rig.failed(t, "task-1", true) // the attempt is being retried; the round waits
 
-	rig.typing.OnSettled(context.Background(), bubbleSessionID(t))
+	rig.typing.OnSettled(context.Background(), bubbleSessionID(t), engine.TypingSettlement{})
 
 	if got := len(rig.conn.streamFrames(t)); got != 1 {
 		t.Fatalf("got %d stream frames, want 1 (the opening one) — a settled flush closed the "+
@@ -454,28 +241,6 @@ func TestAStaleRoundIsSweptRatherThanKept(t *testing.T) {
 	}
 	if rig.streams.has(sessionID, taskUUID(t, "task-1")) {
 		t.Fatal("a round from beyond the stream window was still on file")
-	}
-}
-
-// TestAStaleQueuedRunIsSweptRatherThanKept is the same guard on the other half
-// of the store. A run queued for a bubble that never arrived must not sit there
-// waiting: the next question, minutes later, would bind its own bubble to a run
-// that is long over, and that bubble has no ending left to close it.
-func TestAStaleQueuedRunIsSweptRatherThanKept(t *testing.T) {
-	t.Parallel()
-	rig := newBubbleRig(t)
-
-	rig.queued(t, "task-1") // no bubble was ever painted for it
-	rig.now = rig.now.Add(streamMaxAge + time.Minute)
-	rig.ask(t, "REQ-MUCH-LATER")
-
-	if rig.streams.has(bubbleSessionID(t), taskUUID(t, "task-1")) {
-		t.Fatal("a much later question's bubble was bound to a run queued a whole window ago")
-	}
-	rig.queued(t, "task-2")
-	rig.answer(t, "the agent reply", "task-2")
-	if got := rig.streams.depth(); got != 0 {
-		t.Fatalf("%d bubble(s) still open, want 0 — the late question's own run could not close its bubble", got)
 	}
 }
 

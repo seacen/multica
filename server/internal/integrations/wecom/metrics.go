@@ -10,18 +10,16 @@ package wecom
 // wrong behaviour for the operator behind it — nothing on a dashboard changes
 // when a bot has been unable to connect for an hour.
 //
-// The same is true one layer up, of the two features that answer a user
-// without the user being able to tell whether they worked: a bubble that
-// refused its closing frame still delivers the answer, as a new message; and an
-// attachment that could not be fetched leaves its "[Image]" placeholder in the
-// body, so the agent answers as though it had seen the picture. Both read as a
+// The same is true one layer up, of the feature that answers a user without
+// the user being able to tell whether it worked: a bubble that refused its
+// closing frame still delivers the answer, as a new message. That reads as a
 // quiet afternoon from outside.
 //
 // The counters here are chosen for what somebody would page on rather than for
 // completeness: the connection is not coming up, and if so whether that needs a
 // person or just time; the read loop is being made to wait by an ingest worker
-// that cannot keep up; and each of those three features has stopped doing the
-// thing it exists to do.
+// that cannot keep up; and the bubble has stopped doing the thing it exists to
+// do.
 //
 // No installation id anywhere. It is an unbounded identifier and the metrics
 // package rejects that class of label outright (forbiddenMetricLabels in
@@ -33,8 +31,8 @@ package wecom
 // operator that some bot is behind and not which one.
 
 // Metrics is the sink this adapter reports to. Every method must tolerate being
-// called concurrently, and none of them may block: they run on the read loop,
-// on the event bus, and on the detached media path.
+// called concurrently, and none of them may block: they run on the read loop
+// and on the event bus.
 type Metrics interface {
 	// RecordConnectFailure — a dial, a handshake write or a handshake read
 	// that did not complete, or a handshake the server answered with a code
@@ -65,16 +63,33 @@ type Metrics interface {
 	// RecordStreamFinished / FellBack — how the bubble ended. A fall-back is
 	// an ending that arrived as a new message because the bubble could not
 	// take the closing frame; the words are not lost, but the experience is
-	// the one the bubble was built to replace. The ratio between the two is
-	// the signal; the count of bubbles opened is not, so it is not collected.
+	// the one the bubble was built to replace.
 	//
-	// Both are fed from the one line in sendersRegistry.stream, and they have
-	// to stay that way for the ratio to mean anything: every closer goes
+	// Both are fed from the one line in sendersRegistry.recordEnding, and they
+	// have to stay that way for the ratio to mean anything: every closer goes
 	// through it — the answer, and the failure and cancellation notices the
 	// typing indicator writes — so a ratio read off these two covers the same
 	// population on both sides.
 	RecordStreamFinished()
 	RecordStreamFellBack()
+
+	// RecordStreamOpened — one bubble is on a user's screen and something owes
+	// it an ending. Counted where the handle is KEPT, which is not the same as
+	// where a frame was accepted: an opening frame whose ack never came back
+	// keeps its handle on purpose, because re-sending that stream id later
+	// creates the message if the frame was lost.
+	//
+	// It is here because the ratio above cannot see the failure that matters
+	// most. A bubble nobody ever closes moves neither counter — the relay gap
+	// on a multi-replica deployment, a process restarted mid-run, a closing
+	// frame that never happens — and from the two ending counters alone that
+	// is indistinguishable from a quiet hour. opened minus finished minus
+	// fell_back is that number, and it is the one an operator can act on.
+	//
+	// It does not settle to zero at any instant: bubbles in flight sit in the
+	// difference, and a run can hold one for the length of the window. It is a
+	// gauge of a backlog read over time, not a balance.
+	RecordStreamOpened()
 
 	// RecordMediaFailure — an attachment that never reached the agent.
 	// reason is one of the mediaDrop* constants below.
@@ -89,33 +104,22 @@ type Metrics interface {
 	// deliver, labelled with why (outbound_outcome.go's closed reason set).
 	// Every reason here leaves somebody in WeCom waiting on an answer that is
 	// not coming, so this IS an error total and the label says which failure it
-	// was. The ordinary outcomes — a question typed in the web UI on a
-	// WeCom-bound session, an installation revoked between trigger and reply —
-	// are not counted here; RecordOutboundSkipped has them.
+	// was — most of them before the frame ever reaches WeCom. The completions
+	// this adapter did not owe, and the ones nothing here can attribute to a
+	// WeCom chat, are counted apart, by RecordOutboundSkipped.
 	RecordOutboundDropped(reason string)
-	// RecordOutboundSkipped — a completion this adapter was never going to
-	// deliver, because it was not owed to a WeCom user in the first place. Kept
-	// apart from dropped on purpose: counting a web-UI question's answer as a
-	// failed WeCom delivery makes ordinary web usage look like an outage.
+	// RecordOutboundSkipped — a completion this adapter did not send because it
+	// was not WeCom's to send, labelled with why (outbound_outcome.go's closed
+	// skip set). Kept apart from dropped on purpose: counting a web-UI
+	// question's answer as a failed WeCom delivery makes ordinary web usage look
+	// like an outage.
+	//
+	// Not every reason here is harmless, so this total is not one to read as a
+	// single number. no_delivery_row is a turn the channel ingested with no row
+	// saying which chat — a reply that may well be owed, with nothing left that
+	// can name the room — and it is the one reason in the set that logs at
+	// WARN. Alert on it by label, not on the sum.
 	RecordOutboundSkipped(reason string)
-	// RecordOutboundTruncated — one reply the user can read the beginning of
-	// and no more. An answer past the 20480-byte body cap goes out as several
-	// messages, and a piece after the first can fail with the ones before it
-	// already in the chat.
-	//
-	// Its own counter because neither of the other two can say this. Dropped
-	// says nobody was told anything, and an operator reading it as "resend
-	// that" would print the opening of the answer twice; delivered on its own
-	// says the whole answer arrived. The reply is ALSO counted as delivered,
-	// which is what keeps the denominator meaning "replies that reached the
-	// user" — so this is read as a fraction of delivered, not added to it.
-	//
-	// Both routes an answer can take feed it, which is the point: before this
-	// existed, a long answer that broke halfway was recorded as delivered when
-	// the round had a bubble and as dropped when it did not — the same thing
-	// on the user's screen, counted two opposite ways depending on an
-	// implementation detail they cannot see.
-	RecordOutboundTruncated()
 
 	// RecordAttachmentDelivered / RecordAttachmentDropped count FILES, one per
 	// file, while the three above count REPLIES, one per reply. The two units
@@ -182,13 +186,13 @@ func (nopMetrics) RecordConnectFailure()              {}
 func (nopMetrics) RecordAuthFailure()                 {}
 func (nopMetrics) RecordCallbackQueued()              {}
 func (nopMetrics) RecordCallbackQueueBlocked()        {}
+func (nopMetrics) RecordStreamOpened()                {}
 func (nopMetrics) RecordStreamFinished()              {}
 func (nopMetrics) RecordStreamFellBack()              {}
 func (nopMetrics) RecordMediaFailure(string)          {}
 func (nopMetrics) RecordOutboundDelivered()           {}
 func (nopMetrics) RecordOutboundDropped(string)       {}
 func (nopMetrics) RecordOutboundSkipped(string)       {}
-func (nopMetrics) RecordOutboundTruncated()           {}
 func (nopMetrics) RecordAttachmentDelivered()         {}
 func (nopMetrics) RecordAttachmentDropped(string)     {}
 func (nopMetrics) RecordAttachmentDeliveryShed()      {}

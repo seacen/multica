@@ -1,9 +1,9 @@
 package wecom
 
 // replier.go — the WeCom OutboundReplier. Handles the engine's needs_binding
-// / agent_offline / agent_archived / invoke_denied / issue_created outcomes by
-// sending a text message back over the same aibot WebSocket the inbound loop
-// owns (aibot has no REST outbound; every write is on the socket, looked up via
+// / agent_offline / agent_archived / issue_created outcomes by sending a
+// text message back over the same aibot WebSocket the inbound loop owns
+// (aibot has no REST outbound; every write is on the socket, looked up via
 // the sendersRegistry).
 
 import (
@@ -24,10 +24,9 @@ import (
 // defaultBindingPath is where the web app serves the bind page.
 const defaultBindingPath = "/wecom/bind"
 
-// normalizeBindingPath applies the one default. It lived beside the enter_chat
-// greeting until that was withdrawn upstream on product grounds; the binding
-// prompt is now the only thing that builds this URL, and the default stays here
-// so a deployment that configures no path still gets a usable link.
+// normalizeBindingPath applies the one default: the binding prompt is the only
+// thing that builds this URL, and a deployment that configures no path still
+// needs a usable link.
 func normalizeBindingPath(p string) string {
 	if p == "" {
 		return defaultBindingPath
@@ -91,6 +90,14 @@ func NewOutboundReplier(cfg OutboundReplierConfig) *OutboundReplier {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if cfg.Languages == nil {
+		// Not fatal — the deployment language is a usable answer — but it is
+		// the difference between this replier doing its job and quietly doing
+		// main's. A missing wire produces no other symptom: nothing errors,
+		// nothing is empty, every notice just comes out in one language.
+		logger.Warn("wecom replier: no language lookup wired; every notice will use the deployment language " +
+			"whatever the reader's profile says (set OutboundReplierConfig.Languages)")
+	}
 	r := &OutboundReplier{
 		senders:     cfg.Senders,
 		languages:   cfg.Languages,
@@ -137,11 +144,6 @@ func (r *OutboundReplier) Reply(ctx context.Context, inst engine.ResolvedInstall
 			r.logger.WarnContext(ctx, "wecom replier: archived notice failed",
 				"installation_id", util.UUIDToString(inst.ID), "error", err)
 		}
-	case engine.OutcomeInvokeDenied:
-		if err := r.sendInvokeDenied(ctx, inst, msg, c); err != nil {
-			r.logger.WarnContext(ctx, "wecom replier: invoke-denied notice failed",
-				"installation_id", util.UUIDToString(inst.ID), "error", err)
-		}
 	case engine.OutcomeFreshPending:
 		if err := r.post(ctx, inst, msg, c.FreshPending); err != nil {
 			r.logger.WarnContext(ctx, "wecom replier: fresh-start confirmation failed",
@@ -155,6 +157,11 @@ func (r *OutboundReplier) Reply(ctx context.Context, inst engine.ResolvedInstall
 	case engine.OutcomeIssueUsage:
 		if err := r.post(ctx, inst, msg, c.IssueUsage); err != nil {
 			r.logger.WarnContext(ctx, "wecom replier: issue usage reply failed",
+				"installation_id", util.UUIDToString(inst.ID), "error", err)
+		}
+	case engine.OutcomeInvokeDenied:
+		if err := r.sendInvokeDenied(ctx, inst, msg); err != nil {
+			r.logger.WarnContext(ctx, "wecom replier: invoke-denied notice failed",
 				"installation_id", util.UUIDToString(inst.ID), "error", err)
 		}
 	case engine.OutcomeIngested:
@@ -238,18 +245,24 @@ func (r *OutboundReplier) sendBindingPrompt(ctx context.Context, inst engine.Res
 	return nil
 }
 
-// sendInvokeDenied tells a member the agent is not theirs to run. A 1:1 is
-// answered in place. A group trigger is answered in the sender's own 1:1 and
-// not in the room: a line there would show everyone which member was refused
-// and that the agent is someone's private one. That private line reads in the
-// sender's language rather than the room's — they are bound, so they have one.
-func (r *OutboundReplier) sendInvokeDenied(ctx context.Context, inst engine.ResolvedInstallation, msg channel.InboundMessage, c copyPack) error {
+// sendInvokeDenied tells a member the agent is not theirs to run.
+//
+// A 1:1 is answered in place. A GROUP trigger is answered in the sender's own
+// 1:1 and the room hears nothing: a line there would tell everyone present both
+// which member was refused and that the agent is someone's private one. The
+// sender is bound by definition at this point — the identity check is what
+// produced the user id this verdict was read for — so a 1:1 route to them
+// exists.
+//
+// Either way the only reader is the sender, so the sender's own profile picks
+// the language — not the room's, which is what Reply resolved for everything
+// else it says.
+func (r *OutboundReplier) sendInvokeDenied(ctx context.Context, inst engine.ResolvedInstallation, msg channel.InboundMessage) error {
+	text := copyFor(localeFor(ctx, r.languages, inst.ID, chatTypeSingleInt, msg.Source.SenderID)).InvokeDenied
 	if aibotChatTypeFromChannel(msg.Source.ChatType) != chatTypeGroupInt {
-		return r.post(ctx, inst, msg, c.InvokeDenied)
+		return r.post(ctx, inst, msg, text)
 	}
-	sender := msg.Source.SenderID
-	personal := copyFor(localeFor(ctx, r.languages, inst.ID, chatTypeSingleInt, sender))
-	return r.postPrivate(ctx, inst, sender, personal.InvokeDenied)
+	return r.postPrivate(ctx, inst, msg.Source.SenderID, text)
 }
 
 // postPrivate delivers text to a single user's 1:1 chat (chat_type=1),

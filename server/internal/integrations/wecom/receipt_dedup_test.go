@@ -90,14 +90,43 @@ func sendFrames(t *testing.T, conn *recordingConn) int {
 	return n
 }
 
-// dedupChannel is testChannel with the receipt dedup wired, as production
-// wires it (cmd/server/router.go).
+// dedupChannel assigns c.dedup straight onto the struct, which skips both
+// newWecomFactory and router.go. That is fine for driving the state machine
+// below, but it is why this file cannot tell whether production wires the thing
+// at all — TestRegisterWecomCarriesTheDeduperIntoTheChannel goes through the
+// factory, and cmd/server has the one that reads the real boot path.
 func dedupChannel(t *testing.T, d engine.Deduper) *wecomChannel {
 	t.Helper()
 	c := testChannel(func(context.Context, channel.InboundMessage) error { return nil })
 	c.installationID = mustTestUUID(t)
 	c.dedup = d
 	return c
+}
+
+// The factory is what router.go actually calls, and it is where a ChannelDeps
+// field goes missing without anything failing. Driving it here means the copy
+// from deps into the channel cannot silently stop happening.
+func TestRegisterWecomCarriesTheDeduperIntoTheChannel(t *testing.T) {
+	t.Parallel()
+	dedup := newFakeDeduper()
+	factory := newWecomFactory(ChannelDeps{Credentials: fixedCredentials{}, Dedup: dedup})
+
+	ch, err := factory(channel.Config{
+		ID:      mustTestUUID(t),
+		Raw:     []byte(`{"bot_id":"bot-1"}`),
+		Handler: func(context.Context, channel.InboundMessage) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("factory: %v", err)
+	}
+	wc, ok := ch.(*wecomChannel)
+	if !ok {
+		t.Fatalf("factory returned %T, want *wecomChannel", ch)
+	}
+	if wc.dedup == nil {
+		t.Fatal("the factory dropped ChannelDeps.Dedup, so every channel it builds answers a " +
+			"redelivered unreadable message again on each delivery")
+	}
 }
 
 // The user sends one location card. WeCom delivers the callback twice.

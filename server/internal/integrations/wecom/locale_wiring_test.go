@@ -13,19 +13,15 @@ package wecom
 
 import (
 	"context"
-	"log/slog"
-	"net/http"
-	"net/http/httptest"
-	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
 	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
+	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -183,6 +179,36 @@ func TestReplierGroupNoticeReadsTheRoomNotTheMember(t *testing.T) {
 	}
 }
 
+// TestInvokeDeniedFromAGroupReadsTheSendersLanguage — the refusal for a group
+// trigger goes to the sender's own 1:1, never the room, so it is the one group
+// outcome whose reader is a single person. It reads their profile, not the
+// deployment default the room's notices use.
+func TestInvokeDeniedFromAGroupReadsTheSendersLanguage(t *testing.T) {
+	t.Parallel()
+	reg := newSendersRegistry()
+	inst := engine.ResolvedInstallation{ID: mustTestUUID(t)}
+	conn := &recordingConn{}
+	reg.set(inst.ID, conn.autoAck(newWSSender(conn, nil)))
+	r := NewOutboundReplier(OutboundReplierConfig{
+		Senders:   reg,
+		Languages: languagesFor("en"),
+		AppURL:    "https://multica.example",
+	})
+	msg := channel.InboundMessage{Source: channel.Source{
+		ChatID:   "GROUP_CHAT",
+		ChatType: channel.ChatTypeGroup,
+		SenderID: "T-asker",
+	}}
+	r.Reply(context.Background(), inst, msg, engine.Result{Outcome: engine.OutcomeInvokeDenied})
+
+	if got := conn.sendBody(t, 0)["chatid"]; got != "T-asker" {
+		t.Fatalf("refusal went to chatid %v, want the sender's own 1:1 T-asker", got)
+	}
+	if got, want := sentMarkdown(t, conn, 0), copyPacks[LocaleEn].InvokeDenied; got != want {
+		t.Fatalf("refusal = %q, want the sender's language %q", got, want)
+	}
+}
+
 // ---- surface 2: inbox_message.go ----
 
 func TestInboxCardReadsTheRecipientsLanguage(t *testing.T) {
@@ -302,41 +328,58 @@ func TestAttachmentSendFailureNoticeReadsTheDestinationsLanguage(t *testing.T) {
 	}
 }
 
-// ---- surface 4: the media failure notice ----
-
-// TestMediaFailureNoticeReadsTheSendersLanguage drives the whole ingest, not
-// tellTheSender directly: the notice runs after the download has already
-// failed, on a context the caller may well have let expire, and resolving the
-// language is the part of that path most likely to be skipped by accident.
-func TestMediaFailureNoticeReadsTheSendersLanguage(t *testing.T) {
+// The relayed path builds its own attachmentTarget, so "the notice reads the
+// destination's language" has to be true twice. On a multi-replica deployment
+// the relayed one is the common case: chat:done lands wherever the run
+// finished, and only the lease holder can write to the socket.
+//
+// Nothing else differs when this is wrong — the file still fails, the notice
+// still goes out, it is just in the wrong language — so no other test would
+// have caught it.
+func TestRelayedAttachmentFailureNoticeAlsoReadsTheDestinationsLanguage(t *testing.T) {
 	t.Parallel()
-	expired := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
-	}))
-	defer expired.Close()
-
 	for _, tc := range localeCases {
 		t.Run(tc.name, func(t *testing.T) {
-			storage := &fakeMediaStorage{}
-			senders, conn := notifierWithLiveSocket(uuidOf(1))
-			// mediaMessage sends as T-alex in a 1:1, so the notice is
-			// addressed to one person and reads their profile.
-			r := NewMediaResolver(storage, newFakeMediaLedger(storage), senders,
-				fakeLanguages{senderID: "T-alex", userID: localeTestUserID, language: tc.language},
-				testLogger()).(*wecomMediaResolver)
-			r.http = testMediaClient()
-
-			msg := mediaMessage(t, "image", map[string]any{
-				"image": map[string]any{"url": expired.URL, "aeskey": testAESKey},
+			q := oneAttachmentQueries(t, db.Attachment{
+				ID: mustTestUUID(t), Filename: "big.bin", Url: "https://cdn.example/obj/bin",
 			})
-			r.ResolveMedia(context.Background(), mediaInstallation(), engine.ResolvedIdentity{}, uuidOf(6), uuidOf(5), msg)
+			// A 1:1, where the bound chatid IS the reader's userid.
+			q.sessionBinding.ChannelChatID = "T-asker"
+			q.sessionBinding.ChatType = string(channel.ChatTypeP2P)
+			q.userLanguage = tc.language
+			q.userBindingID = localeTestUserID
 
-			if got, want := sentMarkdown(t, conn, 0), copyPacks[tc.locale].MediaUnreadable; got != want {
-				t.Fatalf("failure notice = %q, want the %s copy %q", got, tc.locale, want)
+			o, instID, conn := newOutboundWithMedia(t, q, &fakeObjectStore{key: "obj/bin", data: []byte("DATA")})
+			q.sessionBinding.InstallationID = instID
+			q.installation.ID = instID
+			conn.refuse[cmdUploadMediaInit] = 40058 // the server will not take the file
+
+			if res := o.deliverRelayed(context.Background(), relayFrame{
+				Kind:           relayKindReply,
+				InstallationID: util.UUIDToString(instID),
+				ChatID:         "T-asker",
+				ChatType:       chatTypeSingleInt,
+				Content:        "See the attached dump.",
+				MessageID:      testMessageID,
+				WorkspaceID:    testWorkspaceID,
+				SessionID:      testSessionID,
+				TaskID:         testTaskID,
+				CarriesFiles:   true,
+			}); res.outcome != outcomeDone {
+				t.Fatalf("outcome = %v, want outcomeDone", res.outcome)
+			}
+
+			got := markdownSends(t, conn)
+			want := copyPacks[tc.locale].MediaSendFailed
+			if len(got) == 0 || got[len(got)-1] != want {
+				t.Fatalf("sends = %q, want the %s failure notice %q last — a relayed reply reaches the "+
+					"same reader as a direct one", got, tc.locale, want)
 			}
 		})
 	}
 }
+
+// ---- surface 4: the media failure notice ----
 
 // ---- surface 5: the streaming bubble ----
 
@@ -369,27 +412,6 @@ func TestTheBubbleClosesInTheAskersLanguage(t *testing.T) {
 }
 
 // ---- surface 6: the read loop's own receipt ----
-
-func TestUnreadableKindReceiptReadsTheSendersLanguage(t *testing.T) {
-	t.Parallel()
-	for _, tc := range localeCases {
-		t.Run(tc.name, func(t *testing.T) {
-			c := testChannel(func(context.Context, channel.InboundMessage) error { return nil })
-			c.installationID = mustTestUUID(t)
-			c.languages = fakeLanguages{senderID: "USER_A", userID: localeTestUserID, language: tc.language}
-			conn := &recordingConn{}
-			// A location card: a kind this adapter cannot read at all.
-			err := c.dispatchFrame(context.Background(), msgCallbackFrame(t, "location", ""),
-				conn.autoAck(newWSSender(conn, nil)), slog.Default())
-			if err != nil {
-				t.Fatalf("dispatchFrame: %v", err)
-			}
-			if got, want := sentMarkdown(t, conn, 0), copyPacks[tc.locale].UnsupportedMsgType; got != want {
-				t.Fatalf("receipt = %q, want the %s copy %q", got, tc.locale, want)
-			}
-		})
-	}
-}
 
 // ---- the deployment knob ----
 
@@ -475,194 +497,3 @@ func TestDeploymentLocaleMovesTheCopyNobodyHasAProfileFor(t *testing.T) {
 }
 
 // ---- the compatibility pin ----
-
-// TestZhHansPackIsTheCopyThatAlreadyShipped is the guard on the one promise
-// this change makes to the tenants already running the bot: nothing a Chinese
-// reader sees changes. Every other test in this file reads its expected text
-// off the pack, which proves the SURFACE consults the pack and proves nothing
-// at all about what the pack says — edit a zh-Hans string and they all still
-// pass. So the wording is spelled out once, here: the lines that predate the
-// pack against the literals their call sites carried, and the bubble's own
-// lines, which are new, so that changing one is a deliberate edit here rather
-// than a silent one in the pack.
-//
-// It walks the struct rather than checking a handful of fields, so a copy
-// string added later without a line in the table fails here instead of
-// shipping unreviewed. That makes the table the place a zh-Hans wording change
-// has to be argued for, which is the point.
-func TestZhHansPackIsTheCopyThatAlreadyShipped(t *testing.T) {
-	t.Parallel()
-
-	want := map[string]string{
-		"AgentOffline":         "⚠️ 智能体当前不在线，你的消息已收到，等它上线后会处理。",
-		"AgentArchived":        "⚠️ 该智能体已归档，无法回复。请联系工作区管理员。",
-		"UnsupportedMsgType":   "抱歉，我暂时无法处理这类消息。",
-		"BindingPromptPrefix":  "👋 请先绑定你的 Multica 账号，才能与我对话：\n",
-		"BindingPromptSuffix":  "\n（链接 15 分钟内有效）",
-		"BindingPending":       "👋 绑定链接刚才已经发给你了，就在上方，请直接点击完成绑定。",
-		"BindingSentPrivately": "👋 已把绑定链接私发给你，请在与我的单聊里点击完成绑定。",
-		"IssueCreatedPrefix":   "✅ 已创建 ",
-		"IssueTitleSeparator":  " — ",
-		"IssueDuplicatePrefix": "⚠️ 未创建 —— 已存在进行中的 ",
-		"StreamNoReply":        "（这轮没有需要回复的内容）",
-		"StreamMerged":         "✅ 这条已并入上一条回复一起处理了。",
-		"StreamNotStarted":     "已收到，但这条暂时没能开始处理。",
-		"StreamFailed":         "⚠️ 这次没跑通，请稍后再试一次。",
-		"StreamCancelled":      "⏹️ 这次处理已取消。",
-		"StreamContinued":      "处理时间较长，接下一条",
-		"StreamStuck":          "⚠️ 上面那条进度不会再更新了，这轮的结果我用新消息发你。",
-		"StreamProgressPrefix": "正在处理：",
-		"InboxDetailLink":      "查看详情",
-		"InboxTypeFallback":    "新消息",
-
-		"MediaTooLarge":   "抱歉，附件太大了，我这边收不下。",
-		"MediaUnreadable": "抱歉，有附件没能收到，麻烦重新发一次。",
-		"MediaSendFailed": "⚠️ 有文件没能发出来，我这边保留着，需要的话我再试一次。",
-		// New with the three-way delivery state (#6604). MediaSendFailed keeps
-		// its wording and its meaning narrows to what definitely did not
-		// arrive; these two cover the cases it used to be misapplied to.
-		"MediaSendUnknown":  "⚠️ 有文件我没收到企业微信的送达回执，可能已经发到了、也可能没有。我不会自动重发，免得发重了；你那边没看到的话说一声，我再发一次。",
-		"MediaLookupFailed": "⚠️ 我这边没查到这条回答带没带文件，所以要是有，这次没发出来。需要的话我再试一次。",
-
-		// Widened deliberately (#6608): media routing (#6605) made typed
-		// messages and videos routable, and the sentence had stopped naming
-		// what the bot takes.
-		// TestTheBoundGreetingNamesEveryKindTheBotActuallyRoutes is what ties
-		// it to ownText; this line is where the wording change is argued for.
-
-		"StreamNoReplyWithFiles": "（这轮没有文字回复，附件在下面）",
-
-		// Arrived from upstream as package constants in replier.go and were
-		// folded into the pack on the way in, so the text is upstream's,
-		// unchanged. FreshPending was reworded upstream when #7468 split
-		// /fresh into /clear and /new: /clear now stays in the conversation
-		// it is already in, and ChatStarted is the answer to /new. Answering
-		// a /clear with the old "started a new conversation" line sends the
-		// reader looking for a thread that never moved.
-		"FreshPending": "✅ 已准备从空上下文运行。你的下一条聊天消息仍会进入当前对话，但不会带上之前的上下文。",
-		"ChatStarted":  "✅ 已新建 Multica 对话。你的下一条消息会进入该对话。",
-		"IssueUsage":   "请填写任务标题，格式如下：\n\n`/issue <标题>`\n`[描述]`（可选）",
-
-		// New with the channel invoke gate. Worded after the web setting it
-		// answers to, 谁可以运行该智能体, so the member can find it.
-		"InvokeDenied": "⚠️ 你没有权限运行该智能体。如需使用，请联系它的所有者。",
-	}
-	wantLabels := map[string]string{
-		"issue_assigned":     "任务指派",
-		"mentioned":          "提及你",
-		"status_changed":     "状态变更",
-		"comment_added":      "新评论",
-		"new_comment":        "新评论",
-		"reaction_added":     "表情反应",
-		"task_failed":        "任务失败",
-		"unassigned":         "取消指派",
-		"assignee_changed":   "指派人变更",
-		"priority_changed":   "优先级变更",
-		"due_date_changed":   "截止日期变更",
-		"start_date_changed": "开始日期变更",
-	}
-
-	// Both packs print the token's life in words. The number is real config,
-	// so pin the pair: change the TTL and this says so rather than letting the
-	// prompt promise fifteen minutes for a link that expires in five.
-	if BindingTokenTTL != 15*time.Minute {
-		t.Errorf("BindingTokenTTL = %s, but both binding prompts spell \"15 minutes\"; update the copy or the constant", BindingTokenTTL)
-	}
-
-	zh := reflect.ValueOf(copyPacks[LocaleZhHans])
-	typ := zh.Type()
-	for i := range typ.NumField() {
-		name := typ.Field(i).Name
-		switch typ.Field(i).Type.Kind() {
-		case reflect.String:
-			expected, listed := want[name]
-			if !listed {
-				t.Errorf("copyPack.%s is a reader-visible string with no line in this table; add the text it shipped with", name)
-				continue
-			}
-			if got := zh.Field(i).String(); got != expected {
-				t.Errorf("zh-Hans %s = %q, want %q — a Chinese tenant reads this, so change it deliberately or not at all", name, got, expected)
-			}
-			delete(want, name)
-		case reflect.Map:
-			if name != "InboxTypeLabels" {
-				t.Errorf("copyPack.%s is a map this test does not know how to pin", name)
-				continue
-			}
-			got, _ := zh.Field(i).Interface().(map[string]string)
-			for key, expected := range wantLabels {
-				if got[key] != expected {
-					t.Errorf("zh-Hans label %q = %q, want %q", key, got[key], expected)
-				}
-			}
-			for key := range got {
-				if _, listed := wantLabels[key]; !listed {
-					t.Errorf("zh-Hans carries an extra label %q; add it here with the text it shipped with", key)
-				}
-			}
-		case reflect.Struct:
-			if name != "Progress" {
-				t.Errorf("copyPack.%s is a nested struct this test does not know how to pin", name)
-				continue
-			}
-			pinProgressCopy(t, zh.Field(i))
-		default:
-			t.Errorf("copyPack.%s has kind %s, which this test does not pin", name, typ.Field(i).Type.Kind())
-		}
-	}
-	for name := range want {
-		t.Errorf("this table pins copyPack.%s, which no longer exists", name)
-	}
-}
-
-// pinProgressCopy is the same table for the step lines inside the bubble.
-// They are new copy rather than something that already shipped, so what this
-// pins is that a change to any of them is made here, deliberately, and not
-// slipped into the pack — and that every line keeps the verb count its format
-// string needs, which is the half a reviewer cannot see by reading.
-func pinProgressCopy(t *testing.T, v reflect.Value) {
-	t.Helper()
-	want := map[string]string{
-		"Read":         "正在读取 %s",
-		"ReadPlain":    "正在读取文件",
-		"Edit":         "正在修改 %s",
-		"EditPlain":    "正在修改文件",
-		"Command":      "正在执行命令",
-		"CommandNamed": "正在执行 %s",
-		"Search":       "正在检索代码",
-		"SearchNamed":  "正在检索 %s",
-		"Web":          "正在查资料",
-		"WebNamed":     "正在查 %s",
-		"Subtask":      "正在派子任务",
-		"SubtaskNamed": "正在派子任务：%s",
-		"Plan":         "正在梳理计划",
-		"PlanNamed":    "正在梳理计划：%s",
-		"Service":      "正在调用 %s · %s",
-		"ServiceArgs":  "正在调用 %s · %s：%s",
-		"Skill":        "正在启用技能 %s",
-		"SkillPlain":   "正在启用技能",
-		"Tool":         "正在使用 %s",
-		"ToolArgs":     "正在使用 %s：%s",
-		"Fallback":     "正在处理",
-		"Failed":       "上一步出错了，正在继续",
-		"FailedNamed":  "上一步出错了：%s，正在继续",
-		"Thinking":     "思考：",
-		"Elapsed":      "已用时 %s",
-	}
-	typ := v.Type()
-	for i := range typ.NumField() {
-		name := typ.Field(i).Name
-		expected, listed := want[name]
-		if !listed {
-			t.Errorf("progressCopy.%s is a reader-visible string with no line in this table", name)
-			continue
-		}
-		if got := v.Field(i).String(); got != expected {
-			t.Errorf("zh-Hans progress %s = %q, want %q", name, got, expected)
-		}
-		delete(want, name)
-	}
-	for name := range want {
-		t.Errorf("this table pins progressCopy.%s, which no longer exists", name)
-	}
-}

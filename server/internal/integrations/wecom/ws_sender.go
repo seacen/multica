@@ -83,6 +83,13 @@ type wsSender struct {
 	ackMu   sync.Mutex
 	replies map[string]*replyWaiter
 
+	// quota holds this connection's aibot_send_msg allowance, per target chat,
+	// and retryBackoff is what a throttled push waits before its one retry.
+	// One quota per socket is the whole accounting — see rate_limit.go for why
+	// that is the right scope and where the numbers come from.
+	quota        *sendQuota
+	retryBackoff time.Duration
+
 	// waiters holds the STREAM frames whose verdict somebody is standing by
 	// for, keyed by the callback req_id the frame echoes. Separate from
 	// replies because the two answer different questions and their keys come
@@ -102,13 +109,6 @@ type wsSender struct {
 	// standing still for five seconds.
 	ackTimeout time.Duration
 
-	// quota holds this connection's aibot_send_msg allowance, per target chat,
-	// and retryBackoff is what a throttled push waits before its one retry.
-	// One quota per socket is the whole accounting — see rate_limit.go for why
-	// that is the right scope and where the numbers come from.
-	quota        *sendQuota
-	retryBackoff time.Duration
-
 	// seq numbers outbound frames in the order they reach the socket.
 	// Guarded by the writer slot (wmu), which is the point at which the ping
 	// loop, agent replies, inbox pushes and stream frames become ordered — so
@@ -117,7 +117,137 @@ type wsSender struct {
 	// echoes the server's req_id and that may be empty or repeated. It never
 	// goes on the wire.
 	seq uint64
+
+	// chats serializes whole logical messages per target chat. mu orders one
+	// frame write; it is released before the ack wait, which is where an
+	// unrelated send used to land between two pieces of one answer.
+	//
+	// EVERY push the reader sees takes it: text through sendTextCtx and files
+	// through sendMedia. Half of that is no rule at all — a picture between
+	// "(1/3)" and "(2/3)" is the same unreadable chat as a stray sentence
+	// there, and attachment delivery is spawned alongside the answer it came
+	// with, so the two are concurrent by construction rather than by
+	// coincidence. What it does NOT cover is the upload: that puts nothing in
+	// the chat, and holding the chat's turn for a multi-megabyte transfer
+	// would queue every other message behind bytes that have not yet become a
+	// message.
+	chats chatLocks
 }
+
+// chatLocks is one lock per target chat, created on demand and dropped when
+// the last holder leaves, so a process that has talked to many chats does not
+// keep an entry for each of them forever.
+//
+// Per CHAT rather than per connection on purpose: a second answer to a
+// different room has no reason to queue behind this one, and the ping loop
+// writes through request/write and never takes a chat lock at all, so it
+// cannot be held up by a send.
+type chatLocks struct {
+	mu    sync.Mutex
+	locks map[string]*chatLock
+}
+
+type chatLock struct {
+	// ch is a mutex that can be waited on with a context: capacity one, a
+	// token in it means held.
+	ch   chan struct{}
+	refs int
+}
+
+// acquire blocks until this chat is free or ctx ends. The returned release is
+// nil when it returns an error.
+//
+// The wait is bounded by whoever holds it: a holder is inside at most one
+// ackTimeout per piece, and the pieces of one answer are few. A caller on
+// context.Background therefore waits rather than interleaving, which is the
+// whole point — the alternative is the reader seeing an unrelated message
+// wedged into the middle of an answer.
+func (c *chatLocks) acquire(ctx context.Context, chatID string) (func(), error) {
+	c.mu.Lock()
+	if c.locks == nil {
+		c.locks = make(map[string]*chatLock)
+	}
+	l := c.locks[chatID]
+	if l == nil {
+		l = &chatLock{ch: make(chan struct{}, 1)}
+		c.locks[chatID] = l
+	}
+	l.refs++
+	c.mu.Unlock()
+
+	release := func() {
+		<-l.ch
+		c.mu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(c.locks, chatID)
+		}
+		c.mu.Unlock()
+	}
+	drop := func() {
+		c.mu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(c.locks, chatID)
+		}
+		c.mu.Unlock()
+	}
+
+	// A free chat is taken without consulting the context at all. select picks
+	// at RANDOM among ready cases, so a caller whose context is already dead
+	// arriving at a chat nobody holds would otherwise be turned away half the
+	// time for a chat nobody was using.
+	//
+	// It also keeps errChatBusy honest: it is returned only when the chat
+	// really was somebody else's and the wait ran out. What the caller gets
+	// instead is request's pre-write check, which is the same fact under a
+	// different name — both wrap errNotAttempted, so the classifiers cannot
+	// tell them apart and do not need to.
+	select {
+	case l.ch <- struct{}{}:
+		return release, nil
+	default:
+	}
+	select {
+	case l.ch <- struct{}{}:
+		return release, nil
+	case <-ctx.Done():
+		drop()
+		return nil, fmt.Errorf("%w: %w", errChatBusy, ctx.Err())
+	}
+}
+
+// errNotAttempted marks a send that ended BEFORE any byte could leave this
+// process. It is the one mark on this path that means "certainly not
+// delivered", and it is the only thing the three classifiers have to test for
+// — provablyNotSent (relay_outbound.go), unconfirmedReason (outbound_outcome.go)
+// and sendOutcome (outbound_media.go).
+//
+// It exists because the bare ctx.Err() these paths used to return said the
+// opposite. Every classifier reads a context error as "the frame may be in
+// front of the person already" — the right reading for a context that ended
+// while waiting for a VERDICT (errAckAbandoned), and the exact inversion of
+// one that ended before the write. So the direct path filed a message it had
+// never sent as "outcome unknown", which is the one outcome nobody may resend;
+// the relay settled its claim and stopped offering it; and the media path told
+// the user their file might have arrived. The user got nothing and the party
+// whose job is to try again was told not to.
+//
+// Every not-attempted failure WRAPS this rather than carrying its own
+// unrelated sentinel, so the classifiers ask one question instead of keeping a
+// list in step with this file. Two failures wrap it today: the chat lock's
+// wait running out (errChatBusy) and request's pre-write check.
+//
+// Each of those also wraps ctx.Err(), because the cause is worth having in a
+// log line. That is why every classifier has to test for this AHEAD of its
+// generic context branch — errors.Is finds context.Canceled in here too.
+var errNotAttempted = errors.New("wecom: nothing was written")
+
+// errChatBusy — the wait for this chat's turn ended before the turn came, and
+// NOT ONE BYTE went anywhere. The lock is taken before a frame is built, so
+// this and request's pre-write check are the two failures on the send path
+// that are provably non-deliveries.
+var errChatBusy = fmt.Errorf("%w; the wait for this chat's turn ended first", errNotAttempted)
 
 func newWSSender(conn wsConn, log *slog.Logger) *wsSender {
 	if log == nil {
@@ -139,10 +269,9 @@ func newWSSender(conn wsConn, log *slog.Logger) *wsSender {
 // lockWriter takes the writer, or gives up when ctx does. A caller with no
 // deadline of its own — the ping, the subscribe handshake, a proactive push —
 // passes context.Background() and waits as long as it takes.
-// tryLockWriter takes the writer slot if it is free, and says so. Only a probe
-// wants this: main's trace test asserts "am I the one holding the writer" with
-// sync.Mutex.TryLock, and the writer here is a one-slot channel instead, so the
-// question needs a spelling of its own.
+// tryLockWriter takes the writer if it is free, without waiting. It exists for
+// the same reason sync.Mutex.TryLock does: a probe that needs to know whether
+// somebody else is inside, and must not queue behind them to find out.
 func (s *wsSender) tryLockWriter() bool {
 	select {
 	case s.wmu <- struct{}{}:
@@ -219,10 +348,30 @@ var (
 // the wire — see streamAcks for why a verdict has to be matched rather than
 // simply handed to whoever is waiting.
 type ackWaiter struct {
-	ch   chan ackResult
-	seq  uint64        // 0 until the frame is written
-	done chan struct{} // closed once the waiter has left the table, by verdict or by cancel
-	once sync.Once
+	ch  chan ackResult
+	seq uint64 // 0 until the frame is written
+	// addressable says every frame written before this one on the same req_id
+	// had already been answered when this one went out — which is what makes
+	// the position of an arriving verdict identify the frame it belongs to.
+	//
+	// awaitAck is what keeps it true, by not letting a frame out while the
+	// server still owes one. This flag is the assertion of that invariant at
+	// the point it is relied on: if it is ever false, something wrote past the
+	// gate and no verdict on this req_id may be trusted by position.
+	addressable bool
+	// rewrite marks the one frame the gate lets past an outstanding debt: the
+	// SAME closing frame written again. It is what makes such a frame
+	// addressable despite the debt — and the two are one decision, not two.
+	// Letting the frame out while refusing to match its verdict is strictly
+	// worse than refusing it outright: seal then reads errStreamAckTimeout in
+	// place of the refusal the server actually sent, and a refusal is the only
+	// signal that routes the answer to the plain message. Measured on
+	// 2026-09-03 (STRATEGY §6.5): six identical rewrites of a sealed stream all
+	// returned errcode 0, so whichever identical write a verdict belongs to it
+	// reports the same outcome — the same fact that justifies letting it out.
+	rewrite bool
+	done    chan struct{} // closed once the waiter has left the table, by verdict or by cancel
+	once    sync.Once
 }
 
 func newAckWaiter() *ackWaiter {
@@ -246,13 +395,13 @@ type ackResult struct {
 // The ack frame carries nothing but the req_id — no stream id, no sequence —
 // so a verdict is only identifiable by its position.
 //
-// MEASURED 2026-09-02 against the live bot (STRATEGY §6.4): with several
-// frames of one req_id in flight, acks do NOT come back in write order — 24
-// frames written back-to-back were answered grouped by outcome, and eleven of
-// twelve concurrent refreshes to one stream were refused with errcode 6000
-// ("data version conflict"). So position matching is only sound while AT MOST
-// ONE frame of a req_id is on the wire, and that is the rule awaitAck now
-// enforces for closing frames as well as refreshes.
+// MEASURED 2026-09-02 against the live bot: with several frames of one req_id
+// in flight, acks do NOT come back in write order — 24 frames written
+// back-to-back were answered grouped by outcome, and eleven of twelve
+// concurrent refreshes to one stream were refused with errcode 6000 ("data
+// version conflict"). So position matching is only sound while AT MOST ONE
+// frame of a req_id is on the wire, and that is the rule awaitAck now enforces
+// for closing frames as well as refreshes.
 //
 // The count still matters under that rule, for the one ordering that remains:
 // a frame whose caller gave up (cancelAck) may still be answered later, and
@@ -263,11 +412,11 @@ type ackResult struct {
 //
 // sealed is the other half: a finished stream is immutable, so a frame that
 // lost the race to the answer must never reach the wire behind it. It is kept
-// PER STREAM ID, not per req_id, because one req_id carries more than one
-// stream over a long run: the guard seals the stream that is about to expire
-// and opens a fresh one on the same req_id (streamStore.rotate), and the
-// refreshes that follow are addressed to the new stream. A seal keyed by
-// req_id would refuse every one of them as a straggler of the old one.
+// PER STREAM ID, not per req_id, so a frame is refused only as a straggler of
+// the stream it actually names. Nothing on this path puts a second stream on
+// one req_id today — a round opens one bubble and one ending seals it — and
+// keying the seal by req_id would be the wrong shape the moment one does,
+// refusing every frame of the new stream as a straggler of the old.
 //
 // acked counts verdicts that arrived and only those. Nothing ever advances it
 // on a caller's behalf — see cancelAck for why a write-off is worse than a
@@ -321,7 +470,6 @@ type replyResult struct {
 // reports whether anybody was. The read loop calls it for every frame that
 // answers one of our writes; an unclaimed ack is not an error, since the
 // pushes that do not wait share this connection.
-//
 // Order matters: a request waiting on the body is asked first, because those
 // req_ids are ours and a stream's are the server's — one lookup settles which
 // kind of answer this is without the frame having to say. A stream ack that
@@ -356,7 +504,7 @@ func (s *wsSender) deliverAck(reqID string, code int, msg string) {
 	}
 	st.acked++
 	w, ok := s.waiters[reqID]
-	if ok && w.seq == st.acked {
+	if ok && w.addressable && w.seq == st.acked {
 		delete(s.waiters, reqID)
 	} else {
 		ok = false
@@ -382,12 +530,38 @@ func (s *wsSender) deliverAck(reqID string, code int, msg string) {
 // the live probe showed to be lethal: two frames on the wire are answered in
 // whatever order the server likes and the second is refused with 6000 for
 // colliding with the first, so a refused answer could read as delivered.
-func (s *wsSender) awaitAck(ctx context.Context, reqID string, finish bool) (*ackWaiter, error) {
+// A FRAME GOES OUT ONLY WHEN THE SERVER OWES NOTHING ON THIS req_id. Two
+// things have to be true, and only one of them used to be checked.
+//
+// Nobody is waiting — the old condition — keeps two callers from reading each
+// other's verdict. It is not enough on its own, because a caller that GIVES UP
+// leaves the table empty while the server still owes that frame an answer: the
+// next frame is then written with two verdicts outstanding, and an ack carries
+// only req_id, so which frame an arriving one belongs to is decided by
+// position. Position is a guess the moment there is more than one.
+//
+// It is not a safe guess here. Acks come back grouped by outcome rather than in
+// write order — twenty-four frames back-to-back answered as eleven, then
+// twelve, then one (STRATEGY §6.4) — so the closing frame's own refusal can
+// land before the abandoned opener's late acceptance. Matching by position
+// then drops the refusal and hands the acceptance to the closing frame, which
+// reports the answer as delivered and never falls back. Nobody receives it.
+//
+// So the second condition: every frame already written has been answered. An
+// abandoned frame still blocks, until its verdict arrives or the caller's own
+// budget ends — and a caller that runs out gets errStreamBusy or its context
+// error, both of which leave the answer to the plain-message path rather than
+// to a guess.
+func (s *wsSender) awaitAck(ctx context.Context, reqID string, finish, rewrite bool) (*ackWaiter, error) {
+	waitStart := time.Now()
 	for {
 		s.ackMu.Lock()
 		prev, taken := s.waiters[reqID]
-		if !taken {
+		st, tracked := s.streams[reqID]
+		owed := tracked && st.acked < st.sent && !rewrite
+		if !taken && !owed {
 			w := newAckWaiter()
+			w.rewrite = rewrite
 			s.waiters[reqID] = w
 			s.ackMu.Unlock()
 			return w, nil
@@ -396,13 +570,39 @@ func (s *wsSender) awaitAck(ctx context.Context, reqID string, finish bool) (*ac
 		if !finish {
 			return nil, errStreamBusy
 		}
+		if taken {
+			select {
+			case <-prev.done:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			continue
+		}
+		// Owed but unwaited: the abandoned frame's verdict is in flight and
+		// nothing signals its arrival, so this is the one place a short poll
+		// is the honest mechanism.
+		//
+		// Bounded, and deliberately not by the caller's whole budget. A
+		// verdict that has not come back within one ack wait is not coming,
+		// and spending the rest of the budget here costs the plain message
+		// that is the answer's remaining route. Giving up returns
+		// errStreamBusy, which is provably-not-sent: nothing was written, so
+		// the fallback is free to send the answer exactly once.
+		if time.Since(waitStart) > ackTimeout {
+			return nil, errStreamBusy
+		}
 		select {
-		case <-prev.done:
+		case <-time.After(ackOwedPoll):
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
 	}
 }
+
+// ackOwedPoll is how often awaitAck re-checks whether an abandoned frame's
+// verdict has landed. Short enough not to add a perceptible pause to the one
+// turn in which it happens, long enough not to spin.
+const ackOwedPoll = 10 * time.Millisecond
 
 // cancelAck retires a waiter whose caller has stopped waiting, for either of
 // the two reasons a caller stops: its own budget ran out, or the full ack
@@ -445,19 +645,24 @@ func (s *wsSender) beginStreamFrameLocked(reqID, streamID string, w *ackWaiter, 
 	if st.isSealed(streamID) && !finish {
 		return false
 	}
+	// Read before the increment: every earlier frame answered means acked has
+	// caught up with sent.
+	clean := st.acked == st.sent
 	st.sent++
 	if finish {
 		st.seal(streamID)
 	}
 	if w != nil {
 		w.seq = st.sent
+		w.addressable = clean || w.rewrite
 	}
 	return true
 }
 
 // abortStreamFrameLocked gives back the place reserved for a frame that never
 // reached the socket, so one failed write does not put every later verdict on
-// this req_id out of step. The seal is not given back: a turn whose closing
+// this req_id out of step. Establishing that it never reached the socket is
+// the caller's job — see the errWriteAttempted check at the one call site. The seal is not given back: a turn whose closing
 // frame failed is over either way, and the caller has already fallen back to a
 // plain message. Caller holds the writer.
 func (s *wsSender) abortStreamFrameLocked(reqID string) {
@@ -478,12 +683,44 @@ func (s *wsSender) pruneStreamsLocked() {
 	}
 	now := time.Now()
 	for k, st := range s.streams {
-		if len(st.sealed) > 0 && now.Sub(st.at) > streamMaxAge {
+		// SETTLED, NOT SEALED, IS THE CONDITION. Requiring a seal kept the
+		// counters of every turn whose closing frame never went out — the gate
+		// refused it while a verdict was owed, or the answer fell back — for
+		// the life of the connection, and after the seal/fallback rules those
+		// are not rare.
+		//
+		// What actually has to be true is that no verdict is still coming for
+		// this req_id: with acked == sent the server owes nothing, so nothing
+		// can arrive later to be matched against counters that have been
+		// reset. An entry still owed one stays, however old, because that is
+		// the misattribution the sequence numbers exist to prevent.
+		//
+		// Age is not sufficient on its own, and it is worth saying why the
+		// shorter argument fails: a req_id outlives its stream. The platform
+		// ends a STREAM at ten minutes (doc 101463) but a new stream id on the
+		// same req_id is accepted — measured 2026-08-09, STRATEGY §6.1 — so
+		// "there will be no next frame" is not something age can establish.
+		if st.acked >= st.sent && now.Sub(st.at) > streamMaxAge {
+			delete(s.streams, k)
+			continue
+		}
+		// The other way an entry stops protecting anything: cancelAck leaves a
+		// debt on purpose, so a turn whose verdict never comes is never
+		// settled and would be kept for the life of the connection.
+		//
+		// What retires it is not age by itself — a req_id outlives its stream,
+		// and a new stream id on the same req_id is accepted (measured
+		// 2026-08-09, STRATEGY §6.1). It is OUR OWN reach that ends: the round
+		// store evicts a handle at streamMaxAge, so past that nothing can
+		// hand seal a handle for this req_id, and a closer already holding one
+		// is bounded by streamCloseTimeout. Past both, no frame can be written
+		// here again and the counters guard nothing.
+		if now.Sub(st.at) > streamMaxAge+streamCloseTimeout {
 			delete(s.streams, k)
 		}
 	}
-	// Whatever is left is either sealed and young, or still open. Neither may
-	// be thrown away. A live turn whose counters are gone has its next frame
+	// Whatever is left is young, which means it may still be a live turn.
+	// Those may not be thrown away. A live turn whose counters are gone has its next frame
 	// stamped from zero: a stale verdict for an earlier frame then matches the
 	// closing one, the refusal that closing frame actually got is never seen,
 	// and the answer is reported delivered while it went nowhere — the exact
@@ -557,16 +794,16 @@ func (s *wsSender) deliverReply(env frameEnvelope) bool {
 // answer. A non-nil error is either a *wecomAPIError carrying the server's
 // errcode, errAckTimeout, or a transport failure.
 func (s *wsSender) request(ctx context.Context, cmd string, body map[string]any) (json.RawMessage, error) {
-	return s.requestWithID(ctx, newReqID(), cmd, body)
-}
-
-// requestWithID is request() for a frame whose req_id is not ours to choose —
-// a reply, which must echo the req_id of the frame that opened the turn or the
-// server refuses it. The enter_chat greeting is the caller today.
-func (s *wsSender) requestWithID(ctx context.Context, reqID, cmd string, body map[string]any) (json.RawMessage, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		// Marked, for the same reason the wait below is marked and the
+		// opposite fact. Nothing has been minted, registered or built at this
+		// point, so this is proof the peer saw nothing — and a bare ctx.Err()
+		// here is indistinguishable from the one twenty lines down, which
+		// proves the opposite. A caller that cannot tell them apart has to
+		// read both the same way, and either reading is wrong for one of them.
+		return nil, fmt.Errorf("%w: %w", errNotAttempted, err)
 	}
+	reqID := newReqID()
 	w, ok := s.awaitReply(reqID)
 	if !ok {
 		return nil, fmt.Errorf("wecom: %s req_id %s is already awaiting a response", cmd, reqID)
@@ -613,6 +850,25 @@ func (s *wsSender) requestWithID(ctx context.Context, reqID, cmd string, body ma
 // (846605). streamID is ours — reuse it to replace the bubble's body, and set
 // finish once the content is final.
 func (s *wsSender) respondStream(ctx context.Context, reqID, streamID, content string, finish bool) error {
+	return s.respondStreamFrame(ctx, reqID, streamID, content, finish, false)
+}
+
+// respondStreamRewrite writes a frame this sender has already written once —
+// seal's retry of a closing frame whose verdict never came back.
+//
+// It is the one write allowed past the owed-verdict gate, and safely so: an
+// identical frame is not a second frame. Re-writing a sealed stream was
+// measured against the live tenant on 2026-09-03 — six frames onto an
+// already-sealed stream, same content and different, all errcode 0
+// (STRATEGY §6.5) — so whichever of the identical writes a verdict belongs to,
+// it reports the same outcome. Blocking the retry instead would leave a
+// written frame unanswered and the answer resent as a plain message, which is
+// the duplicate this whole path exists to avoid.
+func (s *wsSender) respondStreamRewrite(ctx context.Context, reqID, streamID, content string, finish bool) error {
+	return s.respondStreamFrame(ctx, reqID, streamID, content, finish, true)
+}
+
+func (s *wsSender) respondStreamFrame(ctx context.Context, reqID, streamID, content string, finish, rewrite bool) error {
 	if reqID == "" {
 		return errors.New("wecom: stream frame requires the callback req_id")
 	}
@@ -624,7 +880,7 @@ func (s *wsSender) respondStream(ctx context.Context, reqID, streamID, content s
 		return err
 	}
 
-	w, err := s.awaitAck(ctx, reqID, finish)
+	w, err := s.awaitAck(ctx, reqID, finish, rewrite)
 	if err != nil {
 		return err
 	}
@@ -701,7 +957,16 @@ func (s *wsSender) writeStreamFrame(ctx context.Context, reqID, streamID string,
 		return errStreamSuperseded
 	}
 	if err := s.writeLocked(ctx, payload, t); err != nil {
-		s.abortStreamFrameLocked(reqID)
+		// Only a frame that provably never reached the socket gives its place
+		// back. errWriteAttempted means WriteMessage was entered, so the peer
+		// may have taken the bytes and may yet answer them; handing the place
+		// back would let that verdict settle the NEXT frame — the exact
+		// misattribution the counters exist to prevent. The cost of keeping
+		// the place is a debt the owed gate makes visible, which is the
+		// recoverable side of the trade.
+		if !errors.Is(err, errWriteAttempted) {
+			s.abortStreamFrameLocked(reqID)
+		}
 		return err
 	}
 	return nil
@@ -765,15 +1030,16 @@ var errWriteAttempted = errors.New("wecom: frame write attempted")
 // than replacing it, so every errors.Is(err, context.Canceled) reader keeps
 // working and the outcome still files as "interrupted".
 //
-// It exists because request returns ctx.Err() from two places that mean
+// It exists because request raises a context error in two places that mean
 // opposite things — the check ahead of the write, where nothing left this
-// process, and the wait after it, where the peer may already hold the frame.
-// Until this mark, the two differed only in the line that raised them, which
-// is not something a caller can see. A caller weighing a cancellation against
-// another outcome it already holds then has to read every cancellation the
-// same way, and either one of those readings is wrong. sendMsgFrame is that
-// caller: it holds a refusal WeCom stated for a first frame, and must not let
-// it speak for a second one that is already on the wire.
+// process (errNotAttempted), and the wait after it, where the peer may already
+// hold the frame. Until the two marks, they differed only in the line that
+// raised them, which is not something a caller can see. A caller weighing a
+// cancellation against another outcome it already holds then has to read every
+// cancellation the same way, and either one of those readings is wrong.
+// sendMsgFrame is that caller: it holds a refusal WeCom stated for a first
+// frame, and must not let it speak for a second one that is already on the
+// wire.
 var errAckAbandoned = errors.New("wecom: the wait for the verdict was cut short after the frame went out")
 
 // sendText pushes an aibot_send_msg (proactive push) with plain text to a
@@ -795,10 +1061,9 @@ func (s *wsSender) sendText(chatID string, chatTypeInt int, content string) erro
 // send that waited for one from inside a callback would have waited on itself.
 // It is also where a long answer is cut into pieces the server will accept.
 // That belongs here rather than at any one call site because a body past the
-// cap is refused whole: every caller that pushes plain text — the agent's
-// answer, a binding prompt, a failure notice — has the same 20480-byte
-// ceiling and the same all-or-nothing outcome, and a split anywhere higher
-// would leave the ones that did not know about it silently losing messages.
+// cap is refused WHOLE: every caller that pushes plain text — the agent's
+// reply, an inbox card, a relayed frame — would otherwise have to remember the
+// rule, and the one that forgot would lose its message silently.
 //
 // A piece that fails stops the rest: the pieces after it are the tail of an
 // answer whose head did not arrive, and sending them alone would read as the
@@ -809,9 +1074,22 @@ func (s *wsSender) sendText(chatID string, chatTypeInt int, content string) erro
 // once part of the answer is in the chat.
 func (s *wsSender) sendTextCtx(ctx context.Context, chatID string, chatTypeInt int, content string) error {
 	pieces := splitForWire(content)
-	if len(pieces) == 1 {
-		return s.sendOneTextCtx(ctx, chatID, chatTypeInt, pieces[0])
+	// Held for every send, not only a split one: a single-frame push from
+	// another caller — an inbox card, the file this same answer produced
+	// (sendMedia takes the same lock), the unsupported-type notice — is
+	// exactly what used to arrive between piece one and piece two, and with
+	// two long answers in flight at once the (n/total) counters could not be
+	// matched back to their own text.
+	//
+	// A caller whose context ends while queued here gets errChatBusy, which
+	// wraps errNotAttempted: nothing has been built yet, let alone written,
+	// and the classifiers have to be able to tell that from a context that
+	// ended while waiting for a verdict.
+	release, err := s.chats.acquire(ctx, chatID)
+	if err != nil {
+		return err
 	}
+	defer release()
 	for i, piece := range pieces {
 		if err := s.sendOneTextCtx(ctx, chatID, chatTypeInt, piece); err != nil {
 			if i > 0 {
@@ -841,11 +1119,6 @@ var errPartiallySent = errors.New("wecom: an earlier piece of this answer was al
 // sendOneTextCtx writes exactly one aibot_send_msg frame and reads its ack.
 // Nothing here may exceed the cap: splitForWire is the only thing standing
 // between an agent's answer and a 45002 refusal.
-//
-// Through sendMsgFrame rather than request directly, so this piece counts
-// against the chat's quota and gets its retry if WeCom throttles it — a long
-// answer is where a single reply spends several of those allowances at once
-// (rate_limit.go).
 func (s *wsSender) sendOneTextCtx(ctx context.Context, chatID string, chatTypeInt int, content string) error {
 	body, err := sendMsgTextBody(chatID, chatTypeInt, content)
 	if err != nil {

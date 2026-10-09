@@ -52,9 +52,7 @@ func newBubbleReplica(t *testing.T, q *db.Queries, instID pgtype.UUID) *bubbleRe
 		Tasks:      q,
 		Deliveries: q,
 		Languages:  q,
-		Identities: q,
 		Logger:     logger,
-		GuardAfter: -1,
 	})
 	r.typing.Register(r.bus)
 	NewOutbound(q, reg, r.streams, logger).Register(r.bus)
@@ -80,7 +78,7 @@ func (r *bubbleReplica) asked(t *testing.T, turn boundTurn, reqID string) {
 			Source: channel.Source{ChannelType: TypeWecom, ChatID: turn.chatID, ChatType: channel.ChatTypeP2P, SenderID: "USER_1"},
 			Raw:    raw,
 		},
-		sessionID)
+		sessionID, sessionID)
 	r.bus.Publish(events.Event{
 		Type:          protocol.EventTaskQueued,
 		ChatSessionID: turn.sessionID,
@@ -150,51 +148,5 @@ func TestABubbleAnswersInPlaceAgainstARealDatabase(t *testing.T) {
 	}
 	if r.streams.depth() != 0 {
 		t.Errorf("store holds %d rounds after the answer, want 0", r.streams.depth())
-	}
-}
-
-// TestAnAnswerAfterARestartGoesOutAsAMessageAgainstARealDatabase is the
-// bubble lost: a fresh store on the same database — the process restarted
-// mid-run — has nothing for the round, and the answer takes the plain path,
-// addressed by channel_task_delivery.
-//
-// REVERSE VERIFICATION: make sendAsMessage return errNothingToSay before the
-// send (or make taskAddress report skipNoDeliveryRow for every row) and this
-// fails with no aibot_send_msg at all.
-func TestAnAnswerAfterARestartGoesOutAsAMessageAgainstARealDatabase(t *testing.T) {
-	pool := twoReplicaDB(t)
-	turn := seedBoundTurn(t, pool)
-	q := db.New(pool)
-	instID := mustParseTaskUUID(t, turn.instID)
-
-	// The process that painted the bubble.
-	before := newBubbleReplica(t, q, instID)
-	before.asked(t, turn, "REQ-DB-2")
-	if streams, _ := before.wire(t); len(streams) != 1 {
-		t.Fatalf("the question painted %d stream frames, want 1", len(streams))
-	}
-
-	// The process that answers: same database, new store, nothing on file.
-	after := newBubbleReplica(t, q, instID)
-	after.bus.Publish(chatDoneFor(turn))
-
-	streams, sends := after.wire(t)
-	if len(streams) != 0 {
-		t.Fatalf("the restarted process wrote %d stream frames for a bubble it never painted: %v", len(streams), streams)
-	}
-	if len(sends) != 1 {
-		t.Fatalf("the restarted process sent %d aibot_send_msg, want 1. log:\n%s", len(sends), after.logs.String())
-	}
-	if sends[0]["chatid"] != turn.chatID {
-		t.Errorf("the message went to chatid %v, want %s — the delivery row names the chat that asked", sends[0]["chatid"], turn.chatID)
-	}
-	md, _ := sends[0]["markdown"].(map[string]any)
-	if md == nil || md["content"] != "S270 的价格是 1280 元。" {
-		t.Errorf("the message carries %v, want the answer", sends[0]["markdown"])
-	}
-	// And the bubble the first process painted is left as it was: nothing
-	// here could have sealed it, and nothing pretends to.
-	if streams, _ := before.wire(t); len(streams) != 1 {
-		t.Errorf("the first process's socket now carries %d stream frames, want the 1 it painted", len(streams))
 	}
 }

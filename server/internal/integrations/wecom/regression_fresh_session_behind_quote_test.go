@@ -48,7 +48,7 @@ type freshWatchingTasks struct {
 	queued []bool
 }
 
-func (*freshWatchingTasks) CanMemberInvokeAgent(context.Context, pgtype.UUID, pgtype.UUID) (bool, error) {
+func (*freshWatchingTasks) MemberMayInvokeAgent(context.Context, pgtype.UUID, pgtype.UUID) (bool, error) {
 	return true, nil
 }
 
