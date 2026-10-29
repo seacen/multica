@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { AlertCircle, Cloud, Monitor, Pencil, Plus, Server } from "lucide-react";
+import { AlertCircle, Cloud, Monitor, Pencil, Plus, Server } from "@multica/ui/icons";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useAuthStore } from "@multica/core/auth";
 import { useWorkspaceId } from "@multica/core/hooks";
@@ -28,6 +28,7 @@ import { RenameMachineDialog } from "./rename-machine-dialog";
 import { RuntimeProfilesDialog } from "./runtime-profiles-dialog";
 import { pendingRuntimesForProfiles } from "./pending-runtime";
 import { MachineCliSection } from "./machine-cli-section";
+import { isQoderLocator, QoderDetailPage } from "./qoder-detail-page";
 import { HealthIcon, useHealthLabel } from "./shared";
 import { useT, useTimeAgo } from "../../i18n";
 
@@ -177,6 +178,13 @@ export function RuntimeDetailPage({
     };
   }, [machine, isAdmin, currentUserId]);
 
+  if (
+    isQoderLocator(machineLocator, runtimes) ||
+    (machine?.runtimes.length &&
+      machine.runtimes.every((runtime) => runtime.provider === "qoder_cloud"))
+  ) {
+    return <QoderDetailPage />;
+  }
   if (isLoading) return <MachineDetailSkeleton />;
 
   if (!machine) {

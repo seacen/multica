@@ -225,6 +225,13 @@ func (o *Outbound) deliverAttachmentsByID(rawMessageID, rawWorkspaceID string, t
 // waiting. Rationing this stage ahead of the lookup would either stay silent
 // about a file that was dropped or warn about a file that never existed.
 func (o *Outbound) sendAttachments(ctx context.Context, messageID, workspaceID pgtype.UUID, to attachmentTarget, carriesTheReply bool) {
+	// Everything this function writes — every frame of every file, and every
+	// sentence to the user about one — is put to the installation's permission
+	// at the moment it is written. A revocation is a person withdrawing the
+	// connection; the object reads, the upload, the chat's turn and a retry's
+	// backoff can each take long enough for it to land, and the failure notice
+	// is a write into that chat like any other.
+	ctx = withWriteGuard(ctx, o.attachmentWriteGuard(to.InstallationID))
 	// replyFailed records this reply's single outcome, but only when the files
 	// ARE the reply. When words already landed the reply is settled and only
 	// the per-file counters move.
@@ -397,18 +404,56 @@ func (o *Outbound) tellUser(ctx context.Context, to attachmentTarget, text strin
 		return
 	}
 	if err := sender.sendTextCtx(ctx, to.ChatID, to.ChatType, text); err != nil {
+		if errors.Is(err, errMediaPermissionWithdrawn) {
+			// Silence is the intended outcome: the connection was withdrawn
+			// (or cannot be confirmed), and a notice is a write into that chat.
+			o.logger.InfoContext(ctx, "wecom outbound: notice about the file not sent, permission withdrawn",
+				"error", err, "installation_id", uuidStringPub(to.InstallationID))
+			return
+		}
 		o.logger.WarnContext(ctx, "wecom outbound: could not tell the user about the file",
 			"error", err, "installation_id", uuidStringPub(to.InstallationID))
+	}
+}
+
+// errMediaPermissionWithdrawn marks a write the attachment path refused because
+// the installation was revoked, or could not be read, after the delivery began.
+var errMediaPermissionWithdrawn = errors.New("wecom: media delivery stopped, permission withdrawn")
+
+// permissionReadBudget bounds one permission read. The read runs while the
+// socket's writer is held (see attachmentWriteGuard), so a database that has
+// stopped answering must cost a refused frame and not a socket that nobody can
+// ping.
+const permissionReadBudget = 3 * time.Second
+
+// attachmentWriteGuard is the permission check for every frame the attachment
+// path writes — upload init, each chunk and its retry, finish, the file
+// message and any retry of it, and the notices to the user. It is installed in
+// the context (withWriteGuard) and run by the ws layer with the writer in
+// hand, so it is asked at the last moment before a byte leaves and not at the
+// moment a stage began waiting.
+//
+// The three outcomes of mayStillWrite collapse to one refusal here, which is
+// right for a write: revoked, gone and unreadable are all "do not write now".
+// What differs is only what is owed afterwards, and an attachment owes nothing
+// — the file stays in object storage, and the user can ask again.
+func (o *Outbound) attachmentWriteGuard(id pgtype.UUID) func(context.Context) error {
+	return func(ctx context.Context) error {
+		ctx, cancel := context.WithTimeout(ctx, permissionReadBudget)
+		defer cancel()
+		if check := o.mayStillWrite(ctx, id); check != installationOK {
+			return fmt.Errorf("wecom: installation may no longer be written to (%s): %w", check, errMediaPermissionWithdrawn)
+		}
+		return nil
 	}
 }
 
 // sendAttachment carries one file from object storage into the chat, and
 // reports what is known about where it ended up. The error is for the log; the
 // state is what the user is told.
-// errMediaPermissionWithdrawn marks a delivery stopped because the
-// installation was revoked while the file work was in flight.
-var errMediaPermissionWithdrawn = errors.New("wecom: media delivery stopped, permission withdrawn")
-
+//
+// ctx must carry attachmentWriteGuard (sendAttachments puts it there): that is
+// what keeps a revoked installation from being written to.
 func (o *Outbound) sendAttachment(ctx context.Context, sender *wsSender, row db.Attachment, to attachmentTarget) (deliveryState, error) {
 	// The recorded size is checked before a single byte is fetched. An
 	// oversize attachment is refused either way — readObject re-checks what it
@@ -422,16 +467,6 @@ func (o *Outbound) sendAttachment(ctx context.Context, sender *wsSender, row db.
 	if err != nil {
 		return deliveryDefinitelyFailed, err
 	}
-	// Re-asked after the read, between chunks, and after the upload: a
-	// revocation is a person withdrawing the connection, and the object read
-	// or the upload can be minutes long — plenty of room for the withdrawal
-	// to land while the top-of-loop gate's answer goes stale. Each stage that
-	// is about to put bytes toward the chat asks again first; a file already
-	// uploaded but not yet sent is a media_id nobody receives, which is the
-	// cheap side of the asymmetry.
-	if check := o.mayStillWrite(ctx, to.InstallationID); check != installationOK {
-		return deliveryDefinitelyFailed, fmt.Errorf("wecom: installation may no longer be written to (%s): %w", check, errMediaPermissionWithdrawn)
-	}
 	kind := wecomMediaKind(row.ContentType, row.Filename, len(data))
 	name := outboundMediaName(row.Filename, row.ContentType)
 
@@ -439,21 +474,12 @@ func (o *Outbound) sendAttachment(ctx context.Context, sender *wsSender, row db.
 		Kind:     kind,
 		Filename: name,
 		Data:     data,
-		BeforeChunk: func(hctx context.Context) error {
-			if check := o.mayStillWrite(hctx, to.InstallationID); check != installationOK {
-				return fmt.Errorf("wecom: installation may no longer be written to (%s): %w", check, errMediaPermissionWithdrawn)
-			}
-			return nil
-		},
 	})
 	if err != nil {
 		// A failed upload never produced a media_id, so no message was ever
 		// addressed to the chat — including when the failure was the finish
 		// step's own lost ack. The file is definitely not there.
 		return deliveryDefinitelyFailed, fmt.Errorf("upload %s: %w", kind, err)
-	}
-	if check := o.mayStillWrite(ctx, to.InstallationID); check != installationOK {
-		return deliveryDefinitelyFailed, fmt.Errorf("wecom: installation may no longer be written to (%s): %w", check, errMediaPermissionWithdrawn)
 	}
 	// Video is the only kind with fields beyond the media_id, and both are
 	// required. The file's own name is what there is to say about it — the

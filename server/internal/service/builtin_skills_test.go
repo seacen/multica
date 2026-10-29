@@ -255,6 +255,85 @@ func TestPlatformSkillRoutingTableMatchesItsReferences(t *testing.T) {
 	}
 }
 
+// TestLegacyRedirectsFollowTheDaemonsBrief pins the compatibility contract for
+// the merge (MUL-6986).
+//
+// The runtime brief is assembled by the DAEMON, so deploying a backend does not
+// rewrite an installed daemon's copy of it. A daemon released before the merge
+// still tells its agent to "read the `multica-working-on-issues` skill" — a
+// name this server no longer ships — and backend upgrades do not force a daemon
+// upgrade, so that window is open-ended. Such a daemon gets a redirect stub;
+// a current one gets nothing extra, which is what lets the stub retire itself.
+//
+// The stub must stay a signpost: if it ever grows contracts of its own they
+// will rot against references/issues.md, silently, on exactly the installs that
+// cannot be updated from here.
+func TestLegacyRedirectsFollowTheDaemonsBrief(t *testing.T) {
+	const legacy = "multica-working-on-issues"
+	svc := &TaskService{}
+
+	current := svc.BuiltinSkills("", false)
+	if named(current, legacy) {
+		t.Errorf("a current daemon still receives %q; the stub only exists for briefs that name it", legacy)
+	}
+	if !named(current, PlatformSkillName) {
+		t.Fatalf("a current daemon does not receive %q", PlatformSkillName)
+	}
+
+	old := svc.BuiltinSkills("", true)
+	if !named(old, legacy) {
+		t.Errorf("a pre-merge daemon does not receive %q, so its brief points at a skill that is not installed", legacy)
+	}
+	if !named(old, PlatformSkillName) {
+		t.Errorf("a pre-merge daemon lost %q; the redirect adds to the set, it does not replace it", PlatformSkillName)
+	}
+
+	// Mika's scoping is orthogonal to the redirect: both dimensions compose.
+	if !named(svc.BuiltinSkills(MikaSystemKey, true), "multica-onboarding") {
+		t.Errorf("Mika on a pre-merge daemon lost multica-onboarding")
+	}
+	if named(svc.BuiltinSkills("", true), "multica-onboarding") {
+		t.Errorf("the redirect path leaked multica-onboarding to an ordinary agent")
+	}
+
+	var stub AgentSkillData
+	for _, s := range old {
+		if s.Name == legacy {
+			stub = s
+		}
+	}
+	if len(stub.Files) != 0 {
+		t.Errorf("redirect stub ships %d supporting files; it should carry nothing but the new location", len(stub.Files))
+	}
+	_, body, ok := splitFrontmatter(stub.Content)
+	if !ok {
+		t.Fatal("redirect stub has no frontmatter")
+	}
+	if !strings.Contains(body, PlatformSkillName) || !strings.Contains(body, "references/issues.md") {
+		t.Errorf("redirect stub does not name where the contracts went:\n%s", body)
+	}
+	// MUL-6966: the stub used to promise "Nothing was dropped in the move".
+	// The metadata guidance since was dropped, and the daemons that reach
+	// this stub are exactly the ones whose frozen brief still sends them
+	// here for it — so the one place the claim is read is the one place it
+	// is false. It has to state the replacement rule instead.
+	if strings.Contains(body, "Nothing was dropped") {
+		t.Errorf("redirect stub still promises nothing was dropped:\n%s", body)
+	}
+	if !strings.Contains(body, "goes in the result comment") {
+		t.Errorf("redirect stub does not say where the retired state now belongs:\n%s", body)
+	}
+	if n := strings.Count(body, "\n") + 1; n > 40 {
+		t.Errorf("redirect stub is %d lines; a signpost that grows contracts will rot against the real reference", n)
+	}
+
+	// Bundle resolution must still serve it: the stub reaches the daemon as a
+	// ref like any other built-in, and the resolve path is name-blind.
+	if !named(svc.AllBuiltinSkills(), legacy) {
+		t.Errorf("the unscoped set is missing %q; bundle resolution would 404 for a pre-merge daemon", legacy)
+	}
+}
+
 // TestPlatformSkillDescriptionNamesEveryDomain is the recall guard for the
 // nine-into-one merge (MUL-6986).
 //
@@ -415,6 +494,13 @@ func TestPlatformSkillCoversPlatformContracts(t *testing.T) {
 				// the routing rule they encoded.
 				"workflow state a human should see and filter by goes in",
 				"goes in the result comment",
+				// #8001: --property comparisons. The op-by-type table is the
+				// only thing between an agent and a silently empty page, and
+				// the two rejections are the cases it would otherwise retry.
+				"Comparisons use the same flag",
+				"`~=` (contains, case-insensitive)",
+				"`!=` is rejected (the server has no not-equal filter)",
+				"so they do not form a range",
 				// #7768: nothing about concurrent runs is pushed into the
 				// prompt any more (MUL-6984), so the skill has to carry the
 				// pull path itself. All three anchors are load-bearing — the
@@ -447,6 +533,9 @@ func TestPlatformSkillCoversPlatformContracts(t *testing.T) {
 				"High-signal keys",
 				"reuse these names so queries stay consistent",
 				"scratchpad for run state",
+				// #8001 replaced the reservation with the operators; a bullet
+				// that says only `=` works would contradict the one below it.
+				"Only `=` is supported today",
 				// Per-turn workflow the runtime brief owns; duplicating it here
 				// is how the two drift apart.
 				"Start from the trigger, not from memory",
@@ -458,6 +547,13 @@ func TestPlatformSkillCoversPlatformContracts(t *testing.T) {
 			file: "references/mentions.md",
 			want: []string{
 				"(member|agent|squad|issue|all)/([0-9a-fA-F-]+|all)",
+				"canonical inline links with visible label text",
+				"Text removed by HTML sanitization",
+				"reference links, images, autolinks, titles",
+				"Code examples are inert as mentions",
+				"A fenced `diff` of agent instructions cannot invoke",
+				"paste it into",
+				"Prose mentions in blockquotes still count",
 				"multica workspace member list --output json",
 				"enqueues a run for that agent",
 				"enqueues NOTHING",
@@ -636,8 +732,10 @@ func TestPlatformSkillCoversPlatformContracts(t *testing.T) {
 // reference its value: it proves the skill teaches exactly what
 // util.ParseMentions enforces. The skill's "Incorrect" examples must parse to
 // nothing (the @gpt-boy class of bug: a name where a UUID belongs fails
-// silently), and its "Correct" example must parse. If the mention regex drifts,
-// this breaks and the skill's claims must be re-checked.
+// silently), and its "Correct" example must parse. If ParseMentions drifts,
+// this breaks and the skill's claims must be re-checked. Goldmark link nodes
+// exclude code; parseMentionLink validates canonical source and visible labels
+// in internal/util/mention.go. These assertions replace the retired source map.
 func TestPlatformSkillTeachesTheParserContract(t *testing.T) {
 	const uuid = "7f3a1b2c-0000-4000-8000-000000000abc"
 
@@ -670,6 +768,35 @@ func TestPlatformSkillTeachesTheParserContract(t *testing.T) {
 			name:    "all uses the literal all",
 			content: "[@all](mention://all/all) heads up",
 			want:    []util.Mention{{Type: "all", ID: "all"}},
+		},
+		{
+			name:    "empty label cannot trigger an agent",
+			content: "[](mention://agent/" + uuid + ")",
+		},
+		{
+			name:    "script content cannot make an agent label visible",
+			content: "[<script>Agent</script>@](mention://agent/" + uuid + ")",
+		},
+		{
+			name:    "template content cannot make an agent label visible",
+			content: "[<template>Agent</template>@](mention://agent/" + uuid + ")",
+		},
+		{
+			name:    "reference link cannot trigger an agent",
+			content: "[@Agent][target]\n\n[target]: mention://agent/" + uuid,
+		},
+		{
+			name:    "inline code example is inert",
+			content: "`[@Agent](mention://agent/" + uuid + ")`",
+		},
+		{
+			name:    "details diff example is inert",
+			content: "<details>\n<summary>Instructions</summary>\n\n```diff\n+ [@Agent](mention://agent/" + uuid + ")\n```\n\n</details>",
+		},
+		{
+			name:    "copied example in prose parses",
+			content: "[@Agent](mention://agent/" + uuid + ") please review",
+			want:    []util.Mention{{Type: "agent", ID: uuid}},
 		},
 		{
 			// Skill: "Using the wrong type for a real UUID still parses — it
@@ -711,8 +838,7 @@ func TestPlatformSkillTeachesTheParserContract(t *testing.T) {
 func TestOnboardingSkillIsScopedToMika(t *testing.T) {
 	const onboarding = "multica-onboarding"
 
-	svc := &TaskService{}
-	ordinary := svc.BuiltinSkills("")
+	ordinary := loadBuiltinSkills("")
 	if named(ordinary, onboarding) {
 		t.Errorf("an ordinary agent still receives %q", onboarding)
 	}
@@ -720,7 +846,7 @@ func TestOnboardingSkillIsScopedToMika(t *testing.T) {
 		t.Errorf("an ordinary agent does not receive %q, which every agent needs", PlatformSkillName)
 	}
 
-	mika := svc.BuiltinSkills(MikaSystemKey)
+	mika := loadBuiltinSkills(MikaSystemKey)
 	if !named(mika, onboarding) {
 		t.Errorf("Mika does not receive %q, which only Mika can use", onboarding)
 	}
@@ -763,9 +889,11 @@ func named(skills []AgentSkillData, name string) bool {
 	return false
 }
 
-// allBuiltinSkillsForTest includes every built-in regardless of agent scope.
+// allBuiltinSkillsForTest includes the legacy redirect stubs. They are shipped
+// payload like any other built-in, so the template, frontmatter and
+// source-leak suites must hold for them as well.
 func allBuiltinSkillsForTest() []AgentSkillData {
-	return (&TaskService{}).AllBuiltinSkills()
+	return append(loadBuiltinSkillDirs(func(string) bool { return true }), legacyRedirectSkills()...)
 }
 
 func findSkill(t *testing.T, name string) (AgentSkillData, bool) {

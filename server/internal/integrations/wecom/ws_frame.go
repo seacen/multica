@@ -130,58 +130,37 @@ type quotedMessage struct {
 	} `json:"mixed"`
 }
 
-// render turns the quoted message into the lines it contributes. A kind this
-// adapter does not know contributes nothing, the same way a mixed run does.
-func (q quotedMessage) render() string {
-	if !strings.EqualFold(q.MsgType, "mixed") {
-		return q.mixedItem.renderQuoted()
-	}
-	var runs []string
-	for _, item := range q.Mixed.MsgItem {
-		if s := item.renderQuoted(); s != "" {
-			runs = append(runs, s)
-		}
-	}
-	return strings.Join(runs, "\n")
+// quoteRun is one line the quoted message contributes: words somebody typed or
+// said, or the marker standing in for an attachment together with the
+// attachment it stands for.
+//
+// The marker and its attachment are one value on purpose. They used to be two
+// lists, rendered by one function and collected by another, and anything that
+// changed the rendered text in between (a sentence that spells the marker out,
+// a cut that removes it) left the second list describing a body the agent never
+// saw. A run that has an attachment cannot be laid out without its marker, and
+// a run that is laid out cannot lose its attachment, so fitQuote below decides
+// what survives once and both follow.
+type quoteRun struct {
+	text  string
+	media *InboundMedia
 }
 
-// media lists the quoted message's downloadable attachments, in the order
-// render lays their markers out, each stamped with the marker it stands for.
-//
-// FETCHING THEM IS THE WHOLE OF THE FIX. "[Image]" is all a quote of a picture
-// could be rendered as — the payload carries no sender, no message id and no
-// timestamp to say WHICH picture — so an agent reading that line cannot tell a
-// screenshot it read a minute ago from one it has never seen, and answers
-// "左下角那块看不清" about a picture it does not have. The url and aeskey on
-// the quote are the only thing that resolves it, and the callback hands them
-// over exactly the way it hands over an attachment the sender just made.
-//
-// The stamp closes the other half. Fetching the bytes puts the picture in the
-// attachment list; the marker's occurrence number is what says WHICH entry of
-// that list the quote's marker is, and without it a message carrying two
-// attachments — one quoted, one just sent — hands the agent two markers and
-// two ids with nothing joining them.
-func (q quotedMessage) media() []InboundMedia {
-	var out []InboundMedia
-	if strings.EqualFold(q.MsgType, "mixed") {
-		for _, item := range q.Mixed.MsgItem {
-			out = append(out, item.media()...)
+// runs lays the quoted message out as the lines it contributes, in order. A
+// kind this adapter does not know contributes nothing, the same way a mixed
+// run does.
+func (q quotedMessage) runs() []quoteRun {
+	if !strings.EqualFold(q.MsgType, "mixed") {
+		if run, ok := q.mixedItem.quoteRun(); ok {
+			return []quoteRun{run}
 		}
-	} else {
-		out = q.mixedItem.media()
+		return nil
 	}
-	// Counted PER MARKER, not over the whole list: "[Image: unavailable]" and
-	// "[File: unavailable]" are different strings, so the second picture in a
-	// quote that also carried a document is still that marker's first
-	// occurrence. Counting them together would send the binder looking for a
-	// second "[Image: unavailable]" that is not there, and leave the picture
-	// unnamed.
-	seen := make(map[string]int, len(out))
-	for i := range out {
-		marker := quotedMediaPlaceholder(out[i].Kind)
-		out[i].InlinePlaceholder = marker
-		out[i].InlineIndex = seen[marker]
-		seen[marker]++
+	var out []quoteRun
+	for _, item := range q.Mixed.MsgItem {
+		if run, ok := item.quoteRun(); ok {
+			out = append(out, run)
+		}
 	}
 	return out
 }
@@ -231,17 +210,6 @@ func (item mixedItem) words() string {
 // body. An item of a kind this adapter does not know contributes nothing
 // rather than a stray placeholder.
 func (item mixedItem) render() string {
-	return item.renderWith(mediaPlaceholder)
-}
-
-// renderQuoted is render for a run inside a 引用 block: same line, but an
-// attachment gets the marker that can be joined to the attachment it stands
-// for. See quotedMediaPlaceholder.
-func (item mixedItem) renderQuoted() string {
-	return item.renderWith(quotedMediaPlaceholder)
-}
-
-func (item mixedItem) renderWith(placeholder func(channel.MsgType) string) string {
 	if s := item.words(); s != "" {
 		return s
 	}
@@ -249,19 +217,27 @@ func (item mixedItem) renderWith(placeholder func(channel.MsgType) string) strin
 	if !ok || strings.TrimSpace(body.URL) == "" {
 		return ""
 	}
-	return placeholder(kind)
+	return mediaPlaceholder(kind)
 }
 
-// media is the downloadable attachment behind this run's placeholder, if it
-// has one. Paired with render on purpose: a run that renders a placeholder
-// must produce an attachment here and a run that renders nothing must produce
-// none, or the positional correspondence the body relies on slips by one.
-func (item mixedItem) media() []InboundMedia {
+// quoteRun is render for a run inside a QUOTED message: an attachment comes
+// back as a marker with room in it to be named (quotedMediaPlaceholder) along
+// with the attachment that marker stands for.
+func (item mixedItem) quoteRun() (quoteRun, bool) {
+	if s := item.words(); s != "" {
+		return quoteRun{text: s}, true
+	}
 	body, kind, ok := mediaFor(item.MsgType, item.Image, item.File, item.Video)
 	if !ok || strings.TrimSpace(body.URL) == "" {
-		return nil
+		return quoteRun{}, false
 	}
-	return []InboundMedia{{Kind: kind, URL: body.URL, AESKey: body.AESKey}}
+	marker := quotedMediaPlaceholder(kind)
+	return quoteRun{text: marker, media: &InboundMedia{
+		Kind:              kind,
+		URL:               body.URL,
+		AESKey:            body.AESKey,
+		InlinePlaceholder: marker,
+	}}, true
 }
 
 // mediaPlaceholder is the marker that stands in for an attachment in the
@@ -285,43 +261,34 @@ func mediaPlaceholder(kind channel.MsgType) string {
 	}
 }
 
-// mediaUnavailable is what a quoted attachment's marker says while there is
-// no attachment to name. English, like the placeholders it goes inside, and
-// for the same reason: an agent reads every channel through one prompt, so
-// this vocabulary is the agent's rather than the chat's, and putting it in
-// the copy pack would make the same picture read differently to the same
-// agent depending on whose chat it came from.
+// mediaUnavailable is what a quoted attachment's marker says before anything
+// has been fetched for it, and what it keeps saying if the fetch never
+// succeeds. A marker that is never rewritten still reads as a sentence.
 const mediaUnavailable = "unavailable"
 
 // quotedMediaPlaceholder is the marker a QUOTED attachment renders as. It
 // carries a word inside the brackets where the sender's own "[Image]" carries
-// nothing, because the quote's placeholder is the one that has to be joined
-// to an attachment.
+// nothing, because the quote's marker is the one that has to be joined to an
+// attachment.
 //
-// Fetching the quoted picture (see quotedMessage.media) put it in the
-// attachment list and stopped there. The list is a separate block of text
-// from the body, so with one attachment the reader infers the join and with
-// two — one quoted, one just sent — there is nothing to infer from: two bare
-// "[Image]" markers, two ids, no correspondence beyond an ordering rule
-// nobody stated. So the marker names its attachment, "[Image: 019fe1d3-…]",
-// and the join stops being an inference.
+// Fetching the quoted picture puts it in the attachment list and stops there.
+// The list is a separate block of text from the body, so with one attachment
+// the reader infers the join and with two it cannot — and a quote is exactly
+// the case where a message carries somebody else's picture beside its own.
+// The marker is what the engine rewrites into the attachment's id.
 //
-// The word is what the marker says BEFORE there is an id, and it is written
-// so that it stays true if no id ever arrives: a download that fails, a host
-// the media address guard refuses, no storage configured, an intent the
-// reconciler already owns and a bind that never commits all leave it reading
-// "unavailable", and only an attachment row the agent can actually fetch
-// replaces it. Which is the distinction that matters to a reader — "there was
-// a picture here and it did not arrive" is a marker with no id, "there was no
-// picture" is no marker at all.
+// The sender's OWN attachments keep the bare "[Image]" they have always had.
+// It is already unambiguous, being the attachment on the message the reader is
+// looking at, and changing it would change what every existing wecom message
+// body says.
 func quotedMediaPlaceholder(kind channel.MsgType) string {
 	return namedMediaPlaceholder(kind, mediaUnavailable)
 }
 
-// namedMediaPlaceholder writes a name inside the bracketed placeholder:
-// "[Image]" becomes "[Image: <name>]". engine.bindMediaRefs rewrites the same
-// shape when it swaps the attachment's id in, and keeps the label ahead of
-// the colon, so the two spellings cannot drift apart.
+// namedMediaPlaceholder writes a name inside the bracketed marker: "[Image]"
+// becomes "[Image: <name>]". engine.inlineAttachmentIDMarker rewrites the same
+// shape and keeps the label ahead of the colon, so the two spellings cannot
+// drift apart.
 func namedMediaPlaceholder(kind channel.MsgType, name string) string {
 	return strings.TrimSuffix(mediaPlaceholder(kind), "]") + ": " + name + "]"
 }
@@ -349,59 +316,43 @@ func mediaFor(msgType string, image, file, video mediaBody) (mediaBody, channel.
 // above the sender's own words and the two lists have to agree on order — the
 // engine binds a marker by its occurrence number in the body.
 func (mc aibotMsgCallback) attachments() []InboundMedia {
-	// The quoted message's attachments come FIRST, because that is where its
-	// placeholders are: routableText renders the quote block above the
-	// sender's own words. The Nth placeholder in the body is the Nth
-	// attachment here, and that correspondence is the only thing an agent has
-	// to work out which picture is which — 图文混排 already depends on it.
-	return append(mc.Quote.media(), mc.ownAttachments()...)
-}
-
-// ownAttachments is attachments() without the quoted message's — the files
-// this sender attached to THIS message.
-//
-// The distinction is not cosmetic. It decides whether a control command is a
-// turn of its own: normalizeWeComControlLayout treats a bare "/clear" with
-// media as a real message rather than the shared pending sentinel, and quoting
-// a colleague's screenshot is not the same act as attaching one. Measured with
-// attachments(), replying "/clear" under any picture anybody ever posted
-// produced an empty body and an empty CommandText, and the sender got a turn
-// with nothing in it.
-func (mc aibotMsgCallback) ownAttachments() []InboundMedia {
-	var out []InboundMedia
-	if body, kind, ok := mediaFor(mc.MsgType, mc.Image, mc.File, mc.Video); ok {
-		if strings.TrimSpace(body.URL) != "" {
-			out = append(out, InboundMedia{Kind: kind, URL: body.URL, AESKey: body.AESKey})
-		}
-		return out
-	}
-	if !strings.EqualFold(mc.MsgType, "mixed") {
-		return out
-	}
-	for _, item := range mc.Mixed.MsgItem {
-		out = append(out, item.media()...)
-	}
-	return out
+	_, quotedMedia := mc.quotedBlock()
+	return append(quotedMedia, mc.ownAttachments()...)
 }
 
 // needsCopy reports whether routing this callback will read anything off the
-// copy pack — a quote prefix, or (for a kind we cannot read) the
-// unsupported-type receipt. Plain text with nothing quoted does not, which is
-// what lets the read loop skip the per-destination language lookup for the
-// overwhelmingly common case.
+// copy pack — the unsupported-type receipt for a kind we cannot read. Readable
+// text does not, which is what lets the read loop skip the per-destination
+// language lookup for the overwhelmingly common case.
+//
+// A quote costs no lookup: quotedContext renders it with a fixed marker that is
+// the agent's vocabulary rather than the chat's.
 func (mc aibotMsgCallback) needsCopy() bool {
-	// A QUOTE NO LONGER COSTS A LOOKUP. It used to: routableText rendered the
-	// quote block through the copy pack, so a plain sentence carrying a quote
-	// needed the destination's language resolved before the body could be
-	// built. quotedContext renders it now, with a fixed marker that is the
-	// agent's vocabulary rather than the chat's, so the pack buys that path
-	// nothing — and the lookup is a per-destination database read on every
-	// quoted message.
-	//
-	// A kind this adapter cannot read still needs one: its receipt is a
-	// sentence the person reads.
 	_, readable := mc.ownText()
 	return !readable
+}
+
+func (mc aibotMsgCallback) ownAttachments() []InboundMedia {
+	var out []InboundMedia
+	add := func(body mediaBody, kind channel.MsgType) {
+		if strings.TrimSpace(body.URL) == "" {
+			return
+		}
+		out = append(out, InboundMedia{Kind: kind, URL: body.URL, AESKey: body.AESKey})
+	}
+	if body, kind, ok := mediaFor(mc.MsgType, mc.Image, mc.File, mc.Video); ok {
+		add(body, kind)
+		return out
+	}
+	if !strings.EqualFold(mc.MsgType, "mixed") {
+		return nil
+	}
+	for _, item := range mc.Mixed.MsgItem {
+		if body, kind, ok := mediaFor(item.MsgType, item.Image, item.File, item.Video); ok {
+			add(body, kind)
+		}
+	}
+	return out
 }
 
 // ownText is the agent-readable body of this callback, and whether there is
@@ -476,16 +427,38 @@ const maxQuotedRunes = 500
 // here. Prefixing it would let a quote of somebody else's "/issue …" file an
 // issue nobody asked for.
 func (mc aibotMsgCallback) quotedContext() string {
-	rendered := strings.TrimSpace(mc.Quote.render())
+	block, _ := mc.quotedBlock()
+	return block
+}
+
+// quotedBlock is the quote block and the attachments whose markers are in it.
+//
+// FETCHING THE ATTACHMENTS IS THE WHOLE OF THE FIX. "[Image]" is all a quote
+// of a picture could be rendered as — the payload carries no sender, no
+// message id and no timestamp to say WHICH picture — so an agent reading that
+// line cannot tell a screenshot it read a minute ago from one it has never
+// seen, and answers "左下角那块看不清" about a picture it does not have. The
+// url and aeskey on the quote are the only thing that resolves it, and the
+// callback hands them over exactly the way it hands over an attachment the
+// sender just made.
+//
+// The marker closes the other half. Fetching the bytes puts the picture in the
+// attachment list; the marker's occurrence number is what says WHICH entry of
+// that list the quote's marker is, and without it a message carrying two
+// attachments — one quoted, one just sent — hands the agent two markers and
+// two ids with nothing joining them.
+//
+// The rule the pair obeys: an attachment is returned only if its marker is in
+// the block, and its InlineIndex counts occurrences in the block as returned.
+// The engine binds by searching the stored body for the Nth occurrence of the
+// marker string, so the number has to be taken from the text the agent will
+// read — not from how many attachments came before it — and the text is
+// whatever is left after the cut. Both come out of fitQuote in one pass, so
+// neither can describe a block the other did not produce.
+func (mc aibotMsgCallback) quotedBlock() (string, []InboundMedia) {
+	rendered, media := fitQuote(mc.Quote.runs(), maxQuotedRunes)
 	if rendered == "" {
-		return ""
-	}
-	// A quoted document would otherwise become the body. The sender quoted it
-	// to point at it, not to resend it, and the words that carry their question
-	// are their own — which follow the block and must not be pushed out of the
-	// agent's reach by it.
-	if runes := []rune(rendered); len(runes) > maxQuotedRunes {
-		rendered = strings.TrimRight(string(runes[:maxQuotedRunes]), " \t\n") + "…"
+		return "", nil
 	}
 	var b strings.Builder
 	for i, line := range strings.Split(rendered, "\n") {
@@ -499,7 +472,85 @@ func (mc aibotMsgCallback) quotedContext() string {
 		}
 		b.WriteString(line)
 	}
-	return b.String()
+	return b.String(), media
+}
+
+// fitQuote lays the quote's runs out within maxRunes and returns the text with
+// the attachments that survived in it, each stamped with which occurrence of
+// its marker it is.
+//
+// A quoted document would otherwise become the body. The sender quoted it to
+// point at it, not to resend it, and the words that carry their question are
+// their own — which follow the block and must not be pushed out of the agent's
+// reach by it. So TEXT is cut at maxRunes, markers counting toward that budget
+// while they fall inside it, and the cut is marked with "…".
+//
+// A marker is never cut, and never dropped. Past the budget, runs of words are
+// dropped and runs that carry an attachment are still laid out whole, one line
+// each; a marker that starts inside the budget and ends past it is kept to the
+// end. So the block can run past maxRunes by at most the markers it carries
+// (about twenty runes each), and every attachment the caller will fetch is
+// one the agent can find in the text. #7980 left the same constraint in its
+// discussion: a truncated block must not drop a placeholder it still counts.
+//
+// InlineIndex is counted on the text as laid out, markers and words alike. A
+// quoted sentence that spells "[Image: unavailable]" out is an occurrence of
+// that marker as far as the engine's search is concerned, so it moves the real
+// marker's number up by one.
+func fitQuote(runs []quoteRun, maxRunes int) (string, []InboundMedia) {
+	var (
+		lines  []string
+		owners []*InboundMedia // owners[i] is the attachment lines[i] is the marker of, or nil
+		used   int
+		cut    bool
+	)
+	for _, run := range runs {
+		width := utf8.RuneCountInString(run.text)
+		if len(lines) > 0 {
+			width++ // the newline ahead of it
+		}
+		switch {
+		case run.media != nil:
+			lines = append(lines, run.text)
+			owners = append(owners, run.media)
+			used += width
+		case cut:
+			// The budget ran out earlier; only markers still get through.
+		case used+width <= maxRunes:
+			lines = append(lines, run.text)
+			owners = append(owners, nil)
+			used += width
+		default:
+			cut = true
+			room := maxRunes - used
+			if len(lines) > 0 {
+				room-- // the newline ahead of it
+			}
+			if room > 0 {
+				kept := strings.TrimRight(string([]rune(run.text)[:room]), " \t\n")
+				if kept != "" {
+					lines = append(lines, kept)
+					owners = append(owners, nil)
+				}
+			}
+			if len(lines) == 0 {
+				lines = append(lines, "")
+				owners = append(owners, nil)
+			}
+			lines[len(lines)-1] = strings.TrimRight(lines[len(lines)-1], " \t\n") + "…"
+		}
+	}
+
+	var media []InboundMedia
+	for i, owner := range owners {
+		if owner == nil {
+			continue
+		}
+		m := *owner
+		m.InlineIndex = strings.Count(strings.Join(lines[:i], "\n"), m.InlinePlaceholder)
+		media = append(media, m)
+	}
+	return strings.Join(lines, "\n"), media
 }
 
 // ownCommandSource is what the slash-command parsers read: the sender's own
@@ -596,16 +647,9 @@ type InboundMessage struct {
 	// envelope's Text field is populated from this.
 	Content string `json:"content,omitempty"`
 
-	// ReqID is the frame req_id the server sent this message with. Every
-	// frame of an aibot_respond_msg stream has to echo it back, so the
-	// streaming replier reads it off here (ws_sender.go respondStream).
-	//
-	// There is no short window on it. Replies are allowed for 24 hours after the
-	// callback, and the id is not tied to the connection that received it: a
-	// stream opened on one connection took a refresh and a closing frame from a
-	// second one, measured against a live bot. The bounds that do apply are the
-	// stream's own lifetime (see errcodeStreamExpired) and 846605 for an id the
-	// server does not recognise.
+	// ReqID is the frame req_id the server sent this message with. We
+	// keep it so a future aibot_respond_msg (5s window) can echo it back;
+	// iteration 1 uses aibot_send_msg unconditionally and does not need it.
 	ReqID string `json:"req_id,omitempty"`
 
 	// Media lists the attachments to fetch, in the order the user sent them.
@@ -631,10 +675,8 @@ type InboundMedia struct {
 	// They travel onto channel.MediaRef, and the binder rewrites that one
 	// occurrence to name the attachment once a row exists (engine/session.go).
 	//
-	// Set for a QUOTED attachment only. The sender's own "[Image]" keeps the
-	// bare marker it has always had: it is already unambiguous, being the
-	// attachment on the message the reader is looking at, and rewriting it
-	// would change what every existing wecom message body says.
+	// Set for a QUOTED attachment only — see quotedMediaPlaceholder for why the
+	// sender's own marker stays bare.
 	InlinePlaceholder string `json:"inline_placeholder,omitempty"`
 	InlineIndex       int    `json:"inline_index,omitempty"`
 }
@@ -648,9 +690,9 @@ func (m InboundMedia) inline(ref channel.MediaRef) channel.MediaRef {
 	}
 	ref.InlinePlaceholder = m.InlinePlaceholder
 	ref.InlineIndex = m.InlineIndex
-	// The marker refers to the attachment, it does not carry it: the picture
-	// belongs to a message somebody else sent, and replacing the marker with
-	// an inline image would state this sender attached it again.
+	// The marker REFERS to the attachment, it does not carry it: the picture
+	// belongs to a message somebody else sent, and replacing the marker with an
+	// inline image would state this sender attached it again.
 	ref.InlineIDOnly = true
 	return ref
 }

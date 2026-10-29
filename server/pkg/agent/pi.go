@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -37,6 +38,7 @@ type piBackend struct {
 	// error. Production uses defaultPiTurnErrorGrace; tests shorten it without
 	// changing concurrent executions through package-global state.
 	turnErrorGrace time.Duration
+	terminateGrace time.Duration
 }
 
 var (
@@ -416,6 +418,24 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 		}
 	}
 
+	extensionPath, err := b.preparePiMcpExtension(opts.McpConfig)
+	if err != nil {
+		releasePiSessionFileLock(sessionLock)
+		return nil, fmt.Errorf("%s mcp extension: %w", label, err)
+	}
+	// Execute owns the temp extension until the process is running. The
+	// reader goroutine takes ownership after start so a launch failure still
+	// deletes the directory, and a running process can read it until exit.
+	releaseExtension := func() { removePiMcpExtension(extensionPath) }
+	defer func() {
+		if releaseExtension != nil {
+			releaseExtension()
+		}
+	}()
+	if extensionPath != "" {
+		opts.piMcpExtensionPath = extensionPath
+	}
+
 	runCtx, cancel := runContext(ctx, timeout)
 	processCtx, cancelProcess := context.WithCancel(runCtx)
 
@@ -426,6 +446,8 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 		args = buildPiArgs(sessionPath, opts, b.cfg.Logger)
 	}
 	cmd, _, _ := b.cfg.commandAt(execName).execVia(processCtx, choosePiInvocation, lookedUp, args, b.cfg.Logger)
+	// The joined cleanup below owns TERM, escalation and pipe release.
+	cmd.Cancel = func() error { return nil }
 	hideAgentWindow(cmd)
 	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs(args))
 	cmd.WaitDelay = 10 * time.Second
@@ -487,6 +509,16 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 		_, _ = io.Copy(stderrWatch, stderrRead)
 		close(stderrDone)
 	}()
+	cleanup := newPiRunCleanup(cmd)
+	grace := b.terminateGrace
+	if grace <= 0 {
+		grace = 2 * time.Second
+	}
+	closePipes := func() {
+		closePiReadPipe(stdout)
+		closePiReadPipe(stderrRead)
+	}
+	finishCleanup := func() error { return cleanup.finish(cmd, closeStdin, closePipes, grace) }
 
 	b.cfg.Logger.Info(label+" started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
 
@@ -498,14 +530,7 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 	}
 	turnErrors := newPiTurnErrorGuard(turnErrorGrace, func() {
 		b.cfg.Logger.Info(label + " turn error recovery grace expired; stopping runtime")
-		// CommandContext owns process-tree cancellation for every runtime
-		// command. An escaped descendant can nevertheless retain stdout/stderr
-		// write ends after that group dies, so close the adapter-owned pipes too:
-		// finalization must not depend on an unowned process eventually exiting.
 		cancelProcess()
-		closeStdin()
-		closePiReadPipe(stdout)
-		closePiReadPipe(stderrRead)
 	})
 
 	// Write concurrently with stdout consumption. A large prompt can fill the
@@ -518,17 +543,29 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 		writeErrCh <- err
 	}()
 
-	// Close every adapter-owned pipe when the context is cancelled. Closing stdin
-	// releases a writer blocked on a child that stopped reading; closing the read
-	// pipes releases the stdout scanner and stderr copier.
 	go func() {
-		<-runCtx.Done()
-		closeStdin()
-		closePiReadPipe(stdout)
-		closePiReadPipe(stderrRead)
+		select {
+		case <-processCtx.Done():
+			_ = finishCleanup()
+		case <-cleanup.exited:
+			// Descendants can inherit stdout after a successful parent exit. Allow
+			// buffered protocol events to drain before ending that read. In-flight
+			// tool accounting below decides whether termination is required.
+			if pipe, ok := stdout.(interface{ SetReadDeadline(time.Time) error }); ok {
+				_ = pipe.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+			}
+			select {
+			case <-processCtx.Done():
+				_ = finishCleanup()
+			case <-cleanup.done:
+			}
+		case <-cleanup.done:
+		}
 	}()
 
+	releaseExtension = nil
 	go func() {
+		defer removePiMcpExtension(extensionPath)
 		defer func() { releasePiSessionFileLock(sessionLock) }()
 		defer cancelProcess()
 		defer cancel()
@@ -556,6 +593,7 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 				continue
 			}
 			turnErrors.observeEvent(evt.Type)
+			cleanup.observe(evt.Type)
 
 			switch evt.Type {
 			case "agent_start":
@@ -675,6 +713,15 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 			}
 		}
 		scanErr := scanner.Err()
+		if errors.Is(scanErr, os.ErrDeadlineExceeded) {
+			select {
+			case <-cleanup.exited:
+				// This deadline only releases an inherited pipe after the runtime's
+				// own exit; all available events were consumed before the deadline.
+				scanErr = nil
+			default:
+			}
+		}
 		if scanErr != nil {
 			// Scanner stopped consuming stdout. Close the pipe before Wait so Pi,
 			// still writing an oversized event, cannot deadlock on the full OS
@@ -686,23 +733,29 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 			trySend(msgCh, Message{Type: MessageText, Content: d})
 		}
 
-		// Finish the user-owned stderr read before Wait closes StderrPipe. Normal
-		// exit gets the same 10s backstop cmd.WaitDelay used to provide when
-		// os/exec owned the copier. Cancellation and error-grace expiry close
-		// stderrRead above, so their finalization does not pay it.
-		stderrTimer := time.NewTimer(cmd.WaitDelay)
-		select {
-		case <-stderrDone:
-			stderrTimer.Stop()
-		case <-stderrTimer.C:
-			closePiReadPipe(stderrRead)
-			<-stderrDone
+		// Do not reap the root before the cancellation owner releases its numeric
+		// process group: an unreaped root prevents PGID reuse during cleanup.
+		if scanErr == nil && cleanup.tools.Load() == 0 && processCtx.Err() == nil && piCanObserveRuntimeExit && !piRuntimeExited(cmd) {
+			select {
+			case <-cleanup.exited:
+			case <-processCtx.Done():
+			}
 		}
+		var cleanupErr error
+		if scanErr != nil || cleanup.tools.Load() > 0 || processCtx.Err() != nil {
+			cleanupErr = finishCleanup()
+		} else {
+			cleanupErr = cleanup.complete(closeStdin, closePipes)
+		}
+		<-stderrDone
 
 		waitErr := cmd.Wait()
 		releaseProcessGroup(cmd)
 		duration := time.Since(startTime)
 		lastTurnError, turnErrorGraceExpired := turnErrors.finish()
+		if cleanupErr == nil && cleanup.tools.Load() > 0 && cleanup.unobserved {
+			cleanupErr = fmt.Errorf("runtime exited before tool process ownership could be recorded")
+		}
 
 		// Wait closes the process pipes, so a prompt write still blocked when the
 		// child exited has returned by now. The writer sends exactly once.
@@ -780,6 +833,11 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 				finalError = fmt.Sprintf("omp session file: %v", sessionErr)
 			}
 		}
+		if cleanupErr != nil {
+			finalStatus = "cleanup_unconfirmed"
+			finalError = fmt.Sprintf("%s process cleanup unconfirmed: %v; background processes may still be running. Check them before manually rerunning this task. %s", label, cleanupErr, finalError)
+			authoritativeTerminal = true
+		}
 
 		b.cfg.Logger.Info(label+" finished", "pid", cmd.Process.Pid, "status", finalStatus, "duration", duration.Round(time.Millisecond).String())
 		// Publish the authoritative terminal boundary before Result. The daemon
@@ -811,6 +869,7 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 	}()
 
 	return &Session{
+		CleanupRequired:  true,
 		Messages:         msgCh,
 		Result:           resCh,
 		TerminalObserved: turnErrors.terminalObserved,
@@ -1112,7 +1171,139 @@ func buildPiArgs(sessionPath string, opts ExecOptions, logger *slog.Logger) []st
 	// inlining the same runtime brief would duplicate it on every turn.
 	// Verified against Pi 0.67.2 (MUL-5392).
 	args = append(args, filterPiCustomArgs(opts.CustomArgs, logger)...)
+	// The extension is explicit, so Pi loads it without trusting the project.
+	// It stays after custom args so the managed path cannot be mistaken for the
+	// value of an extension-defined flag. A user-provided --approve remains
+	// independent and continues to opt into all project-local Pi resources.
+	if opts.piMcpExtensionPath != "" {
+		args = append(args, "--extension", opts.piMcpExtensionPath)
+	}
 	return args
+}
+
+const (
+	piMcpExtensionDirPrefix = "multica-pi-mcp-"
+	// Pi 0.99.0 introduced the built-in MCP extension and the
+	// registerMcpServer API used by the task-local adapter below. This is a
+	// capability floor, not a global Pi floor: older Pi installations keep
+	// working for agents without managed MCP configuration.
+	piMcpMinVersion = "0.99.0"
+)
+
+// preparePiMcpExtension writes Pi's own temporary extension. omp shares this
+// backend but keeps its project mcp.json, so it never gets this file.
+func (b *piBackend) preparePiMcpExtension(raw json.RawMessage) (string, error) {
+	if b.providerLabel == "omp" || !hasManagedMcpConfig(raw) {
+		return "", nil
+	}
+	servers, err := piMcpExtensionServers(raw)
+	if err != nil {
+		return "", err
+	}
+	if len(servers) == 0 {
+		return "", nil
+	}
+	if err := b.validatePiMcpVersion(); err != nil {
+		return "", err
+	}
+	return writePiMcpExtension(raw)
+}
+
+func (b *piBackend) validatePiMcpVersion() error {
+	// Custom runtime profiles only promise Pi's JSON protocol, not the vendor's
+	// version scheme. Their explicit extension load remains the capability
+	// probe; applying Pi's vendor floor would reject compatible wrappers.
+	if !b.cfg.BuiltinRuntime {
+		return nil
+	}
+	detected, err := parseSemver(b.cfg.CLIVersion)
+	if err != nil {
+		return fmt.Errorf("pi MCP requires a newer version: %s or later; could not verify detected version %q; upgrade Pi or remove the MCP configuration", piMcpMinVersion, b.cfg.CLIVersion)
+	}
+	minimum, _ := parseSemver(piMcpMinVersion)
+	if detected.lessThan(minimum) {
+		return fmt.Errorf("pi MCP requires a newer version: %s or later (detected %s); upgrade Pi or remove the MCP configuration", piMcpMinVersion, b.cfg.CLIVersion)
+	}
+	return nil
+}
+
+// writePiMcpExtension writes mcp-extension.mjs under a multica-pi-mcp-*
+// directory. An empty server list returns an empty path and leaves no
+// directory behind. The caller deletes the directory with
+// removePiMcpExtension. Pi validates each server; the generated extension
+// isolates those errors so one malformed entry cannot suppress valid servers.
+func writePiMcpExtension(raw json.RawMessage) (string, error) {
+	if !hasManagedMcpConfig(raw) {
+		return "", nil
+	}
+	servers, err := piMcpExtensionServers(raw)
+	if err != nil {
+		return "", err
+	}
+	if len(servers) == 0 {
+		return "", nil
+	}
+	encoded, err := json.Marshal(servers)
+	if err != nil {
+		return "", err
+	}
+	literal, err := json.Marshal(string(encoded))
+	if err != nil {
+		return "", err
+	}
+	script := "const servers = JSON.parse(" + string(literal) + ");\n" +
+		"export default function (pi) {\n" +
+		"  if (typeof pi.registerMcpServer !== \"function\") {\n" +
+		"    throw new Error(\"Multica MCP delivery requires Pi " + piMcpMinVersion + " or newer\");\n" +
+		"  }\n" +
+		"  for (const [name, config] of Object.entries(servers)) {\n" +
+		"    try {\n" +
+		"      pi.registerMcpServer(name, config);\n" +
+		"    } catch (error) {\n" +
+		"      const reason = error instanceof Error ? error.message : String(error);\n" +
+		"      console.error(\"[multica] could not register MCP server \" + JSON.stringify(name) + \": \" + reason);\n" +
+		"    }\n" +
+		"  }\n" +
+		"}\n"
+	dir, err := os.MkdirTemp("", piMcpExtensionDirPrefix)
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "mcp-extension.mjs")
+	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
+		removePiMcpExtension(path)
+		return "", err
+	}
+	return path, nil
+}
+
+// removePiMcpExtension deletes the temporary extension directory. It refuses
+// any path whose parent is not a multica-pi-mcp-* directory.
+func removePiMcpExtension(path string) {
+	if path == "" {
+		return
+	}
+	dir := filepath.Dir(path)
+	if !strings.HasPrefix(filepath.Base(dir), piMcpExtensionDirPrefix) {
+		return
+	}
+	_ = os.RemoveAll(dir)
+}
+
+func piMcpExtensionServers(raw json.RawMessage) (map[string]json.RawMessage, error) {
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, fmt.Errorf("parse mcp_config: %w", err)
+	}
+	rawServers, ok := doc["mcpServers"]
+	if !ok || bytes.Equal(bytes.TrimSpace(rawServers), []byte("null")) {
+		return nil, nil
+	}
+	var servers map[string]json.RawMessage
+	if err := json.Unmarshal(rawServers, &servers); err != nil {
+		return nil, fmt.Errorf("parse mcp_config mcpServers: %w", err)
+	}
+	return servers, nil
 }
 
 // filterPiCustomArgs removes @file and positional message inputs from

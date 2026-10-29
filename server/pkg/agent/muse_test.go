@@ -3,1023 +3,293 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
-	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
 
-// fakeMuseReceptionist is a scripted stand-in for the real receptionist.
-// It speaks the same wire protocol so the backend's HTTP behavior,
-// polling, streaming and failure mapping are all exercised without any
-// real network or agent run.
-type fakeMuseReceptionist struct {
-	mu           sync.Mutex
-	statuses     []museTaskStatus
-	statusCalls  int
-	events       []museEvent
-	cancelCalls  int
-	executeCalls int
-	executeCode  int
-	statusCode   int // HTTP code for /v1/tasks polls; 0 means 200
-	healthCode   int
-	health       museHealthResponse
-	authHeaders  []string
-	executeBody  []byte
-	sinceParams  []string // ?since= values seen on /events polls
-}
+const fakeMuseSessionID = "01a14870-5a2f-7791-b847-2385a5d47a8c"
 
-func (f *fakeMuseReceptionist) statusForCall() museTaskStatus {
-	if len(f.statuses) == 0 {
-		return museTaskStatus{Status: "running"}
-	}
-	i := f.statusCalls
-	if i >= len(f.statuses) {
-		i = len(f.statuses) - 1
-	}
-	return f.statuses[i]
-}
-
-func (f *fakeMuseReceptionist) handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/execute", func(w http.ResponseWriter, r *http.Request) {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		f.executeCalls++
-		f.authHeaders = append(f.authHeaders, r.Header.Get("Authorization"))
-		bodyBytes, _ := io.ReadAll(io.LimitReader(r.Body, 8<<20))
-		f.executeBody = bodyBytes
-		code := f.executeCode
-		if code == 0 {
-			code = 200
-		}
-		w.WriteHeader(code)
-		if code == 200 {
-			_ = json.NewEncoder(w).Encode(museExecuteResponse{TaskID: "task-1"})
-		}
-	})
-	mux.HandleFunc("/v1/tasks/task-1", func(w http.ResponseWriter, r *http.Request) {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		code := f.statusCode
-		if code == 0 {
-			code = 200
-		}
-		w.WriteHeader(code)
-		if code == 200 {
-			st := f.statusForCall()
-			f.statusCalls++
-			_ = json.NewEncoder(w).Encode(st)
-		}
-	})
-	mux.HandleFunc("/v1/tasks/task-1/events", func(w http.ResponseWriter, r *http.Request) {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		f.sinceParams = append(f.sinceParams, r.URL.Query().Get("since"))
-		// Deliberately ignores ?since= and always returns the full log:
-		// the backend must dedupe by seq itself.
-		_ = json.NewEncoder(w).Encode(museEventsResponse{Events: f.events})
-	})
-	mux.HandleFunc("/v1/tasks/task-1/cancel", func(w http.ResponseWriter, r *http.Request) {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		f.cancelCalls++
-		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
-	})
-	mux.HandleFunc("/v1/health", func(w http.ResponseWriter, r *http.Request) {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		code := f.healthCode
-		if code == 0 {
-			code = 200
-		}
-		w.WriteHeader(code)
-		if code == 200 {
-			h := f.health
-			// Default to protocol v1 if the test didn't set a version.
-			// (Real receptionists always return a version.)
-			if h.ProtocolVersion == 0 {
-				h.ProtocolVersion = 1
-			}
-			_ = json.NewEncoder(w).Encode(h)
-		}
-	})
-	return mux
-}
-
-func fastMusePolls(t *testing.T) {
+// writeFakeMuseServe writes a stand-in for `muse serve` that answers MSP on
+// stdio. It records every request line and its argv so a test can assert on the
+// protocol conversation instead of on timing.
+func writeFakeMuseServe(t *testing.T, resumeError bool) (bin, requests, args string) {
 	t.Helper()
-	oldInterval := musePollInterval.Load()
-	oldBudget := museMaxConsecutivePollErrors.Load()
-	musePollInterval.Store(int64(5 * time.Millisecond))
-	museMaxConsecutivePollErrors.Store(3)
-	t.Cleanup(func() {
-		musePollInterval.Store(oldInterval)
-		museMaxConsecutivePollErrors.Store(oldBudget)
-	})
-}
+	dir := t.TempDir()
+	bin = filepath.Join(dir, "muse")
+	requests = filepath.Join(dir, "requests.jsonl")
+	args = filepath.Join(dir, "args.txt")
 
-// museTestConfig points the backend at endpoint through the process
-// environment, which is the only place the backend reads its endpoint and
-// token from.
-func museTestConfig(t *testing.T, endpoint, token string) Config {
-	t.Helper()
-	t.Setenv(museEnvEndpoint, endpoint)
-	t.Setenv(museEnvToken, token)
-	return Config{Logger: slog.Default()}
-}
-
-func drainMuseSession(t *testing.T, s *Session) (Result, []Message) {
-	t.Helper()
-	var msgs []Message
-	for m := range s.Messages {
-		msgs = append(msgs, m)
+	resumeBranch := `    *'"method":"session/resume"'*)
+      printf '{"jsonrpc":"2.0","id":"%s","result":{"session":{"sessionId":"SESSION_ID"}}}\n' "$id"
+      ;;`
+	if resumeError {
+		resumeBranch = `    *'"method":"session/resume"'*)
+      printf '{"jsonrpc":"2.0","id":"%s","error":{"code":-32001,"message":"session not found","data":{"kind":"notFound"}}}\n' "$id"
+      ;;`
 	}
-	res := <-s.Result
-	return res, msgs
+
+	script := `#!/bin/sh
+printf '%s\n' "$*" > ARGS_PATH
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> REQUESTS_PATH
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":"%s","result":{"serverInfo":{"name":"muse","version":"1.4.10"},"schema":{"version":1}}}\n' "$id"
+      ;;
+RESUME_BRANCH
+    *'"method":"session/start"'*)
+      printf '{"jsonrpc":"2.0","id":"%s","result":{"session":{"sessionId":"SESSION_ID"},"viewCursor":"v1"}}\n' "$id"
+      ;;
+    *'"method":"session/setApprovalMode"'*)
+      printf '{"jsonrpc":"2.0","id":"%s","result":{"sessionId":"SESSION_ID","mode":"allowAll"}}\n' "$id"
+      ;;
+    *'"method":"session/setModel"'*)
+      printf '{"jsonrpc":"2.0","id":"%s","result":{"sessionId":"SESSION_ID","modelId":"new-model"}}\n' "$id"
+      ;;
+    *'"method":"turn/start"'*)
+      printf '{"jsonrpc":"2.0","id":"%s","result":{"startedNewTurn":true,"disposition":"started"}}\n' "$id"
+      sleep 0.02
+      printf '{"jsonrpc":"2.0","method":"turn/started","params":{"sessionId":"SESSION_ID","turnId":"turn-1"}}\n'
+      printf '{"jsonrpc":"2.0","method":"item/started","params":{"sessionId":"SESSION_ID","item":{"itemId":"tool-1","kind":"toolCall","status":"inProgress","tool":"shell","callId":"call-1","args":%s}}}\n' '{}'
+      printf '{"jsonrpc":"2.0","method":"item/completed","params":{"sessionId":"SESSION_ID","item":{"itemId":"tool-1","kind":"toolCall","status":"completed","tool":"shell","callId":"call-1","visibleOutput":"a.txt"}}}\n'
+      printf '{"jsonrpc":"2.0","method":"item/started","params":{"sessionId":"SESSION_ID","item":{"itemId":"msg-1","kind":"agentMessage","status":"inProgress"}}}\n'
+      printf '{"jsonrpc":"2.0","method":"item/delta","params":{"sessionId":"SESSION_ID","itemId":"msg-1","field":"text","delta":"Muse "}}\n'
+      printf '{"jsonrpc":"2.0","method":"item/delta","params":{"sessionId":"SESSION_ID","itemId":"msg-1","field":"text","delta":"finished"}}\n'
+      printf '{"jsonrpc":"2.0","method":"item/completed","params":{"sessionId":"SESSION_ID","item":{"itemId":"msg-1","kind":"agentMessage","status":"completed","messagePhase":"finalAnswer","text":"Muse finished"}}}\n'
+      printf '{"jsonrpc":"2.0","method":"session/tokenUsage","params":{"sessionId":"SESSION_ID","modelId":"muse-wonder-full-1.0","usage":{"inputTokens":120,"outputTokens":8,"cacheReadTokens":20,"cacheWriteTokens":0}}}\n'
+      printf '{"jsonrpc":"2.0","method":"turn/completed","params":{"sessionId":"SESSION_ID","turnId":"turn-1","terminal":"completed","durationMs":12}}\n'
+      ;;
+    *)
+      printf '{"jsonrpc":"2.0","id":"%s","error":{"code":-32601,"message":"method not found"}}\n' "$id"
+      ;;
+  esac
+done
+`
+
+	script = strings.ReplaceAll(script, "ARGS_PATH", args)
+	script = strings.ReplaceAll(script, "REQUESTS_PATH", requests)
+	script = strings.ReplaceAll(script, "RESUME_BRANCH", resumeBranch)
+	script = strings.ReplaceAll(script, "SESSION_ID", fakeMuseSessionID)
+
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake muse: %v", err)
+	}
+	return bin, requests, args
 }
 
-func TestMuseExecuteSuccess(t *testing.T) {
-	fastMusePolls(t)
-	fake := &fakeMuseReceptionist{
-		statuses: []museTaskStatus{
-			{Status: "running"},
-			{Status: "completed", Result: "all done"},
-		},
-		events: []museEvent{
-			{Seq: 1, Type: "text", Content: "hello "},
-			{Seq: 2, Type: "thinking", Content: "hmm"},
-			{Seq: 3, Type: "text", Content: "world"},
-			{Seq: 4, Type: "tool", Tool: "read_file", Content: "reading"},
-		},
-		health: museHealthResponse{ProtocolVersion: 1, Version: "9.9.9"},
-	}
-	srv := httptest.NewServer(fake.handler())
-	defer srv.Close()
-
-	b, err := New("muse", museTestConfig(t, srv.URL, "sekret"))
+func readMuseRequests(t *testing.T, path string) []map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("New(muse) = %v", err)
+		t.Fatalf("read recorded requests: %v", err)
 	}
-	sess, err := b.Execute(context.Background(), "do the thing", ExecOptions{Cwd: "/tmp/work-1"})
+	var out []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if line == "" {
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("recorded request is not JSON: %v", err)
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func museRequestByMethod(requests []map[string]any, method string) map[string]any {
+	for _, entry := range requests {
+		if entry["method"] == method {
+			return entry
+		}
+	}
+	return nil
+}
+
+func newFakeMuseBackend(t *testing.T, bin string) Backend {
+	t.Helper()
+	backend, err := New("muse", Config{
+		ExecutablePath: bin,
+		Logger:         slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})),
+	})
 	if err != nil {
-		t.Fatalf("Execute = %v", err)
+		t.Fatalf("New(muse): %v", err)
 	}
-	res, msgs := drainMuseSession(t, sess)
+	return backend
+}
 
-	if res.Status != "completed" {
-		t.Errorf("Status = %q, want completed", res.Status)
-	}
-	// The receptionist's result is the answer; the text events were commentary.
-	if res.Output != "all done" {
-		t.Errorf("Output = %q, want %q", res.Output, "all done")
-	}
-	if res.SessionID != "muse:task-1" {
-		t.Errorf("SessionID = %q, want muse:task-1", res.SessionID)
+func TestMuseExecuteStreamsTurn(t *testing.T) {
+	t.Parallel()
+	bin, requestsPath, argsPath := writeFakeMuseServe(t, false)
+	backend := newFakeMuseBackend(t, bin)
+
+	session, err := backend.Execute(context.Background(), "do the thing", ExecOptions{
+		Cwd:   t.TempDir(),
+		Model: "muse-wonder-full-1.0",
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
 	}
 
-	var sawText, sawThinking, sawTool, sawRunning int
-	for _, m := range msgs {
-		switch m.Type {
+	var text strings.Builder
+	var toolUse, toolResult bool
+	for msg := range session.Messages {
+		switch msg.Type {
 		case MessageText:
-			sawText++
-		case MessageThinking:
-			sawThinking++
-			if m.Content != "hmm" {
-				t.Errorf("thinking content = %q", m.Content)
-			}
+			text.WriteString(msg.Content)
 		case MessageToolUse:
-			sawTool++
-			if m.Tool != "read_file" {
-				t.Errorf("tool = %q", m.Tool)
-			}
-		case MessageStatus:
-			sawRunning++
+			toolUse = msg.Tool == "shell" && msg.CallID == "call-1"
+		case MessageToolResult:
+			toolResult = msg.Tool == "shell" && msg.CallID == "call-1" && msg.Output == "a.txt"
 		}
 	}
-	// The fake returns the full event log on every poll; each event must be
-	// emitted exactly once.
-	if sawText != 2 || sawThinking != 1 || sawTool != 1 {
-		t.Errorf("message counts text=%d thinking=%d tool=%d, want 2/1/1", sawText, sawThinking, sawTool)
-	}
-	if sawRunning != 1 {
-		t.Errorf("status messages = %d, want 1", sawRunning)
+
+	var result Result
+	for res := range session.Result {
+		result = res
 	}
 
-	fake.mu.Lock()
-	defer fake.mu.Unlock()
-	if fake.executeCalls != 1 {
-		t.Errorf("execute calls = %d, want 1", fake.executeCalls)
+	if result.Status != "completed" {
+		t.Fatalf("status = %q, want completed (error %q)", result.Status, result.Error)
 	}
-	if len(fake.authHeaders) == 0 || fake.authHeaders[0] != "Bearer sekret" {
-		t.Errorf("auth headers = %v, want [Bearer sekret]", fake.authHeaders)
+	if result.Output != "Muse finished" {
+		t.Fatalf("output = %q, want the final-answer text", result.Output)
 	}
-	var body museExecuteRequest
-	if err := json.Unmarshal(fake.executeBody, &body); err != nil {
-		t.Fatalf("decode execute body: %v", err)
+	if result.SessionID != fakeMuseSessionID {
+		t.Fatalf("session id = %q", result.SessionID)
 	}
-	if body.Prompt != "do the thing" {
-		t.Errorf("prompt = %q", body.Prompt)
+	if got := text.String(); got != "Muse finished" {
+		t.Fatalf("streamed text = %q, want the two deltas only", got)
 	}
-	if body.WorkDir != "/tmp/work-1" {
-		t.Errorf("workdir = %q, want /tmp/work-1", body.WorkDir)
+	if !toolUse {
+		t.Fatal("tool-use message did not carry tool/callId")
 	}
-	// The backend must poll incrementally: first ?since=0, then ?since=4
-	// once the four scripted events are consumed.
-	if len(fake.sinceParams) == 0 {
-		t.Error("no ?since= params observed on /events polls")
-	} else {
-		if fake.sinceParams[0] != "0" {
-			t.Errorf("first since = %q, want 0", fake.sinceParams[0])
-		}
-		advanced := false
-		for _, s := range fake.sinceParams[1:] {
-			if s != "0" && s != "" {
-				advanced = true
-			}
-		}
-		if !advanced {
-			t.Errorf("since never advanced past 0: %v", fake.sinceParams)
-		}
+	if !toolResult {
+		t.Fatal("tool-result message did not carry visibleOutput")
+	}
+	want := TokenUsage{InputTokens: 100, OutputTokens: 8, CacheReadTokens: 20}
+	if got := result.Usage["muse-wonder-full-1.0"]; got != want {
+		t.Fatalf("usage = %+v, want %+v (cache reads subtracted from input)", got, want)
+	}
+
+	argv, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read argv: %v", err)
+	}
+	if !strings.Contains(string(argv), "serve") {
+		t.Fatalf("argv = %q, want the serve subcommand", string(argv))
+	}
+	if strings.Contains(string(argv), "--yolo") {
+		t.Fatalf("argv = %q, must not pass --yolo; approval is selected on the wire", string(argv))
+	}
+
+	requests := readMuseRequests(t, requestsPath)
+	start := museRequestByMethod(requests, "session/start")
+	if start == nil {
+		t.Fatal("no session/start recorded")
+	}
+	params, _ := start["params"].(map[string]any)
+	if params["approvalMode"] != "allowAll" {
+		t.Fatalf("approvalMode = %v, want allowAll", params["approvalMode"])
+	}
+	if params["modelId"] != "muse-wonder-full-1.0" {
+		t.Fatalf("modelId = %v, want the agent's model", params["modelId"])
+	}
+	if params["workspaceRoot"] == "" {
+		t.Fatal("session/start carried no workspaceRoot")
+	}
+	commandID, _ := params["commandId"].(string)
+	if !regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).MatchString(commandID) {
+		t.Fatalf("commandId %q is not a UUIDv7", commandID)
+	}
+
+	turn := museRequestByMethod(requests, "turn/start")
+	if turn == nil {
+		t.Fatal("no turn/start recorded")
+	}
+	turnParams, _ := turn["params"].(map[string]any)
+	if turnParams["sessionId"] != fakeMuseSessionID {
+		t.Fatalf("turn/start sessionId = %v", turnParams["sessionId"])
+	}
+	parts, _ := turnParams["input"].([]any)
+	if len(parts) != 1 {
+		t.Fatalf("turn/start input = %v, want one text part", turnParams["input"])
 	}
 }
 
-func TestMuseExecuteForwardsTaskToken(t *testing.T) {
-	fastMusePolls(t)
-	fake := &fakeMuseReceptionist{
-		statuses: []museTaskStatus{
-			{Status: "completed", Result: "done"},
-		},
-		health: museHealthResponse{ProtocolVersion: 1, Version: "9.9.9"},
-	}
-	srv := httptest.NewServer(fake.handler())
-	defer srv.Close()
+func TestMuseExecuteReportsResumeRejection(t *testing.T) {
+	t.Parallel()
+	bin, _, _ := writeFakeMuseServe(t, true)
+	backend := newFakeMuseBackend(t, bin)
 
-	b, err := New("muse", museTestConfig(t, srv.URL, "sekret"))
-	if err != nil {
-		t.Fatalf("New(muse) = %v", err)
-	}
-	_, err = b.Execute(context.Background(), "do the thing", ExecOptions{
-		Cwd:                "/tmp/work-1",
-		TaskToken:          "mat_abc123",
-		MulticaServerURL:   "https://multica.example.com",
-		MulticaWorkspaceID: "ws-123",
+	session, err := backend.Execute(context.Background(), "continue", ExecOptions{
+		Cwd:             t.TempDir(),
+		ResumeSessionID: "01a14870-0000-7000-8000-000000000000",
 	})
 	if err != nil {
-		t.Fatalf("Execute = %v", err)
+		t.Fatalf("Execute: %v", err)
 	}
-	var body museExecuteRequest
-	if err := json.Unmarshal(fake.executeBody, &body); err != nil {
-		t.Fatalf("decode execute body: %v", err)
+	for range session.Messages {
 	}
-	if body.TaskToken != "mat_abc123" {
-		t.Errorf("task_token = %q, want %q", body.TaskToken, "mat_abc123")
+	var result Result
+	for res := range session.Result {
+		result = res
 	}
-	if body.ServerURL != "https://multica.example.com" {
-		t.Errorf("server_url = %q", body.ServerURL)
+	if result.Status != "failed" {
+		t.Fatalf("status = %q, want failed", result.Status)
 	}
-	if body.WorkspaceID != "ws-123" {
-		t.Errorf("workspace_id = %q", body.WorkspaceID)
-	}
-}
-
-func TestMuseExecuteEmptyPrompt(t *testing.T) {
-	fake := &fakeMuseReceptionist{}
-	srv := httptest.NewServer(fake.handler())
-	defer srv.Close()
-
-	b, _ := New("muse", museTestConfig(t, srv.URL, ""))
-	for _, prompt := range []string{"", "   ", "\n\t "} {
-		if _, err := b.Execute(context.Background(), prompt, ExecOptions{}); err == nil {
-			t.Errorf("Execute(%q) succeeded, want error", prompt)
-		}
-	}
-	fake.mu.Lock()
-	defer fake.mu.Unlock()
-	if fake.executeCalls != 0 {
-		t.Errorf("execute calls = %d, want 0 (rejected before any HTTP)", fake.executeCalls)
+	if !result.ResumeRejected {
+		t.Fatal("a notFound resume must be reported as ResumeRejected so the daemon retries fresh")
 	}
 }
 
-func TestMuseExecuteMissingEndpoint(t *testing.T) {
-	t.Setenv(museEnvEndpoint, "")
-	b, err := New("muse", Config{Logger: slog.Default()})
-	if err != nil {
-		t.Fatalf("New(muse) = %v", err)
+func TestMuseUUIDv7IsTimeOrdered(t *testing.T) {
+	t.Parallel()
+	first := museUUIDv7()
+	time.Sleep(2 * time.Millisecond)
+	second := museUUIDv7()
+
+	pattern := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	if !pattern.MatchString(first) || !pattern.MatchString(second) {
+		t.Fatalf("ids %q / %q are not UUIDv7", first, second)
 	}
-	t.Setenv(museEnvEndpoint, "")
-	if _, err := b.Execute(context.Background(), "hi", ExecOptions{}); err == nil {
-		t.Fatal("Execute succeeded without MUSE_ENDPOINT, want error")
-	} else if !strings.Contains(err.Error(), museEnvEndpoint) {
-		t.Errorf("error = %q, want it to name %s", err, museEnvEndpoint)
+	if first >= second {
+		t.Fatalf("UUIDv7 ids are not time-ordered: %q then %q", first, second)
 	}
 }
 
-func TestMuseExecuteInvalidEndpoint(t *testing.T) {
-	b, _ := New("muse", museTestConfig(t, "://not-a-url", ""))
-	if _, err := b.Execute(context.Background(), "hi", ExecOptions{}); err == nil {
-		t.Fatal("Execute succeeded with garbage endpoint, want error")
+func TestMuseToolInputDecodesArguments(t *testing.T) {
+	t.Parallel()
+	decoded := museToolInput([]byte(`{"cmd":"ls","cwd":"/w"}`))
+	if decoded["cmd"] != "ls" || decoded["cwd"] != "/w" {
+		t.Fatalf("decoded = %v, want the model's argument object", decoded)
+	}
+	// Muse carries args verbatim as a string. A non-object payload must still
+	// be visible on the board rather than silently dropped.
+	fallback := museToolInput([]byte(`"ls -la"`))
+	if fallback["arguments"] != "ls -la" {
+		t.Fatalf("fallback = %v, want the raw payload under arguments", fallback)
+	}
+	if museToolInput(nil) != nil {
+		t.Fatal("empty args must decode to nil, not an empty map")
 	}
 }
 
-func TestMuseExecuteHTTPError(t *testing.T) {
-	fake := &fakeMuseReceptionist{executeCode: 500}
-	srv := httptest.NewServer(fake.handler())
-	defer srv.Close()
-
-	b, _ := New("muse", museTestConfig(t, srv.URL, ""))
-	if _, err := b.Execute(context.Background(), "hi", ExecOptions{}); err == nil {
-		t.Fatal("Execute succeeded on HTTP 500, want error")
-	} else if !strings.Contains(err.Error(), "500") {
-		t.Errorf("error = %q, want HTTP status", err)
-	}
-}
-
-func TestMuseExecuteUnauthorized(t *testing.T) {
-	fake := &fakeMuseReceptionist{executeCode: 401}
-	srv := httptest.NewServer(fake.handler())
-	defer srv.Close()
-
-	b, _ := New("muse", museTestConfig(t, srv.URL, "wrong"))
-	if _, err := b.Execute(context.Background(), "hi", ExecOptions{}); err == nil {
-		t.Fatal("Execute succeeded on HTTP 401, want error")
-	} else if !strings.Contains(err.Error(), museEnvToken) {
-		t.Errorf("error = %q, want it to name %s", err, museEnvToken)
-	}
-}
-
-func TestMuseExecuteRemoteFailure(t *testing.T) {
-	fastMusePolls(t)
-	fake := &fakeMuseReceptionist{
-		statuses: []museTaskStatus{{Status: "failed", Error: "boom"}},
-	}
-	srv := httptest.NewServer(fake.handler())
-	defer srv.Close()
-
-	b, _ := New("muse", museTestConfig(t, srv.URL, ""))
-	sess, err := b.Execute(context.Background(), "hi", ExecOptions{})
-	if err != nil {
-		t.Fatalf("Execute = %v", err)
-	}
-	res, _ := drainMuseSession(t, sess)
-	if res.Status != "failed" {
-		t.Errorf("Status = %q, want failed", res.Status)
-	}
-	if res.Error != "boom" {
-		t.Errorf("Error = %q, want boom", res.Error)
-	}
-}
-
-func TestMuseExecuteCancel(t *testing.T) {
-	fastMusePolls(t)
-	fake := &fakeMuseReceptionist{} // never completes: always "running"
-	srv := httptest.NewServer(fake.handler())
-	defer srv.Close()
-
-	b, _ := New("muse", museTestConfig(t, srv.URL, ""))
-	ctx, cancel := context.WithCancel(context.Background())
-	sess, err := b.Execute(ctx, "hi", ExecOptions{})
-	if err != nil {
-		t.Fatalf("Execute = %v", err)
-	}
-	time.Sleep(30 * time.Millisecond) // let at least one poll round happen
-	cancel()
-	res, _ := drainMuseSession(t, sess)
-	if res.Status != "aborted" {
-		t.Errorf("Status = %q, want aborted", res.Status)
-	}
-	fake.mu.Lock()
-	defer fake.mu.Unlock()
-	if fake.cancelCalls != 1 {
-		t.Errorf("cancel calls = %d, want 1", fake.cancelCalls)
-	}
-}
-
-func TestMuseExecuteTimeout(t *testing.T) {
-	fastMusePolls(t)
-	fake := &fakeMuseReceptionist{} // never completes
-	srv := httptest.NewServer(fake.handler())
-	defer srv.Close()
-
-	b, _ := New("muse", museTestConfig(t, srv.URL, ""))
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	sess, err := b.Execute(ctx, "hi", ExecOptions{Timeout: 50 * time.Millisecond})
-	if err != nil {
-		t.Fatalf("Execute = %v", err)
-	}
-	res, _ := drainMuseSession(t, sess)
-	if res.Status != "timeout" {
-		t.Errorf("Status = %q, want timeout", res.Status)
-	}
-}
-
-func TestMuseExecutePollBudgetExhausted(t *testing.T) {
-	fastMusePolls(t)
-	fake := &fakeMuseReceptionist{statusCode: 500} // polls always fail
-	srv := httptest.NewServer(fake.handler())
-	defer srv.Close()
-
-	b, _ := New("muse", museTestConfig(t, srv.URL, ""))
-	sess, err := b.Execute(context.Background(), "hi", ExecOptions{})
-	if err != nil {
-		t.Fatalf("Execute = %v", err)
-	}
-	res, _ := drainMuseSession(t, sess)
-	if res.Status != "failed" {
-		t.Errorf("Status = %q, want failed", res.Status)
-	}
-	if !strings.Contains(res.Error, "unreachable") {
-		t.Errorf("Error = %q, want unreachable", res.Error)
-	}
-}
-
-func TestMuseExecuteResumeSessionID(t *testing.T) {
-	fastMusePolls(t)
-	fake := &fakeMuseReceptionist{
-		statuses: []museTaskStatus{{Status: "completed", Result: "ok"}},
-	}
-	srv := httptest.NewServer(fake.handler())
-	defer srv.Close()
-
-	b, _ := New("muse", museTestConfig(t, srv.URL, ""))
-	sess, err := b.Execute(context.Background(), "hi", ExecOptions{ResumeSessionID: "muse:task-9"})
-	if err != nil {
-		t.Fatalf("Execute = %v", err)
-	}
-	res, _ := drainMuseSession(t, sess)
-	if res.Status != "completed" {
-		t.Errorf("Status = %q, want completed", res.Status)
-	}
-	fake.mu.Lock()
-	defer fake.mu.Unlock()
-	var body museExecuteRequest
-	if err := json.Unmarshal(fake.executeBody, &body); err != nil {
-		t.Fatalf("decode execute body: %v", err)
-	}
-	if body.SessionID != "muse:task-9" {
-		t.Errorf("session_id = %q, want muse:task-9", body.SessionID)
-	}
-}
-
-// The agent's custom_env reaches the backend as cfg.Env. It must not be able to
-// redirect the backend: the receptionist is whatever the daemon's own
-// environment says, and the daemon's token must never be sent anywhere else.
-func TestMuseEndpointAndTokenIgnoreCfgEnv(t *testing.T) {
-	fastMusePolls(t)
-	legit := &fakeMuseReceptionist{
-		statuses: []museTaskStatus{{Status: "completed", Result: "ok"}},
-	}
-	legitSrv := httptest.NewServer(legit.handler())
-	defer legitSrv.Close()
-
-	var mu sync.Mutex
-	var elsewhere []string
-	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		elsewhere = append(elsewhere, r.URL.Path+" "+r.Header.Get("Authorization"))
-		mu.Unlock()
-		http.NotFound(w, r)
-	}))
-	defer other.Close()
-
-	t.Setenv(museEnvEndpoint, legitSrv.URL)
-	t.Setenv(museEnvToken, "daemon-token")
-	b, _ := New("muse", Config{
-		Logger: slog.Default(),
-		Env:    map[string]string{museEnvEndpoint: other.URL, museEnvToken: "agent-token"},
-	})
-	sess, err := b.Execute(context.Background(), "hi", ExecOptions{})
-	if err != nil {
-		t.Fatalf("Execute = %v", err)
-	}
-	res, _ := drainMuseSession(t, sess)
-	if res.Status != "completed" {
-		t.Errorf("Status = %q, want completed (the process-env receptionist must serve the run)", res.Status)
-	}
-	mu.Lock()
-	if len(elsewhere) != 0 {
-		t.Errorf("a cfg.Env endpoint received requests: %q", elsewhere)
-	}
-	mu.Unlock()
-	legit.mu.Lock()
-	defer legit.mu.Unlock()
-	if len(legit.authHeaders) == 0 || legit.authHeaders[0] != "Bearer daemon-token" {
-		t.Errorf("auth headers = %v, want [Bearer daemon-token]", legit.authHeaders)
-	}
-}
-
-// The task id is the receptionist's input. A hostile or buggy id must stay one
-// path segment of a task URL.
-func TestMuseTaskIDIsEscapedInRequestPaths(t *testing.T) {
-	fastMusePolls(t)
-	const hostileID = "../admin/x?y=1#"
-	var mu sync.Mutex
-	var escaped []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		escaped = append(escaped, r.URL.EscapedPath())
-		mu.Unlock()
-		if r.URL.EscapedPath() == "/v1/execute" {
-			_ = json.NewEncoder(w).Encode(museExecuteResponse{TaskID: hostileID})
-			return
-		}
-		_ = json.NewEncoder(w).Encode(museTaskStatus{Status: "completed"})
-	}))
-	defer srv.Close()
-
-	b, _ := New("muse", museTestConfig(t, srv.URL, "tok"))
-	sess, err := b.Execute(context.Background(), "hi", ExecOptions{})
-	if err != nil {
-		t.Fatalf("Execute = %v", err)
-	}
-	drainMuseSession(t, sess)
-
-	mu.Lock()
-	defer mu.Unlock()
-	taskPath := "/v1/tasks/" + url.PathEscape(hostileID)
-	sawTaskPath := false
-	for _, p := range escaped[1:] { // [0] is /v1/execute
-		if p != taskPath && p != taskPath+"/events" {
-			t.Errorf("request path %q left the task URL; want %q or %q/events", p, taskPath, taskPath)
-		}
-		if p == taskPath {
-			sawTaskPath = true
-		}
-	}
-	if !sawTaskPath {
-		t.Errorf("no status poll reached %q; paths = %q", taskPath, escaped)
-	}
-}
-
-// The events and status polls are separate requests, so the receptionist can
-// write its last event between them. The answer must still contain it.
-func TestMuseFinalEventsDrainedAfterTerminalStatus(t *testing.T) {
-	fastMusePolls(t)
-	var mu sync.Mutex
-	events := []museEvent{{Seq: 1, Type: "text", Content: "head "}}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/execute", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(museExecuteResponse{TaskID: "task-1"})
-	})
-	mux.HandleFunc("/v1/tasks/task-1/events", func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-		_ = json.NewEncoder(w).Encode(museEventsResponse{Events: events})
-	})
-	mux.HandleFunc("/v1/tasks/task-1", func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-		// The task finishes after the backend's events poll: the tail is
-		// written and the status flips in the same step.
-		if len(events) == 1 {
-			events = append(events, museEvent{Seq: 2, Type: "text", Content: "tail"})
-		}
-		_ = json.NewEncoder(w).Encode(museTaskStatus{Status: "completed"})
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	b, _ := New("muse", museTestConfig(t, srv.URL, ""))
-	sess, err := b.Execute(context.Background(), "hi", ExecOptions{})
-	if err != nil {
-		t.Fatalf("Execute = %v", err)
-	}
-	res, msgs := drainMuseSession(t, sess)
-	if res.Output != "head tail" {
-		t.Errorf("Output = %q, want %q", res.Output, "head tail")
-	}
-	var texts []string
-	for _, m := range msgs {
-		if m.Type == MessageText {
-			texts = append(texts, m.Content)
-		}
-	}
-	if strings.Join(texts, "") != "head tail" {
-		t.Errorf("streamed text = %q, want %q", texts, "head tail")
-	}
-}
-
-// "result" is the receptionist's final answer; the text events are commentary
-// on the way there. The answer must be the result, and the commentary must
-// still reach the transcript.
-func TestMuseResultIsTheAnswerNotTheEventText(t *testing.T) {
-	fastMusePolls(t)
-	fake := &fakeMuseReceptionist{
-		statuses: []museTaskStatus{{Status: "completed", Result: "The final answer."}},
-		events: []museEvent{
-			{Seq: 1, Type: "text", Content: "Looking that up... "},
-			{Seq: 2, Type: "text", Content: "Almost there."},
-		},
-	}
-	srv := httptest.NewServer(fake.handler())
-	defer srv.Close()
-
-	b, _ := New("muse", museTestConfig(t, srv.URL, ""))
-	sess, err := b.Execute(context.Background(), "hi", ExecOptions{})
-	if err != nil {
-		t.Fatalf("Execute = %v", err)
-	}
-	res, msgs := drainMuseSession(t, sess)
-	if res.Output != "The final answer." {
-		t.Errorf("Output = %q, want the receptionist's result", res.Output)
-	}
-	var streamed []string
-	for _, m := range msgs {
-		if m.Type == MessageText {
-			streamed = append(streamed, m.Content)
-		}
-	}
-	if strings.Join(streamed, "") != "Looking that up... Almost there." {
-		t.Errorf("streamed text = %q, want the commentary events", streamed)
-	}
-}
-
-// The protocol has three event types. Anything else is not words for the user.
-func TestMuseUnknownEventTypesAreIgnored(t *testing.T) {
-	fastMusePolls(t)
-	fake := &fakeMuseReceptionist{
-		statuses: []museTaskStatus{{Status: "completed"}},
-		events: []museEvent{
-			{Seq: 1, Type: "text", Content: "answer"},
-			{Seq: 2, Type: "status", Content: "INTERNAL-STATUS"},
-			{Seq: 3, Type: "", Content: "UNTYPED"},
-			{Seq: 4, Type: "error", Content: "SOME-ERROR"},
-		},
-	}
-	srv := httptest.NewServer(fake.handler())
-	defer srv.Close()
-
-	b, _ := New("muse", museTestConfig(t, srv.URL, ""))
-	sess, err := b.Execute(context.Background(), "hi", ExecOptions{})
-	if err != nil {
-		t.Fatalf("Execute = %v", err)
-	}
-	res, msgs := drainMuseSession(t, sess)
-	if res.Output != "answer" {
-		t.Errorf("Output = %q, want only the text event", res.Output)
-	}
-	for _, m := range msgs {
-		if strings.Contains(m.Content, "INTERNAL-STATUS") || strings.Contains(m.Content, "UNTYPED") || strings.Contains(m.Content, "SOME-ERROR") {
-			t.Errorf("an unknown event type reached the transcript: %+v", m)
-		}
-	}
-}
-
-func TestMuseNewWithoutEnv(t *testing.T) {
-	// The SupportedTypes lockstep test constructs every backend with a bare
-	// Config; muse must not fail construction for lack of configuration —
-	// that surfaces at Execute time instead.
-	t.Setenv(museEnvEndpoint, "")
-	if _, err := New("muse", Config{Logger: slog.Default()}); err != nil {
-		t.Errorf("New(muse) without env = %v, want nil", err)
-	}
-}
-
-func TestProbeMuseReceptionist(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("healthy", func(t *testing.T) {
-		fake := &fakeMuseReceptionist{health: museHealthResponse{ProtocolVersion: 1, Version: "1.2.3"}}
-		srv := httptest.NewServer(fake.handler())
-		defer srv.Close()
-		v, err := ProbeMuseReceptionist(ctx, srv.URL, "sekret")
-		if err != nil {
-			t.Fatalf("probe = %v", err)
-		}
-		if v != "1.2.3" {
-			t.Errorf("version = %q, want 1.2.3", v)
-		}
-	})
-
-	t.Run("protocol skew", func(t *testing.T) {
-		fake := &fakeMuseReceptionist{health: museHealthResponse{ProtocolVersion: 999, Version: "9.9.9"}}
-		srv := httptest.NewServer(fake.handler())
-		defer srv.Close()
-		if _, err := ProbeMuseReceptionist(ctx, srv.URL, ""); err == nil {
-			t.Fatal("probe succeeded on protocol skew, want error")
-		} else if !strings.Contains(err.Error(), "protocol skew") {
-			t.Errorf("error = %q, want protocol skew", err)
-		}
-	})
-
-	t.Run("unreachable", func(t *testing.T) {
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-		url := srv.URL
-		srv.Close()
-		if _, err := ProbeMuseReceptionist(ctx, url, ""); err == nil {
-			t.Fatal("probe succeeded on closed port, want error")
-		}
-	})
-
-	t.Run("empty endpoint", func(t *testing.T) {
-		if _, err := ProbeMuseReceptionist(ctx, "  ", ""); err == nil {
-			t.Fatal("probe succeeded on empty endpoint, want error")
-		}
-	})
-
-	t.Run("health 500", func(t *testing.T) {
-		fake := &fakeMuseReceptionist{healthCode: 500}
-		srv := httptest.NewServer(fake.handler())
-		defer srv.Close()
-		if _, err := ProbeMuseReceptionist(ctx, srv.URL, ""); err == nil {
-			t.Fatal("probe succeeded on HTTP 500, want error")
-		}
-	})
-}
-
-func TestMuseExecuteEmptyTaskID(t *testing.T) {
-	fake := &fakeMuseReceptionist{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/execute" {
-			_ = json.NewEncoder(w).Encode(museExecuteResponse{TaskID: ""})
-			return
-		}
-		fake.handler().ServeHTTP(w, r)
-	}))
-	defer srv.Close()
-
-	b, _ := New("muse", museTestConfig(t, srv.URL, ""))
-	if _, err := b.Execute(context.Background(), "hi", ExecOptions{}); err == nil {
-		t.Fatal("Execute succeeded on empty task id, want error")
-	} else if !strings.Contains(err.Error(), "empty task id") {
-		t.Errorf("error = %q, want empty task id", err)
-	}
-}
-
-func TestMuseExecuteUnknownStatus(t *testing.T) {
-	fastMusePolls(t)
-	fake := &fakeMuseReceptionist{
-		statuses: []museTaskStatus{{Status: "vaporware"}},
-	}
-	srv := httptest.NewServer(fake.handler())
-	defer srv.Close()
-
-	b, _ := New("muse", museTestConfig(t, srv.URL, ""))
-	sess, err := b.Execute(context.Background(), "hi", ExecOptions{})
-	if err != nil {
-		t.Fatalf("Execute = %v", err)
-	}
-	res, _ := drainMuseSession(t, sess)
-	if res.Status != "failed" {
-		t.Errorf("Status = %q, want failed (unknown status must not poll forever)", res.Status)
-	}
-	if !strings.Contains(res.Error, "unknown status") {
-		t.Errorf("Error = %q, want unknown status", res.Error)
-	}
-}
-
-// TestMuseCompletedWithErrorIsFailed: N1 regression.
-// When the receptionist returns completed+error (e.g. "result too large"),
-// the backend must report failed, not completed with transcript fallback.
-func TestMuseCompletedWithErrorIsFailed(t *testing.T) {
-	fastMusePolls(t)
-	fake := &fakeMuseReceptionist{
-		statuses: []museTaskStatus{{
-			Status: "completed",
-			Error:  "result too large (204801 bytes > 204800 byte limit)",
-		}},
-	}
-	srv := httptest.NewServer(fake.handler())
-	defer srv.Close()
-
-	b, _ := New("muse", museTestConfig(t, srv.URL, ""))
-	sess, err := b.Execute(context.Background(), "hi", ExecOptions{})
-	if err != nil {
-		t.Fatalf("Execute = %v", err)
-	}
-	res, _ := drainMuseSession(t, sess)
-	if res.Status != "failed" {
-		t.Errorf("Status = %q, want failed (completed+error is not success)", res.Status)
-	}
-	if !strings.Contains(res.Error, "result too large") {
-		t.Errorf("Error = %q, want 'result too large'", res.Error)
-	}
-}
-
-// TestMuseExecuteSendsProtocolVersion: Go-B3 regression.
-// The execute request must carry protocol_version so the receptionist
-// can reject incompatible versions before creating the task.
-func TestMuseExecuteSendsProtocolVersion(t *testing.T) {
-	fastMusePolls(t)
-	fake := &fakeMuseReceptionist{
-		statuses: []museTaskStatus{{Status: "completed", Result: "done"}},
-	}
-	srv := httptest.NewServer(fake.handler())
-	defer srv.Close()
-
-	b, _ := New("muse", museTestConfig(t, srv.URL, ""))
-	sess, err := b.Execute(context.Background(), "hi", ExecOptions{})
-	if err != nil {
-		t.Fatalf("Execute = %v", err)
-	}
-	drainMuseSession(t, sess)
-
-	fake.mu.Lock()
-	defer fake.mu.Unlock()
-	if len(fake.executeBody) == 0 {
-		t.Fatal("no execute request captured")
-	}
-	var req museExecuteRequest
-	if err := json.Unmarshal(fake.executeBody, &req); err != nil {
-		t.Fatalf("failed to parse execute request: %v", err)
-	}
-	if req.ProtocolVersion != museProtocolVersion {
-		t.Errorf("ProtocolVersion = %d, want %d", req.ProtocolVersion, museProtocolVersion)
-	}
-}
-
-// TestMuseProtocolSkewCancelsOrphanedTask: Go-B3 regression.
-// If the receptionist accepts the task but reports a version mismatch,
-// the backend must attempt to cancel the orphaned task.
-func TestMuseProtocolSkewCancelsOrphanedTask(t *testing.T) {
-	fastMusePolls(t)
-	// Fake that returns v2 in execute response (simulating old receptionist
-	// without pre-create validation)
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/health", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(museHealthResponse{ProtocolVersion: 1, Version: "1.0"})
-	})
-	var cancelCalls int
-	var mu sync.Mutex
-	mux.HandleFunc("/v1/execute", func(w http.ResponseWriter, r *http.Request) {
-		// Old receptionist: creates task, returns v2 in response
-		_ = json.NewEncoder(w).Encode(museExecuteResponse{
-			TaskID:          "orphan-task-1",
-			ProtocolVersion: 2,
-		})
-	})
-	mux.HandleFunc("/v1/tasks/orphan-task-1/cancel", func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		cancelCalls++
-		mu.Unlock()
-		w.WriteHeader(200)
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	b, _ := New("muse", museTestConfig(t, srv.URL, ""))
-	_, err := b.Execute(context.Background(), "hi", ExecOptions{})
-	if err == nil {
-		t.Fatal("Execute should fail on protocol skew")
-	}
-	if !strings.Contains(err.Error(), "protocol skew") {
-		t.Errorf("Error = %q, want protocol skew", err.Error())
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if cancelCalls == 0 {
-		t.Error("expected cancel attempt for orphaned task, got 0")
-	}
-}
-
-// TestMuseProbeProtocolSkew: Codex round2 item 5.
-// probeMuseReceptionist must map version mismatch to ErrMuseProtocolSkew.
-func TestMuseProbeProtocolSkew(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/health", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(museHealthResponse{ProtocolVersion: 999, Version: "9.9"})
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	_, err := ProbeMuseReceptionist(context.Background(), srv.URL, "")
-	if err == nil {
-		t.Fatal("expected protocol skew error")
-	}
-	if !strings.Contains(err.Error(), "protocol skew") {
-		t.Errorf("Error = %q, want protocol skew", err.Error())
-	}
-}
-
-// TestMuseProbeProtocolOK: matching version passes.
-func TestMuseProbeProtocolOK(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/health", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(museHealthResponse{ProtocolVersion: museProtocolVersion, Version: "1.4.0"})
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	ver, err := ProbeMuseReceptionist(context.Background(), srv.URL, "")
-	if err != nil {
-		t.Fatalf("Probe = %v", err)
-	}
-	if ver != "1.4.0" {
-		t.Errorf("Version = %q, want 1.4.0", ver)
-	}
-}
-
-// TestMuseTimeoutSRoundsUp: Codex round2 item 5.
-// Sub-second timeout must round up to 1, not truncate to 0.
-func TestMuseTimeoutSRoundsUp(t *testing.T) {
-	fastMusePolls(t)
-	fake := &fakeMuseReceptionist{
-		statuses: []museTaskStatus{{Status: "completed", Result: "done"}},
-	}
-	srv := httptest.NewServer(fake.handler())
-	defer srv.Close()
-
-	b, _ := New("muse", museTestConfig(t, srv.URL, ""))
-	// 500ms should round up to timeout_s=1, not 0
-	sess, err := b.Execute(context.Background(), "hi", ExecOptions{Timeout: 500 * time.Millisecond})
-	if err != nil {
-		t.Fatalf("Execute = %v", err)
-	}
-	drainMuseSession(t, sess)
-
-	fake.mu.Lock()
-	defer fake.mu.Unlock()
-	var req museExecuteRequest
-	if err := json.Unmarshal(fake.executeBody, &req); err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	if req.TimeoutS != 1 {
-		t.Errorf("TimeoutS = %d, want 1 (500ms rounds up)", req.TimeoutS)
-	}
-}
-
-// TestMuseNoTimeoutSends24h: Codex round2 item 3.
-// When Go has no deadline, send explicit 24h so the receptionist
-// doesn't default to 1h and kill a task Go is happy to wait for.
-func TestMuseNoTimeoutSends24h(t *testing.T) {
-	fastMusePolls(t)
-	fake := &fakeMuseReceptionist{
-		statuses: []museTaskStatus{{Status: "completed", Result: "done"}},
-	}
-	srv := httptest.NewServer(fake.handler())
-	defer srv.Close()
-
-	b, _ := New("muse", museTestConfig(t, srv.URL, ""))
-	sess, err := b.Execute(context.Background(), "hi", ExecOptions{})
-	if err != nil {
-		t.Fatalf("Execute = %v", err)
-	}
-	drainMuseSession(t, sess)
-
-	fake.mu.Lock()
-	defer fake.mu.Unlock()
-	var req museExecuteRequest
-	if err := json.Unmarshal(fake.executeBody, &req); err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	if req.TimeoutS != 24*3600 {
-		t.Errorf("TimeoutS = %d, want 86400 (24h default)", req.TimeoutS)
-	}
-}
-
-// TestMusePollFailureCancelsRemote: Codex round2 item 5.
-// When polling fails exhaustively, the backend must best-effort cancel
-// the remote task (B2).
-func TestMusePollFailureCancelsRemote(t *testing.T) {
-	fastMusePolls(t)
-	var cancelCalls int
-	var mu sync.Mutex
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/health", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(museHealthResponse{ProtocolVersion: 1})
-	})
-	mux.HandleFunc("/v1/execute", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(museExecuteResponse{TaskID: "t1", ProtocolVersion: 1})
-	})
-	// Status endpoint always fails
-	mux.HandleFunc("/v1/tasks/t1", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(500)
-	})
-	mux.HandleFunc("/v1/tasks/t1/events", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(museEventsResponse{})
-	})
-	mux.HandleFunc("/v1/tasks/t1/cancel", func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		cancelCalls++
-		mu.Unlock()
-		w.WriteHeader(200)
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	// Shrink the poll budget for a fast test
-	oldMax := museMaxConsecutivePollErrors.Load()
-	museMaxConsecutivePollErrors.Store(3)
-	defer museMaxConsecutivePollErrors.Store(oldMax)
-
-	b, _ := New("muse", museTestConfig(t, srv.URL, ""))
-	sess, err := b.Execute(context.Background(), "hi", ExecOptions{})
-	if err != nil {
-		t.Fatalf("Execute = %v", err)
-	}
-	res, _ := drainMuseSession(t, sess)
-	if res.Status != "failed" {
-		t.Errorf("Status = %q, want failed", res.Status)
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if cancelCalls == 0 {
-		t.Error("expected best-effort cancel on poll exhaustion")
+func TestMuseModelSelectionIsRuntimeApplied(t *testing.T) {
+	t.Parallel()
+	if !ModelSelectionSupported("muse") {
+		t.Fatal("muse applies agent.model through session/start modelId")
+	}
+	if version := MinVersions["muse"]; version == "" {
+		t.Fatal("muse needs a minimum CLI version")
+	}
+	if LaunchHeader("muse") == "" {
+		t.Fatal("muse needs a launch header for the custom-args preview")
 	}
 }

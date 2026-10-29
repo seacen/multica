@@ -17,7 +17,6 @@ import (
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
-// ---------------------------------------------------------------------------
 // Custom Runtime Profiles (MUL-3284)
 //
 // A runtime_profile is a workspace-level, team-shared definition of a custom
@@ -30,7 +29,6 @@ import (
 // Iron rule: a profile carries NO generic per-agent args. Per-agent launch args
 // stay on agent.custom_args. The only args field is fixed_args — args every
 // agent on this runtime must inherit to enter a compatible mode.
-// ---------------------------------------------------------------------------
 
 type RuntimeProfileResponse struct {
 	ID             string   `json:"id"`
@@ -155,14 +153,6 @@ func (h *Handler) CreateRuntimeProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.RuntimeType = agent.ProfileRuntimeType(strings.TrimSpace(req.RuntimeType), req.ProtocolFamily)
-	// N3: muse is a builtin HTTP backend, not a CLI that can be wrapped
-	// in a custom profile. Reject it here with 400 instead of letting
-	// it hit the DB CHECK constraint (which doesn't list muse) and
-	// return a confusing 500.
-	if req.RuntimeType == "muse" {
-		writeError(w, http.StatusBadRequest, "runtime_type 'muse' is a builtin backend and cannot be used for custom profiles; create a builtin Muse agent instead")
-		return
-	}
 	family, supported := agent.RuntimeProtocolFamily(req.RuntimeType)
 	if !supported {
 		writeError(w, http.StatusBadRequest, "unsupported runtime_type: "+req.RuntimeType)

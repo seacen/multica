@@ -1,87 +1,89 @@
 package wecom
 
-// attachment_revocation_db_test.go — the attachment write path re-reads the
-// installation's permission from the DATABASE, not from a mock, at each stage
-// that is about to put bytes toward the chat. The unit tests beside it
-// (media_upload_test.go) prove the BeforeChunk hook stops the next chunk; this
-// one proves the hook is wired to the real row, so a person revoking the bot
-// mid-upload — an UPDATE on channel_installation — is what stops the file.
+// attachment_revocation_db_test.go — the attachment worker re-reads the
+// installation's permission from the DATABASE, not from a double, at each frame
+// it writes. The tests beside it (attachment_revocation_test.go) prove the
+// ordering with a double that can change its answer; this one proves the guard
+// is wired to the real row, so a person revoking the bot mid-upload — an UPDATE
+// on channel_installation — is what stops the file and silences the notice.
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"testing"
 	"time"
 
+	dbfx "github.com/multica-ai/multica/server/internal/testutil"
+	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
-func TestSendAttachment_ARevokeInTheDatabaseMidUploadStopsTheFile(t *testing.T) {
-	pool := twoReplicaDB(t)
-	ctx := context.Background()
+// attachmentsFromMemory is the real *db.Queries with the one lookup that would
+// need a chat_message and an attachment row answered from memory. The
+// permission read — the thing under test — still goes to the database.
+type attachmentsFromMemory struct {
+	*db.Queries
+	rows []db.Attachment
+}
 
-	wsID, userID, agentID, instID := mustTestUUID(t), mustTestUUID(t), mustTestUUID(t), mustTestUUID(t)
-	tag := uuidStringPub(instID)[:8]
-	exec := func(sql string, args ...any) {
-		t.Helper()
-		if _, err := pool.Exec(ctx, sql, args...); err != nil {
-			t.Fatalf("seed: %v\n%s", err, sql)
-		}
-	}
-	t.Cleanup(func() {
-		_, _ = pool.Exec(ctx, `DELETE FROM channel_installation WHERE id = $1`, instID)
-		_, _ = pool.Exec(ctx, `DELETE FROM agent WHERE id = $1`, agentID)
-		_, _ = pool.Exec(ctx, `DELETE FROM "user" WHERE id = $1`, userID)
-		_, _ = pool.Exec(ctx, `DELETE FROM workspace WHERE id = $1`, wsID)
+func (a attachmentsFromMemory) ListAttachmentsByChatMessage(context.Context, db.ListAttachmentsByChatMessageParams) ([]db.Attachment, error) {
+	return a.rows, nil
+}
+
+func TestSendAttachments_ARevokeInTheDatabaseMidUploadStopsTheFileAndTheNotice(t *testing.T) {
+	pool := twoReplicaDB(t)
+
+	// Fixtures delete in reverse creation order, so no teardown chain to keep
+	// in step (AGENTS.md Testing rules).
+	f := dbfx.New(pool, "", "")
+	tag := uuidStringPub(mustTestUUID(t))[:8]
+	f.WorkspaceID = f.Workspace(t, "revoke "+tag, "revoke-"+tag)
+	f.UserID = f.User(t, "Revoke "+tag, "revoke-"+tag+"@example.com")
+	agentID := f.Agent(t, "revoke-agent-"+tag, "", dbfx.Cols{"runtime_mode": "local"})
+	instID := f.Insert(t, "channel_installation", dbfx.Cols{
+		"workspace_id":      f.WorkspaceID,
+		"agent_id":          agentID,
+		"channel_type":      "wecom",
+		"status":            "active",
+		"installer_user_id": f.UserID,
 	})
-	exec(`INSERT INTO workspace (id, name, slug) VALUES ($1, $2, $3)`, wsID, "revoke "+tag, "revoke-"+tag)
-	exec(`INSERT INTO "user" (id, name, email) VALUES ($1, $2, $3)`, userID, "Revoke "+tag, "revoke-"+tag+"@example.com")
-	exec(`INSERT INTO agent (id, workspace_id, name, runtime_mode) VALUES ($1, $2, $3, 'local')`, agentID, wsID, "revoke-agent-"+tag)
-	exec(`INSERT INTO channel_installation (id, workspace_id, agent_id, channel_type, status, installer_user_id)
-	      VALUES ($1, $2, $3, 'wecom', 'active', $4)`, instID, wsID, agentID, userID)
+	inst, err := util.ParseUUID(instID)
+	if err != nil {
+		t.Fatalf("parse installation id: %v", err)
+	}
 
 	// Five chunks at the ladder's middle step of three in flight: the fourth
 	// and fifth have to wait for a slot, and that wait is where the revocation
 	// lands.
-	data := make([]byte, mediaChunkBytes*4+1)
-	objects := &fakeObjectStore{key: "u", data: data}
+	data := fiveChunks()
 	conn := newMediaConn()
 	arrived, release := conn.holdChunks()
 	sender := conn.newSender()
 	reg := newSendersRegistry()
-	reg.set(instID, sender)
-	o := NewOutbound(db.New(pool), reg, nil, slog.Default(), WithAttachments(objects))
+	reg.set(inst, sender)
+	q := attachmentsFromMemory{Queries: db.New(pool), rows: []db.Attachment{{
+		ID: mustTestUUID(t), Filename: "big.bin", ContentType: "application/octet-stream",
+		Url: "u", SizeBytes: int64(len(data)),
+	}}}
+	o := NewOutbound(q, reg, nil, slog.Default(), WithAttachments(&fakeObjectStore{key: "u", data: data}))
 
-	done := make(chan error, 1)
+	done := make(chan struct{})
 	go func() {
-		_, err := o.sendAttachment(ctx, sender, db.Attachment{
-			ID: mustTestUUID(t), Filename: "big.bin", ContentType: "application/octet-stream",
-			Url: "u", SizeBytes: int64(len(data)),
-		}, attachmentTarget{InstallationID: instID, ChatID: "CHAT_1", ChatType: 1})
-		done <- err
+		defer close(done)
+		o.sendAttachments(context.Background(), mustTestUUID(t), mustTestUUID(t),
+			attachmentTarget{InstallationID: inst, ChatID: "CHAT_1", ChatType: chatTypeSingleInt}, true)
 	}()
-	for i := 0; i < 3; i++ {
-		select {
-		case <-arrived:
-		case <-time.After(5 * time.Second):
-			t.Fatalf("chunk %d never reached the wire", i+1)
-		}
-	}
+	awaitChunks(t, arrived, 3)
 
 	// The person removes the bot: one row flips in the database. Nothing else
 	// in the process is told.
-	exec(`UPDATE channel_installation SET status = 'revoked' WHERE id = $1`, instID)
+	f.Exec(t, `UPDATE channel_installation SET status = 'revoked' WHERE id = $1`, instID)
 	release()
 
-	var err error
 	select {
-	case err = <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the delivery never returned")
-	}
-	if !errors.Is(err, errMediaPermissionWithdrawn) {
-		t.Fatalf("delivery reported %v, want errMediaPermissionWithdrawn", err)
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the attachment worker never returned")
 	}
 	if n := len(conn.cmdFrames(cmdUploadMediaChunk)); n != 3 {
 		t.Errorf("%d chunk frames on the wire, want 3: chunks kept going after the row said revoked", n)
@@ -89,7 +91,8 @@ func TestSendAttachment_ARevokeInTheDatabaseMidUploadStopsTheFile(t *testing.T) 
 	if n := len(conn.cmdFrames(cmdUploadMediaFinish)); n != 0 {
 		t.Errorf("%d finish frames on the wire, want 0", n)
 	}
-	if got := mediaSends(t, conn); len(got) != 0 {
-		t.Errorf("sent %d file(s) into a chat whose owner had removed the bot", len(got))
+	// Not the file, and not the "a file could not be sent" notice either.
+	if n := len(conn.cmdFrames(cmdSendMsg)); n != 0 {
+		t.Errorf("%d messages sent into a chat whose owner had removed the bot, want 0", n)
 	}
 }

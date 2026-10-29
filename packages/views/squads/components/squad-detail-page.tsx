@@ -15,7 +15,7 @@ import { useNavigation } from "../../navigation";
 import { AppLink } from "../../navigation";
 import { BreadcrumbHeader } from "../../layout/breadcrumb-header";
 import { PageHeader } from "../../layout/page-header";
-import { Users, Plus, Trash2, ArrowUpRight, Crown, Loader2, Pencil, FileText, Save } from "lucide-react";
+import { Users, Plus, Trash2, ArrowUpRight, Crown, Loader2, Pencil, FileText, Save } from "@multica/ui/icons";
 import { Button } from "@multica/ui/components/ui/button";
 import { Input } from "@multica/ui/components/ui/input";
 import { Label } from "@multica/ui/components/ui/label";
@@ -57,7 +57,7 @@ import {
   PickerSection,
   PickerEmpty,
 } from "../../issues/components/pickers/property-picker";
-import { ChevronDown, UserPlus } from "lucide-react";
+import { ChevronDown, UserPlus } from "@multica/ui/icons";
 import { toast } from "sonner";
 import type { Squad, SquadMember, SquadMemberStatus, SquadMemberStatusValue, Agent, MemberWithUser } from "@multica/core/types";
 import { useT } from "../../i18n";
@@ -708,11 +708,9 @@ function RoleEditor({ value, onSave }: { value: string; onSave: (next: string) =
   );
 }
 
-// ---------------------------------------------------------------------------
 // SquadDetailInspector — left 320px column, mirrors AgentDetailInspector.
 // Holds identity (avatar / name / description) + leader / member count /
 // timestamps. All inline-editable.
-// ---------------------------------------------------------------------------
 function SquadDetailInspector({
   squad,
   memberCount,
@@ -931,11 +929,9 @@ function SquadDescriptionEditorBody({
   );
 }
 
-// ---------------------------------------------------------------------------
 // SquadOverviewPane — right column with two tabs (Members | Instructions).
 // Mirrors AgentOverviewPane: dirty-guard via AlertDialog when switching tabs
 // with unsaved Instructions.
-// ---------------------------------------------------------------------------
 type SquadDetailTab = "members" | "instructions";
 
 const squadDetailTabs: { id: SquadDetailTab; icon: typeof FileText }[] = [

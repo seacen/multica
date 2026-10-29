@@ -74,7 +74,9 @@ func TestTwoKindsInOneQuoteEachCountFromZero(t *testing.T) {
 		{MsgType: "image", Image: mediaBody{URL: "https://example.invalid/c.png", AESKey: "C"}},
 	}
 
-	got := quotedMessage(q).media()
+	mc := aibotMsgCallback{MsgType: "text", Quote: q}
+	mc.Text.Content = "看这两个"
+	got := mc.attachments()
 	if len(got) != 3 {
 		t.Fatalf("media = %d, want 3", len(got))
 	}

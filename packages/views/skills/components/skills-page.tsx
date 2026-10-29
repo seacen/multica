@@ -9,7 +9,7 @@ import {
   Lock,
   Pencil,
   Plus,
-} from "lucide-react";
+} from "@multica/ui/icons";
 import { SkillIcon } from "../lib/skill-icon";
 import type {
   Agent,
@@ -156,10 +156,8 @@ function columnTrackVars(
 export type SortField = SkillSortField;
 export { rowMatchesFilters, type SkillRow } from "./skill-list-filter";
 
-// ---------------------------------------------------------------------------
 // Page header bar — uses shared PageHeader so the mobile sidebar trigger and
 // h-12 chrome stay consistent with every other dashboard list page.
-// ---------------------------------------------------------------------------
 
 function PageHeaderBar({
   totalCount,
@@ -174,7 +172,6 @@ function PageHeaderBar({
       icon={SkillIcon}
       title={t(($) => $.page.title)}
       count={totalCount}
-      description={t(($) => $.page.tagline)}
       learnMore={{
         href: `https://multica.ai/docs${docsLocalePrefix(i18n.language)}/skills`,
         label: t(($) => $.page.learn_more),
@@ -190,9 +187,7 @@ function PageHeaderBar({
   );
 }
 
-// ---------------------------------------------------------------------------
 // Cells
-// ---------------------------------------------------------------------------
 
 // Hover-revealed multi-select checkbox. Same pattern as SkillPickerList:
 // the shadcn Checkbox is presentational only (`pointer-events-none`, so the
@@ -397,9 +392,7 @@ function CreatorCell({ creator }: { creator: MemberWithUser | null }) {
   );
 }
 
-// ---------------------------------------------------------------------------
 // Empty state
-// ---------------------------------------------------------------------------
 
 function EmptyState({ onCreate }: { onCreate: () => void }) {
   const { t } = useT("skills");
@@ -418,9 +411,7 @@ function EmptyState({ onCreate }: { onCreate: () => void }) {
   );
 }
 
-// ---------------------------------------------------------------------------
 // List
-// ---------------------------------------------------------------------------
 
 function SkillListHeader({
   sortField,
@@ -573,9 +564,7 @@ function LoadingSkeleton() {
   );
 }
 
-// ---------------------------------------------------------------------------
 // Page
-// ---------------------------------------------------------------------------
 
 export default function SkillsPage() {
   const { t } = useT("skills");
@@ -805,16 +794,14 @@ export default function SkillsPage() {
         </div>
       )}
 
-      {isLoading ? (
-        <div className="flex-1 overflow-y-auto @container">
-          <LoadingSkeleton />
-        </div>
-      ) : showEmpty ? (
+      {showEmpty ? (
         <div className="flex flex-1 items-center justify-center">
           <EmptyState onCreate={() => setCreateOpen(true)} />
         </div>
       ) : (
         <>
+          {/* Mounted through loading so the rows don't drop by a toolbar's
+              height when the list lands. */}
           <SkillListToolbar
             search={search}
             onSearchChange={setSearch}
@@ -830,6 +817,11 @@ export default function SkillsPage() {
             allRows={allRows}
             visibleCount={rows.length}
           />
+          {isLoading ? (
+            <div className="flex-1 overflow-y-auto @container">
+              <LoadingSkeleton />
+            </div>
+          ) : (
           <div
             ref={listScrollRef}
             className="min-h-0 flex-1 overflow-auto @container"
@@ -913,6 +905,7 @@ export default function SkillsPage() {
             </ListGridBody>
           </ListGrid>
           </div>
+          )}
         </>
       )}
 
